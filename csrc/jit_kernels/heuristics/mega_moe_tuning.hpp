@@ -48,18 +48,16 @@ struct TuningEntry {
     Precision precision;
     int ranks, experts, topk, hidden, intermediate;
     const char* activation;
-    std::array<Gemm1Tuning, 3> gemm1; // 1024, 2048, 4096 tokens per rank
+    std::array<Gemm1Tuning, 3> gemm1;
     std::array<Gemm2Tuning, 3> gemm2{};
     std::array<CombineTuning, 3> combine{};
+    std::array<int, 3> tokens{1024, 2048, 4096}; // Per-rank counts; zero means unused.
 };
 
 inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& device, int sms,
                                    bool enabled = true) {
     TuningConfig result{w, {}, {}, {}, {}};
     if (!enabled || device != "ZW-M890P" || sms != 39)
-        return result;
-    const int bucket = w.tokens == 1024 ? 0 : w.tokens == 2048 ? 1 : w.tokens == 4096 ? 2 : -1;
-    if (bucket < 0)
         return result;
     using P = Precision;
     using M = PullMode;
@@ -86,16 +84,23 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
         {"qwen38_flash", P::FP8Channelwise, 4, 512, 10, 2560, 640, "swiglu",
          {{{{}, {}, 9, M::Triple}, {{}, {}, 12}, {{}, {}, 12}}},
          {{{Tile{128, 256, 128, 32, 64, 3}}, {}, {}}}},
+        {"mimo_v26_pro", P::W4A4, 8, 384, 8, 6144, 2048, "swiglu",
+         {},
+         {{{Tile{128, 256, 64, 64, 64, 3}}, {}, {}}}, {}, {8192, 0, 0}},
     };
     for (const auto& entry : entries) {
         if (w.precision == entry.precision && w.ranks == entry.ranks && w.experts == entry.experts &&
             w.topk == entry.topk && w.hidden == entry.hidden && w.intermediate == entry.intermediate &&
             w.activation == entry.activation) {
-            result.profile = entry.model;
-            result.gemm1 = entry.gemm1[bucket];
-            result.gemm2 = entry.gemm2[bucket];
-            result.combine = entry.combine[bucket];
-            break;
+            for (std::size_t bucket = 0; bucket < entry.tokens.size(); ++bucket) {
+                if (entry.tokens[bucket] > 0 && w.tokens == entry.tokens[bucket]) {
+                    result.profile = entry.model;
+                    result.gemm1 = entry.gemm1[bucket];
+                    result.gemm2 = entry.gemm2[bucket];
+                    result.combine = entry.combine[bucket];
+                    return result;
+                }
+            }
         }
     }
     return result;

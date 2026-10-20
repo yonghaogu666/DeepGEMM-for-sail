@@ -15,6 +15,7 @@ references and timing are separate from this complete kernel call sequence.
 import argparse
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ CASES = (
     MoECase("glm52", 6144, 2048, 256, 8, 4096, tokens=MODEL_TOKENS, worlds=(8,)),
     MoECase("kimi_k3", 3584, 3072, 896, 16, 4096, tokens=MODEL_TOKENS, activation="situ", worlds=(16,)),
     MoECase("qwen38_2_4t", 8192, 2048, 512, 10, 4096, tokens=MODEL_TOKENS, worlds=(16,)),
+    MoECase("mimo_v26_pro", 6144, 2048, 384, 8, 8192, tokens=(8192,), worlds=(8,)),
 )
 
 
@@ -302,6 +304,11 @@ def check_correctness(moe, result, source, ids, weights, checked):
     # repeating that selector in the reference; explicit padding is tested below.
     assert any(torch.equal(dst_rows, ((counts + bm - 1) // bm * bm).int())
                for bm in (16, 32, 64, 128, 256))
+    scatter_override = os.environ.get("DG_MOE_SCATTER_CONFIG")
+    measured_tile = moe.tuning.gemm2_tile if moe.tuning is not None else None
+    if scatter_override or measured_tile is not None:
+        bm = int(scatter_override.split(",")[0]) if scatter_override else measured_tile[0]
+        torch.testing.assert_close(dst_rows, ((counts + bm - 1) // bm * bm).int(), rtol=0, atol=0)
     src_rows = ((counts + moe.gemm1_block_m - 1) // moe.gemm1_block_m * moe.gemm1_block_m).int()
     for actual, expected in (
         (moe.valid, counts.int()),
@@ -508,21 +515,28 @@ def test_tuning_profiles(case, monkeypatch):
     args = dict(num_ranks=case.worlds[0], num_experts=case.experts, num_topk=case.topk,
                 hidden=case.hidden, intermediate_hidden=case.intermediate,
                 precision="w4a4", activation=case.activation)
-    for tokens in MODEL_TOKENS:
+    for tokens in case.tokens:
         config = dg.get_mega_moe_tuning_config(**args, num_tokens=tokens)
         assert config.profile == case.name and config.num_tokens == tokens
         with pytest.raises(AttributeError):
             config.pull_sms = 1
-    for tokens in (0, 1, 1023, 1025, 2047, 2049, 4095, 4097):
+    for tokens in set((0, 1, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096, 4097,
+                       8191, 8192, 8193)) - set(case.tokens):
         assert not dg.get_mega_moe_tuning_config(**args, num_tokens=tokens).profile
     for change in (dict(hidden=case.hidden + 256), dict(num_experts=case.experts + case.worlds[0]),
-                   dict(activation="step")):
-        assert not dg.get_mega_moe_tuning_config(**(args | change), num_tokens=1024).profile
+                   dict(activation="step"), dict(num_ranks=1), dict(num_topk=1),
+                   dict(intermediate_hidden=case.intermediate + 256), dict(precision="fp8_blockwise")):
+        assert not dg.get_mega_moe_tuning_config(**(args | change), num_tokens=case.tokens[0]).profile
     if case.name == "qwen38_2_4t":
         assert dg.get_mega_moe_tuning_config(**args, num_tokens=1024).reduce_chunked is False
         assert dg.get_mega_moe_tuning_config(**args, num_tokens=2048).reduce_chunked is None
+    if case.name == "mimo_v26_pro":
+        config = dg.get_mega_moe_tuning_config(**args, num_tokens=8192)
+        assert config.pull_sms is None
+        assert tuple(config.gemm2_tile) == (128, 256, 64, 64, 64, 3)
+        assert config.gemm1_tile is None and config.reduce_chunked is None
     monkeypatch.setenv("DG_MOE_USE_TUNED_CONFIGS", "0")
-    assert not dg.get_mega_moe_tuning_config(**args, num_tokens=1024).profile
+    assert not dg.get_mega_moe_tuning_config(**args, num_tokens=case.tokens[0]).profile
 
 
 def test_tuning_rejects_wrong_workload():

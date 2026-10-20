@@ -392,6 +392,12 @@ inline Config fp4_pipeline_scatter_config(int m, int n, int k, int groups,
     const int em = expected ? std::max(1, *expected)
                    : tuning ? std::max(1, ceil_div(tuning->workload.tokens * tuning->workload.topk, groups))
                             : ceil_div(m, groups);
+    if (!requested && get_env<std::string>("DG_MOE_SCATTER_CONFIG").empty() &&
+        tuning && tuning->gemm2.tile) {
+        const auto& t = *tuning->gemm2.tile;
+        requested = Config{get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[5],
+                           fp4_smem(t[5], t[0], t[1], t[3], t[4], t[2])};
+    }
     return fp4_scatter_config(m, n, k, groups, requested, true, false, false, em);
 }
 

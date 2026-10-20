@@ -126,8 +126,12 @@ Here `intermediate_hidden` is the expert intermediate width, before doubling
 for the gate/up projection. The table matches precision, activation, EP size,
 expert count, top-k, hidden/intermediate dimensions and tokens per rank exactly.
 It contains the measured W4A4, W4A16 and FP8 channelwise model configurations
-at 1024, 2048 and 4096 tokens on ZW-M890P with 39 SMs. No profile is selected
-for other token counts or devices. FP8 blockwise uses its existing heuristics.
+at 1024, 2048 and 4096 tokens on ZW-M890P with 39 SMs. MiMo-V2.6-Pro W4A4
+has a separate EP8 profile at exactly 8192 tokens per rank (a 64K prefill
+chunk), with GEMM2 tile `128,256,64,64,64,3`. Dispatch, GEMM1 tiling, tail
+scheduling and the slot-major combine retain their defaults. No profile is
+selected for other token counts or devices.
+FP8 blockwise uses its existing heuristics.
 Profiles cover quantized GEMM1 output (BF16 for W4A16) and BF16 scatter.
 
 Profiles provide only measured overrides; unset fields use the existing
@@ -144,6 +148,16 @@ The table lives in `csrc/jit_kernels/heuristics/mega_moe_tuning.hpp`;
 precision-specific fallback, override handling and validation remain in
 `csrc/jit_kernels/heuristics/mega_moe.hpp`. Launchers consume the resulting
 configuration without maintaining a separate model table.
+
+For the MiMo shape, run the complete routed pipeline with correctness checks:
+
+```bash
+torchrun --master-addr=127.0.0.1 --master-port=29880 --nproc-per-node=8 tests/test_moe_w4a4.py \
+    --case mimo_v26_pro --tokens 8192 --reference-tokens 64 --benchmark
+```
+
+Repeat with `DG_MOE_USE_TUNED_CONFIGS=0` for the heuristic baseline. Keep
+explicit tuning overrides unset for this comparison.
 
 ## Four-stage compute interface
 
