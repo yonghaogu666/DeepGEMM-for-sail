@@ -6,6 +6,7 @@
 #include <hggc_runtime.h>
 #include <cstdint>
 #include <math.h>
+#include <deep_gemm/impls/mega_moe_io.cuh>
 
 namespace deep_gemm::mega_moe::fp8_channelwise {
 
@@ -39,11 +40,10 @@ CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
 
     const __ppu_bfloat16* row =
         hidden_states + static_cast<uint64_t>(token) * HIDDEN;
-    const uint4* row_vec = reinterpret_cast<const uint4*>(row);
 
     float local_max = 0.0f;
     for (uint32_t vec = tid; vec < kNumVecs; vec += BLOCK_THREADS) {
-        const uint4 bits = row_vec[vec];
+        const uint4 bits = detail::load_bf16x8(row + vec * kVecElems);
         const __ppu_bfloat162* pairs =
             reinterpret_cast<const __ppu_bfloat162*>(&bits);
 #pragma unroll
@@ -86,7 +86,7 @@ CUTLASS_DEVICE void fp8_mega_moe_pre_dispatch_kernel_device(
         staged_tokens + static_cast<uint64_t>(token) * HIDDEN;
     uint16_t* output_packed = reinterpret_cast<uint16_t*>(output_row);
     for (uint32_t vec = tid; vec < kNumVecs; vec += BLOCK_THREADS) {
-        const uint4 bits = row_vec[vec];
+        const uint4 bits = detail::load_bf16x8(row + vec * kVecElems);
         const __ppu_bfloat162* pairs =
             reinterpret_cast<const __ppu_bfloat162*>(&bits);
 #pragma unroll

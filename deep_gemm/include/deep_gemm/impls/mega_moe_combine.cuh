@@ -4,6 +4,7 @@
 #include <hggc_fp16.h>
 #include <hggc_fp8.h>
 #include <deep_gemm/tix/sys_atomics.cuh>
+#include <deep_gemm/impls/mega_moe_io.cuh>
 
 namespace deep_gemm::mega_moe::detail {
 
@@ -136,7 +137,7 @@ __device__ __forceinline__ void barrier_reduce_kernel(
         #pragma unroll
         for (int i = 0; i < 4; ++i)
             pairs[i] = __float22bfloat162_rn(acc[i]);
-        *reinterpret_cast<float4*>(output + static_cast<int64_t>(token) * hidden + vector * 8) = packed;
+        store_bf16x8(output + static_cast<int64_t>(token) * hidden + vector * 8, packed);
     }
 }
 

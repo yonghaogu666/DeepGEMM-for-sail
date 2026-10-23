@@ -7,6 +7,7 @@
 #include <math.h>
 #include <deep_gemm/tix/cvt.cuh>
 #include <deep_gemm/tix/utils.cuh>
+#include <deep_gemm/impls/mega_moe_io.cuh>
 
 namespace deep_gemm::mega_moe::fp4 {
 
@@ -36,20 +37,19 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
 
     const uint32_t tid = threadIdx.x;
     for (uint32_t token = blockIdx.x; token < num_tokens; token += gridDim.x) {
-        const uint4* row_vec = reinterpret_cast<const uint4*>(
-            hidden_states + static_cast<uint64_t>(token) * HIDDEN);
+        const auto* row = hidden_states + static_cast<uint64_t>(token) * HIDDEN;
         uint32_t* token_words = reinterpret_cast<uint32_t*>(
             staged_tokens + static_cast<uint64_t>(token) * kTokenBytes);
         uint8_t* sf_row = staged_scales + static_cast<uint64_t>(token) * kSfBytes;
 
         if constexpr (kEvenVecSchedule) {
-            uint4 cur_bits = row_vec[tid];
+            uint4 cur_bits = detail::load_bf16x8(row + tid * kVecElems);
             #pragma unroll 1
             for (uint32_t iter = 0; iter < kIters; ++iter) {
                 const uint32_t vec = tid + iter * BLOCK_THREADS;
                 uint4 next_bits = cur_bits;
                 if (iter + 1u < kIters) {
-                    next_bits = row_vec[tid + (iter + 1u) * BLOCK_THREADS];
+                    next_bits = detail::load_bf16x8(row + (tid + (iter + 1u) * BLOCK_THREADS) * kVecElems);
                 }
                 const uint4 bits = cur_bits;
                 const __ppu_bfloat162* pairs = reinterpret_cast<const __ppu_bfloat162*>(&bits);
@@ -85,7 +85,7 @@ CUTLASS_DEVICE void fp4_mega_moe_pre_dispatch_kernel_device(
             }
         } else {
             for (uint32_t vec = tid; vec < kNumVecs; vec += BLOCK_THREADS) {
-                const uint4 bits = row_vec[vec];
+                const uint4 bits = detail::load_bf16x8(row + vec * kVecElems);
                 const __ppu_bfloat162* pairs = reinterpret_cast<const __ppu_bfloat162*>(&bits);
 
                 float vals[kVecElems];
