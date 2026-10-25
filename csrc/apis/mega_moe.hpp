@@ -272,10 +272,8 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
     if (act == "situ_and_mul")
         TORCH_CHECK(activation_clamp == 0 && std::isfinite(situ_beta) && situ_beta > 0 &&
                     std::isfinite(situ_linear_beta) && situ_linear_beta > 0);
-    const bool dynamic = flag("MEGA_MOE_DYNAMIC_CONFIG", true);
-    auto c = dynamic ? launch_config(buffer, num_tokens) : capacity;
-    const auto selected_tuning = dynamic ? tuning : mega_moe_config::Gemm1Tuning{};
-    mega_moe_config::apply_gemm1_tuning(c, selected_tuning,
+    auto c = launch_config(buffer, num_tokens);
+    mega_moe_config::apply_gemm1_tuning(c, tuning,
         field<std::optional<mega_moe_config::Overrides>>(buffer, "_config_override"),
         field<int>(buffer, "_gemm1_block_n"), field<int>(buffer, "_gemm1_block_k"));
     const int sfb_bn = field<int>(buffer, "_sfb_layout_block_n");
@@ -327,10 +325,10 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
     return mega_moe_native::fp4_mega_moe_dispatch_gemm1_impl(
         c, capacity, field<Tensor>(buffer, "buf_ptrs"), gemm1_weight, gemm1_weight_sf, gemm1_weight_sf_u16,
         replica, replica_scale, output, scratch, rank, num_tokens, masters, stride, sfb_bn, fp4_output,
-        scale_output, dynamic, py::hasattr(buffer, "bf16_hidden"), dispatch_only, split, glu, quantize_output,
+        scale_output, py::hasattr(buffer, "bf16_hidden"), dispatch_only, split, glu, quantize_output,
         act, activation_clamp, situ_beta, situ_linear_beta, situ_tanh_bf16x2, pull_begin_block,
         pull_end_block, resume_dispatch, finalize_dispatch, synchronize_pull, publish_arrivals,
-        num_launch_blocks, gemm2_block_m, selected_tuning);
+        num_launch_blocks, gemm2_block_m, tuning);
 }
 // FP8 dispatch / fused GEMM1.
 static void fp8_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor& topk_ids,

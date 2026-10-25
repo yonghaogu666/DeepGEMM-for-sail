@@ -846,13 +846,13 @@ inline int fp4_mega_moe_dispatch_gemm1_impl(
     const torch::Tensor& gemm1_weight_sf_u16, const torch::Tensor& replica,
     const torch::Tensor& replica_scale, const torch::Tensor& output, const torch::Tensor& scratch, int rank,
     int num_tokens, int masters, int stride, int sfb_bn, std::optional<torch::Tensor> fp4_output,
-    std::optional<torch::Tensor> scale_output, bool dynamic, bool bf16, bool dispatch_only, bool split,
+    std::optional<torch::Tensor> scale_output, bool bf16, bool dispatch_only, bool split,
     bool glu, bool quantize_output, const std::string& act, float activation_clamp, float situ_beta,
     float situ_linear_beta, bool situ_tanh_bf16x2, int pull_begin_block, int pull_end_block,
     bool resume_dispatch, bool finalize_dispatch, bool synchronize_pull, bool publish_arrivals,
     int num_launch_blocks, int gemm2_block_m = 0,
     const mega_moe_config::Gemm1Tuning& tuning = {}) {
-    mega_moe_config::fp4_dispatch_schedule(c, capacity, num_tokens, dynamic, bf16, dispatch_only, split, glu,
+    mega_moe_config::fp4_dispatch_schedule(c, capacity, num_tokens, bf16, dispatch_only, split, glu,
                                            quantize_output, tuning);
     c.gemm2_block_m = gemm2_block_m ? gemm2_block_m : c.block_m;
     TORCH_CHECK(c.enable_remote_pull, "MegaMoE GEMM1 metadata requires remote-pull dispatch");

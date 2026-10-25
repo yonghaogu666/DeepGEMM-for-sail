@@ -533,7 +533,7 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
 
 // Keep dispatch scheduling independent of buffer ownership and kernel argument assembly.
 inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capacity, int num_tokens,
-                                  bool dynamic, bool bf16, bool dispatch_only, bool split, bool glu,
+                                  bool bf16, bool dispatch_only, bool split, bool glu,
                                   bool quantize_output, const Gemm1Tuning& tuning = {}) {
     const bool gemm = !dispatch_only;
     const bool push = dispatch_only && bf16 && num_tokens >= 512 && !split;
@@ -543,7 +543,7 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     TORCH_CHECK(serial_rows >= 0);
     const bool latency =
         flag("MEGA_MOE_LATENCY_OPTIMIZED",
-             dynamic && num_tokens * c.num_topk <= serial_rows && glu && quantize_output && gemm && pull);
+             num_tokens * c.num_topk <= serial_rows && glu && quantize_output && gemm && pull);
     const bool specialized = !dispatch_only && !latency && flag("MEGA_MOE_SM_SPECIALIZATION", true);
     c.gemm1_dynamic_queue = specialized && gemm && pull && tuning.dynamic_queue.value_or(true);
     const int slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
