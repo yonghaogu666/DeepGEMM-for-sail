@@ -43,7 +43,6 @@ struct DispatchConfig {
     int num_sms = 0;
     int num_threads = 0;
     int num_topk = 0;
-    int producer_warps = 0;
     int pull_slots = 0;
     int pull_sms = 0;
     mega_moe::Gemm1Epilogue gemm1_epilogue = mega_moe::Gemm1Epilogue::IdentityBf16;
@@ -546,11 +545,8 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
         flag("MEGA_MOE_LATENCY_OPTIMIZED",
              dynamic && num_tokens * c.num_topk <= serial_rows && glu && quantize_output && gemm && pull);
     const bool specialized = !dispatch_only && !latency && flag("MEGA_MOE_SM_SPECIALIZATION", true);
-    const int producers = latency ? 0 : integer("MEGA_MOE_PRODUCER_WARPS", push && bf16 ? 8 : 0);
-    TORCH_CHECK(producers >= 0 && producers <= 16);
-    c.gemm1_dynamic_queue = specialized && gemm && pull && producers == 0 &&
-                            tuning.dynamic_queue.value_or(true);
-    const int slots = dispatch_pull_slots(c.num_threads + producers * 32, c.token_bytes, c.sf_bytes);
+    c.gemm1_dynamic_queue = specialized && gemm && pull && tuning.dynamic_queue.value_or(true);
+    const int slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
     int pulls, gemms;
     if (specialized) {
         pulls = integer("MEGA_MOE_PULL_SMS", std::getenv("MEGA_MOE_GEMM_SMS")
@@ -566,7 +562,6 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     c.enable_gemm1 = gemm;
     c.enable_remote_pull = pull;
     c.enable_remote_push = push;
-    c.producer_warps = producers;
     c.pull_sms = pulls;
     c.gemm_sms = gemms;
     c.sm_specialization = specialized;

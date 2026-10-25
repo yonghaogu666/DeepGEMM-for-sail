@@ -62,7 +62,6 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"NUM_SMS", std::to_string(c.num_sms)},
         {"NUM_THREADS", std::to_string(c.num_threads)},
         {"NUM_TOPK", std::to_string(c.num_topk)},
-        {"PRODUCER_WARPS", std::to_string(c.producer_warps)},
         {"PULL_SLOTS", std::to_string(c.pull_slots)},
         {"PULL_SMS", std::to_string(c.pull_sms)},
         {"GEMM1_EPILOGUE", c.gemm1_epilogue == mega_moe::Gemm1Epilogue::SwiGluFp8
@@ -248,8 +247,6 @@ constexpr uint32_t GEMM1_BLOCK_K = {GEMM1_BLOCK_K};
 constexpr uint32_t GEMM1_WARP_M = {GEMM1_WARP_M};
 constexpr uint32_t GEMM1_WARP_N = {GEMM1_WARP_N};
 constexpr uint32_t GEMM1_STAGES = {GEMM1_STAGES};
-constexpr uint32_t NUM_PRODUCER_WARPS = {PRODUCER_WARPS};
-constexpr uint32_t NUM_LAUNCH_THREADS = NUM_THREADS + NUM_PRODUCER_WARPS * 32;
 constexpr uint32_t ppu_smem_compute() {
 constexpr int stages = mega_moe::fp4::Gemm1PickStage<BLOCK_M, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
     GEMM1_WARP_M, GEMM1_WARP_N, GEMM1_STAGES, 262144, {SFB_LAYOUT_BLOCK_N}>::value;
@@ -261,7 +258,7 @@ uint32_t pull = {ENABLE_REMOTE_PULL} ? {PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES) :
 return collective > phase_a ? (collective > pull ? collective : pull) : (phase_a > pull ? phase_a : pull);
 }
 extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = ppu_smem_compute();
-extern "C" __global__ __launch_bounds__(NUM_THREADS + {PRODUCER_WARPS} * 32, 1)
+extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
 void PPU_KERNEL_ENTRY(layout::SymBuffer<{NUM_RANKS}> sb, int rank, int num_tokens, uint8_t* gemm1_weight, uint8_t* gemm1_weight_sf, uint16_t* gemm1_weight_sf_u16, uint8_t* gemm1_weight_replicas, uint16_t* gemm1_weight_sf_u16_replicas, int num_master_experts, __ppu_bfloat16* gemm1_output, int gemm1_output_stride, uint16_t* sfa_scratch, uint8_t* fp4_output, uint16_t* scale_output, int pull_begin_block, int pull_end_block, int resume_dispatch, int finalize_dispatch, int synchronize_pull, int publish_arrivals, int num_launch_blocks) {
 
 using namespace deep_gemm;
@@ -291,8 +288,6 @@ constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_I
 constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
 constexpr uint64_t off_pt = {LAYOUT_OFF_PT}, off_psf = {LAYOUT_OFF_PSF};
 
-constexpr uint32_t NUM_PRODUCER_WARPS = {PRODUCER_WARPS};
-constexpr uint32_t NUM_LAUNCH_THREADS = NUM_THREADS + NUM_PRODUCER_WARPS * 32;
 
 const int64_t local_base = sb.base;
 auto P = [&](uint64_t off) -> void* { return (void*)(local_base + (int64_t)off); };
@@ -339,7 +334,7 @@ uint8_t* fp4_out = (uint8_t*)fp4_output_ptr;
 uint8_t* scale_out = (uint8_t*)scale_output_ptr;
 
 deep_gemm::mega_moe::fp4::dispatch_gemm1_device<
-    NUM_RANKS, NUM_SMS, NUM_LAUNCH_THREADS, NUM_EXPERTS,
+    NUM_RANKS, NUM_SMS, NUM_THREADS, NUM_EXPERTS,
     NUM_EXPERTS_PER_RANK, NUM_TOPK, BLOCK_M, CHUNK_BLOCKS,
     {PULL_SMS},
     {GEMM_SMS},
@@ -389,7 +384,7 @@ deep_gemm::mega_moe::fp4::dispatch_gemm1_device<
          int32_t(synchronize_pull),
          int32_t(publish_arrivals),
          int32_t(num_launch_blocks)},
-        dim3(num_launch_blocks), config.num_threads + config.producer_warps * 32);
+        dim3(num_launch_blocks), config.num_threads);
 }
 
 struct Bf16MegaMoePreDispatchTag {};
