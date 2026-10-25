@@ -42,8 +42,7 @@ inline void barrier_reduce_impl(const torch::Tensor& buf, const torch::Tensor& w
     const bool scaled = scales.has_value();
     const int threads = mega_moe_config::combine_num_threads(tokens, hidden);
     const int scale_tiles = scaled ? ceil_div(hidden, scale_block_n) : 0;
-    const int shift = fp8 && !scaled && !mega_moe_config::fp8_unit_scale()
-                          ? get_env<int>("DG_MOE_SCATTER_FP8_EXP_SHIFT", 0) : 0;
+    constexpr int shift = 0;
     const auto body = fmt::format(
         "barrier_reduce_kernel<{}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d);",
         topk, fp8, scaled, threads);

@@ -341,11 +341,6 @@ inline DispatchConfig fp8_dispatch_config(int ranks, int experts, int topk, int 
     c.block_m = bm;
     return c;
 }
-inline bool fp8_unit_scale() {
-    return get_env<std::string>("DG_MOE_SCATTER_FP8_STATIC_SCALE_ONE", "0") == "1" &&
-           get_env<std::string>("DG_MOE_SCATTER_FP8_SIDE_SCALE", "1") == "1" &&
-           get_env<std::string>("DG_MOE_SCATTER_FP8_SIDE_SCALE_DYNAMIC", "0") != "1";
-}
 inline Config fp4_scatter_config(int m, int n, int k, int groups, std::optional<Config> requested,
                                  bool low_latency, bool masked, std::optional<bool> fp8,
                                  std::optional<int> expected) {
@@ -376,7 +371,7 @@ inline Config fp4_scatter_config(int m, int n, int k, int groups, std::optional<
         wn = fields[4];
         stages = fields[5];
     } else if (low_latency) {
-        const bool quant = fp8.value_or(get_env<std::string>("DG_MOE_SCATTER_FP8", "0") == "1");
+        const bool quant = fp8.value_or(false);
         // Select measured low-latency tile configurations by group count and expected M.
         if (!quant && groups == 12 && em <= 64) {
             bm = 64;
@@ -541,13 +536,10 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
 inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capacity, int num_tokens,
                                   bool dynamic, bool bf16, bool dispatch_only, bool split, bool glu,
                                   bool quantize_output, const Gemm1Tuning& tuning = {}) {
-    const bool gemm = !dispatch_only && flag("MEGA_MOE_ENABLE_GEMM1", true);
-    const int push_threshold = integer("MEGA_MOE_BF16_PUSH_MIN_TOKENS", 512);
-    TORCH_CHECK(push_threshold >= 0);
-    const bool push =
-        dispatch_only && flag("MEGA_MOE_ENABLE_REMOTE_PUSH", bf16 && num_tokens >= push_threshold && !split);
+    const bool gemm = !dispatch_only;
+    const bool push = dispatch_only && bf16 && num_tokens >= 512 && !split;
     TORCH_CHECK(!push || (!split && capacity.sf_bytes == 0));
-    const bool pull = !push && flag("MEGA_MOE_ENABLE_REMOTE_PULL", true);
+    const bool pull = !push;
     const int sms = c.num_sms, serial_rows = integer("MEGA_MOE_SERIAL_MAX_RECV_ROWS", 2 * sms);
     TORCH_CHECK(serial_rows >= 0);
     const bool latency =

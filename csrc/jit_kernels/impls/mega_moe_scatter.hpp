@@ -543,7 +543,7 @@ inline void m_grouped_gemm_fp4_with_scatter_impl(
         scale_block_n = bn;
     torch::Tensor cs, so;
     if (side) {
-        side_mode = get_env<std::string>("DG_MOE_SCATTER_FP8_SIDE_SCALE_DYNAMIC", "0") == "1" ? 2 : 1;
+        side_mode = 1;
         TORCH_CHECK(combine_scales->is_cuda() && combine_scales->scalar_type() == torch::kInt64 &&
                     combine_scales->is_contiguous());
         TORCH_CHECK(scale_offsets && scale_offsets->scalar_type() == torch::kInt64 &&

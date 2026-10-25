@@ -507,12 +507,8 @@ static void m_grouped_gemm_fp4_with_scatter(const Pair& lhs_, const Pair& rhs_, 
     const int groups = masters + (rhs_replicas_ ? replica.size(0) : 0);
     TORCH_CHECK(groups > 0 && hidden == n && rank >= 0 && rank < world_size && world_size <= 64 &&
                 max_tokens > 0 && num_topk > 0);
-    const bool fp8 = force_fp8_scatter.value_or(get_env<std::string>("DG_MOE_SCATTER_FP8", "0") == "1");
-    const bool unit = fp8 && mega_moe_config::fp8_unit_scale();
-    int shift = integer("DG_MOE_SCATTER_FP8_EXP_SHIFT", 0);
-    TORCH_CHECK(shift >= 0 && shift <= 12);
-    if (unit)
-        shift = 0;
+    const bool fp8 = force_fp8_scatter.value_or(false);
+    constexpr int shift = 0;
     check_tensor(combine_buf, fp8 ? torch::kUInt8 : torch::kBFloat16);
     TORCH_CHECK(combine_buf.numel() >= int64_t(num_topk) * max_tokens * hidden);
     check_tensor(token_meta, torch::kInt64);
