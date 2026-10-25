@@ -549,13 +549,11 @@ inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capac
     const int slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
     int pulls, gemms;
     if (specialized) {
-        pulls = integer("MEGA_MOE_PULL_SMS", std::getenv("MEGA_MOE_GEMM_SMS")
-                                                 ? sms - integer("MEGA_MOE_GEMM_SMS", 0)
-                                                 : tuning.pull_sms.value_or(std::min(6, sms - 1)));
-        gemms = integer("MEGA_MOE_GEMM_SMS", sms - pulls);
+        pulls = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(std::min(6, sms - 1)));
+        gemms = sms - pulls;
     } else {
         pulls = latency ? sms : integer("MEGA_MOE_PULL_SMS", sms);
-        gemms = latency ? sms : integer("MEGA_MOE_GEMM_SMS", sms);
+        gemms = sms;
     }
     TORCH_CHECK(pulls >= 1 && pulls <= sms && gemms >= 1 && gemms <= sms);
     TORCH_CHECK(!specialized || ((gemm || pull) && pulls + gemms == sms));
