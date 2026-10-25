@@ -359,8 +359,7 @@ static void fp8_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor&
 
 static int run_fp8_gemm1(const py::object& buffer, int rank, int num_tokens, const Tensor& weight,
                          const Tensor& scales, const Tensor& output, OptTensor quant, OptTensor quant_scale,
-                         std::optional<float> limit, std::optional<bool> paired,
-                         std::optional<bool> triple, OptTensor replicas, OptTensor replica_scales,
+                         std::optional<float> limit, OptTensor replicas, OptTensor replica_scales,
                          std::optional<float> alpha,
                          std::optional<std::string> selected, const mega_moe_config::Gemm1Tuning& tuning = {}) {
     auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
@@ -393,7 +392,7 @@ static int run_fp8_gemm1(const py::object& buffer, int rank, int num_tokens, con
     const auto [oai, activation_alpha] = fp8_activation_config(alpha, selected);
     return mega_moe_native::fp8_mega_moe_dispatch_gemm1_impl(
         c, field<Tensor>(buffer, "buf_ptrs"), rank, num_tokens, weight, scales, rw, rs, masters, output,
-        quant, quant_scale, limit, paired, triple, oai, activation_alpha, tuning,
+        quant, quant_scale, limit, oai, activation_alpha, tuning,
         field<std::optional<int>>(buffer, "_block_m_override"));
 }
 static void fp8_blockwise_mega_moe_pre_dispatch(const py::object& buffer, const Tensor& hidden_states,
@@ -1041,7 +1040,7 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
                                                : std::nullopt;
         return run_fp8_gemm1(buffer, rank, num_tokens, rhs.first, rhs.second,
                              quant ? *bf16_scratch : out, quant ? OptTensor(out) : std::nullopt,
-                             out_scales, activation_limit, std::nullopt, std::nullopt,
+                             out_scales, activation_limit,
                              rhs_replicas ? OptTensor(rhs_replicas->first) : std::nullopt,
                              rhs_replicas ? OptTensor(rhs_replicas->second) : std::nullopt,
                              alpha, act, gemm1_tuning);

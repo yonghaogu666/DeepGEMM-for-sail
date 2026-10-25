@@ -8,7 +8,6 @@
 namespace deep_gemm::mega_moe_config {
 
 enum class Precision { W4A4, W4A16, FP8Channelwise, FP8Blockwise };
-enum class PullMode { Single, Paired, Triple };
 using Tile = std::array<int, 6>; // BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages
 
 struct TuningWorkload {
@@ -21,7 +20,6 @@ struct Gemm1Tuning {
     std::optional<Tile> tile{};
     std::optional<int> block_m{};
     std::optional<int> pull_sms{};
-    std::optional<PullMode> pull_mode{};
     std::optional<bool> dynamic_queue{}; // Unset: backend policy; false: explicitly disabled.
     bool separate_dispatch = false;
     std::optional<int> dispatch_threads{};
@@ -75,7 +73,6 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
     if (!enabled || device != "ZW-M890P" || sms != 39)
         return result;
     using P = Precision;
-    using M = PullMode;
     // Separate dispatch and GEMM launches keep their own CTA geometry. The
     // buffer tile describes transport padding, independently of the MMA tile.
     const auto separate_gemm1 = [](const Tile& tile, int dispatch_threads = 512) {
@@ -135,24 +132,24 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
         {"kimi_k3", P::W4A16, 32, 896, 16, 3584, 3072, "situ", k3_ep32},
         {"kimi_k3", P::W4A16, 32, 928, 16, 3584, 3072, "situ", k3_ep32},
         {"minimax_m3", P::FP8Channelwise, 8, 128, 4, 6144, 3072, "swiglu_oai",
-         {{1024, {{}, {}, 3, M::Triple}}, {2048, {{}, {}, 3, M::Triple}},
-          {4096, {{}, {}, 3, M::Triple}}}},
+         {{1024, {{}, {}, 3}}, {2048, {{}, {}, 3}},
+          {4096, {{}, {}, 3}}}},
         {"minimax_m3_blockwise", P::FP8Blockwise, 8, 384, 4, 7168, 5120, "swiglu_oai",
-         {{64, {{}, 32, {}, {}, true}, {Tile{32, 256, 128, 16, 64, 3}}},
+         {{64, {{}, 32, {}, true}, {Tile{32, 256, 128, 16, 64, 3}}},
           {1024, {{}, {}, 4}}, {4096, {{}, {}, 4}}}},
         {"minimax_m3_blockwise", P::FP8Blockwise, 16, 384, 4, 7168, 5120, "swiglu_oai",
-         {{64, {{}, 32, {}, {}, true}, {Tile{32, 256, 128, 16, 64, 3}}}}},
+         {{64, {{}, 32, {}, true}, {Tile{32, 256, 128, 16, 64, 3}}}}},
         {"minimax_m3_blockwise", P::FP8Blockwise, 32, 384, 4, 7168, 5120, "swiglu_oai",
          {{1024, {{}, {}, 4}}, {4096, {{}, {}, 3}}}},
         {"glm52", P::FP8Channelwise, 8, 256, 8, 6144, 2048, "swiglu",
-         {{32, {{}, 128, {}, {}, true}, {Tile{128, 256, 128, 32, 64, 4}, {}, 4096, true}},
-          {1024, {{}, {}, 9, M::Triple, true}},
-          {2048, {{}, {}, 9, M::Triple}}, {4096, {{}, {}, 9, M::Triple}}}},
+         {{32, {{}, 128, {}, true}, {Tile{128, 256, 128, 32, 64, 4}, {}, 4096, true}},
+          {1024, {{}, {}, 9, true}},
+          {2048, {{}, {}, 9}}, {4096, {{}, {}, 9}}}},
         {"glm53_flash", P::FP8Channelwise, 4, 288, 8, 4096, 2048, "swiglu",
-         {{1024, {{}, 128, 6, {}, true}, {Tile{128, 256, 128, 32, 64, 3}}},
+         {{1024, {{}, 128, 6, true}, {Tile{128, 256, 128, 32, 64, 3}}},
           {2048}, {4096}}},
         {"qwen38_flash", P::FP8Channelwise, 4, 512, 10, 2560, 640, "swiglu",
-         {{1024, {{}, {}, 9, M::Triple}, {Tile{128, 256, 128, 32, 64, 3}}},
+         {{1024, {{}, {}, 9}, {Tile{128, 256, 128, 32, 64, 3}}},
           {2048, {{}, {}, 12}}, {4096, {{}, {}, 12}}}},
         {"mimo_v26_pro", P::W4A4, 8, 384, 8, 6144, 2048, "swiglu",
          {{2048, {{}, {}, 8}}, {4096, {{}, {}, 8}, {{}, 1}},
@@ -188,10 +185,6 @@ inline bool channel_pair_staging_default(int m, int n, int k, int groups, int ex
             topk == entry.topk)
             return true;
     return false;
-}
-
-inline const char* pull_mode_name(PullMode mode) {
-    return mode == PullMode::Paired ? "paired" : mode == PullMode::Triple ? "triple" : "single";
 }
 
 } // namespace deep_gemm::mega_moe_config

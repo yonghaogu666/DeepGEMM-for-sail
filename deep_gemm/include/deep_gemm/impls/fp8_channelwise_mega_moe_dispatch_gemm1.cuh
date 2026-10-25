@@ -129,7 +129,6 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kPairedBlockPull = false, bool kTripleBlockPull = false,
     bool kSwiGLUOAI = false, bool kDynamicWork = false>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
@@ -164,12 +163,8 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                   "CTA threads must match the GEMM TiledMMA");
     static_assert(kNumPullCTAs > 0 && kNumPullCTAs < kNumCTAs,
                   "overlap requires separate pull and GEMM CTAs");
-    static_assert(!kPairedBlockPull || kNumPullCTAs % 2 == 0,
-                  "paired block pull requires two equal producer teams");
-    static_assert(!kTripleBlockPull || kNumPullCTAs % 3 == 0,
+    static_assert(kNumPullCTAs % 3 == 0,
                   "triple block pull requires three equal producer teams");
-    static_assert(!(kPairedBlockPull && kTripleBlockPull),
-                  "select at most one producer-team schedule");
 
     extern __shared__ __align__(16) unsigned char smem_buf[];
     const uint32_t cta_idx = blockIdx.x;
@@ -310,19 +305,15 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             g * kBlockM};
     };
 
-    // Pull CTAs cooperate on each M block. A hot expert is therefore split
-    // across kNumPullCTAs instead of being pinned to one CTA. Each warp owns one
-    // 6144-byte shared slot and publishes the block only after all local stores
-    // and metadata writes are complete.
+    // Three pull teams process interleaved M blocks. CTAs in each team partition
+    // the block's rows, with one shared token slot per warp. Publish arrivals
+    // only after all local stores and metadata writes are complete.
     if (cta_idx < kNumPullCTAs) {
-        constexpr uint32_t kNumPullTeams =
-            kTripleBlockPull ? 3 : (kPairedBlockPull ? 2 : 1);
+        constexpr uint32_t kNumPullTeams = 3;
         constexpr uint32_t kPullTeamSize =
             kNumPullCTAs / kNumPullTeams;
-        const uint32_t pull_team =
-            kNumPullTeams > 1 ? cta_idx / kPullTeamSize : 0;
-        const uint32_t team_sm_idx =
-            kNumPullTeams > 1 ? cta_idx % kPullTeamSize : cta_idx;
+        const uint32_t pull_team = cta_idx / kPullTeamSize;
+        const uint32_t team_sm_idx = cta_idx % kPullTeamSize;
         uint8_t* smem_token =
             smem_buf + static_cast<uint64_t>(warp_idx) * kTokenBytes;
         for (uint32_t g = pull_team; g < total_m_blocks;
@@ -483,7 +474,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 kBlockM, group_m - m_block * kBlockM);
 
             constexpr uint32_t kRequiredArrivals =
-                kNumPullCTAs / (kTripleBlockPull ? 3 : kPairedBlockPull ? 2 : 1);
+                kNumPullCTAs / 3;
             while (tix::ld_acq(
                        workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
 
@@ -534,7 +525,6 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kPairedBlockPull = false, bool kTripleBlockPull = false,
     bool kSwiGLUOAI = false, bool kDynamicWork = false>
 __global__ __launch_bounds__(kNumThreads, 1) void
 dispatch_gemm1_kernel(
@@ -557,7 +547,7 @@ dispatch_gemm1_kernel(
         const float swiglu_alpha,
         const uint32_t num_tokens,
         const uint32_t num_max_tokens_per_rank) {
-    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kBlockM, kTokenBytes, kGemm1N, kBlockN, kBlockK, kWarpM, kWarpN, kStages, kNumPullCTAs, kPairedBlockPull, kTripleBlockPull, kSwiGLUOAI, kDynamicWork>(workspace_base, sym_buffer, input_topk_idx, input_topk_weights, input_token, input_scale, token_pool, scale_pool, topk_weight_pool, gemm1_weight, gemm1_weight_scale, gemm1_weight_replicas, gemm1_weight_scale_replicas, num_master_experts, swiglu_output, swiglu_limit, swiglu_alpha, num_tokens, num_max_tokens_per_rank);
+    dispatch_gemm1_device<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kBlockM, kTokenBytes, kGemm1N, kBlockN, kBlockK, kWarpM, kWarpN, kStages, kNumPullCTAs, kSwiGLUOAI, kDynamicWork>(workspace_base, sym_buffer, input_topk_idx, input_topk_weights, input_token, input_scale, token_pool, scale_pool, topk_weight_pool, gemm1_weight, gemm1_weight_scale, gemm1_weight_replicas, gemm1_weight_scale_replicas, num_master_experts, swiglu_output, swiglu_limit, swiglu_alpha, num_tokens, num_max_tokens_per_rank);
 }
 
 }  // namespace deep_gemm::mega_moe::fp8_channelwise

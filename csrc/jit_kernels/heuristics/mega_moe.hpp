@@ -43,7 +43,6 @@ struct DispatchConfig {
     int num_sms = 0;
     int num_threads = 0;
     int num_topk = 0;
-    int paired_block_pull = 0;
     int producer_warps = 0;
     int pull_slots = 0;
     int pull_sms = 0;
@@ -58,7 +57,6 @@ struct DispatchConfig {
     float swiglu_alpha = 0;
     bool swiglu_oai = false;
     int token_bytes = 0;
-    int triple_block_pull = 0;
     int w4_block_k = 0;
     int w4_block_m = 0;
     int w4_block_n = 0;
@@ -448,26 +446,7 @@ inline Config fp4_pipeline_scatter_config(int m, int n, int k, int groups,
     return fp4_scatter_config(m, n, k, groups, requested, true, false, false, em);
 }
 
-inline void fp8_pull_config(DispatchConfig& c, std::optional<bool> paired,
-                            std::optional<bool> triple = std::nullopt,
-                            const std::string& default_mode = "triple", const Gemm1Tuning& tuning = {}) {
-    TORCH_CHECK(!(paired.value_or(false) && triple.value_or(false)));
-    const auto mode = paired || triple ? (paired.value_or(false)   ? "paired"
-                                          : triple.value_or(false) ? "triple"
-                                                                   : default_mode)
-                                       : get_env<std::string>("MEGA_MOE_PULL_MODE",
-                                             tuning.pull_mode ? pull_mode_name(*tuning.pull_mode) : default_mode);
-    TORCH_CHECK(mode == "single" || mode == "paired" || mode == "triple");
-    const int pulls = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(6));
-    const int team = mode == "triple" ? 3 : mode == "paired" ? 2 : 1;
-    TORCH_CHECK(pulls > 0 && pulls < c.num_sms && pulls % team == 0, "Invalid FP8 pull SM partition");
-    c.num_pull_sms = pulls;
-    c.paired_block_pull = int(mode == "paired");
-    c.triple_block_pull = int(mode == "triple");
-}
-
-inline void fp8_gemm1_config(DispatchConfig& c, std::optional<bool> paired,
-                             std::optional<bool> triple, const Gemm1Tuning& tuning,
+inline void fp8_gemm1_config(DispatchConfig& c, const Gemm1Tuning& tuning,
                              std::optional<int> block_m = std::nullopt) {
     // Pull reads unpadded source rows; only this rank's landing pool and GEMM
     // metadata use BM. Workspace offsets and peer handshakes are independent
@@ -481,7 +460,9 @@ inline void fp8_gemm1_config(DispatchConfig& c, std::optional<bool> paired,
     c.gemm1_stages = 4;
     c.num_threads = threads(c.gemm1_compute_m, c.gemm1_block_n, c.gemm1_warp_m, c.gemm1_warp_n);
     c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(false);
-    fp8_pull_config(c, paired, triple, "triple", tuning);
+    c.num_pull_sms = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(6));
+    TORCH_CHECK(c.num_pull_sms > 0 && c.num_pull_sms < c.num_sms && c.num_pull_sms % 3 == 0,
+                "FP8 channelwise pull CTAs must form three equal teams");
 }
 
 inline int blockwise_compute_m(std::optional<int> expected_m, int groups, int n, int sms) {

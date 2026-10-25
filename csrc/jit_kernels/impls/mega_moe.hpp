@@ -62,7 +62,6 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"NUM_SMS", std::to_string(c.num_sms)},
         {"NUM_THREADS", std::to_string(c.num_threads)},
         {"NUM_TOPK", std::to_string(c.num_topk)},
-        {"PAIRED_BLOCK_PULL", std::to_string(c.paired_block_pull)},
         {"PRODUCER_WARPS", std::to_string(c.producer_warps)},
         {"PULL_SLOTS", std::to_string(c.pull_slots)},
         {"PULL_SMS", std::to_string(c.pull_sms)},
@@ -79,7 +78,6 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"SWIGLU_ALPHA", source_float_literal(c.swiglu_alpha)},
         {"SWIGLU_OAI", (c.swiglu_oai ? "true" : "false")},
         {"TOKEN_BYTES", std::to_string(c.token_bytes)},
-        {"TRIPLE_BLOCK_PULL", std::to_string(c.triple_block_pull)},
         {"W4_BLOCK_K", std::to_string(c.w4_block_k)},
         {"W4_BLOCK_M", std::to_string(c.w4_block_m)},
         {"W4_BLOCK_N", std::to_string(c.w4_block_n)},
@@ -646,8 +644,7 @@ deep_gemm::mega_moe::fp8_channelwise::dispatch_gemm1_device<
     NUM_RANKS, NUM_SMS, NUM_THREADS, NUM_EXPERTS, NUM_EXPERTS_PER_RANK,
     NUM_TOPK, BLOCK_M, TOKEN_BYTES, GEMM1_N, GEMM1_BLOCK_N,
     GEMM1_BLOCK_K, GEMM1_WARP_M, GEMM1_WARP_N, GEMM1_STAGES,
-    NUM_PULL_SMS, {PAIRED_BLOCK_PULL},
-    {TRIPLE_BLOCK_PULL}, {SWIGLU_OAI}, {GEMM1_DYNAMIC_QUEUE}>(
+    NUM_PULL_SMS, {SWIGLU_OAI}, {GEMM1_DYNAMIC_QUEUE}>(
     P(off_ws), sb,
     (const int64_t*)P(off_iti), (const float*)P(off_itw),
     (const uint8_t*)P(off_it), (const float*)P(off_isf),
@@ -919,12 +916,11 @@ inline int fp8_mega_moe_dispatch_gemm1_impl(
     DispatchConfig c, const torch::Tensor& ptrs, int rank, int num_tokens, const torch::Tensor& weight,
     const torch::Tensor& scales, const torch::Tensor& rw, const torch::Tensor& rs, int masters,
     const torch::Tensor& output, std::optional<torch::Tensor> quant, std::optional<torch::Tensor> quant_scale,
-    std::optional<float> limit, std::optional<bool> paired,
-    std::optional<bool> triple, bool oai, float alpha,
+    std::optional<float> limit, bool oai, float alpha,
     const mega_moe_config::Gemm1Tuning& tuning = {}, std::optional<int> block_m = std::nullopt) {
     const int n = weight.size(1);
     c.gemm1_n = n;
-    mega_moe_config::fp8_gemm1_config(c, paired, triple, tuning, block_m);
+    mega_moe_config::fp8_gemm1_config(c, tuning, block_m);
     c.swiglu_oai = oai;
     c.swiglu_alpha = alpha;
     const float clamp = limit.value_or(-1.0f);
