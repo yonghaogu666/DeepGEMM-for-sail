@@ -603,7 +603,7 @@ inline std::pair<Config, ScatterConfig> channel_scatter_policy(
     std::optional<bool> rolling_override, std::optional<int> sms_override,
     const Gemm2Tuning& tuning = {}) {
     const int em = ceil_div(m, groups), physical_sms = get_num_sms();
-    int sms = sms_override.value_or(integer("DG_CHANNELWISE_SCATTER_NUM_SMS", physical_sms));
+    const int sms = sms_override.value_or(physical_sms);
     TORCH_CHECK(sms > 0 && sms <= physical_sms);
     std::string kernel = kernel_override.value_or("Default");
     TORCH_CHECK(kernel == "Default" || kernel == "OverlapPrologue");

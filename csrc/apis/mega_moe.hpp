@@ -19,7 +19,6 @@ using OptTensor = std::optional<Tensor>;
 using OptPair = std::optional<Pair>;
 using Config = mega_moe_config::Config;
 using mega_moe_config::DispatchConfig;
-using mega_moe_config::flag;
 using mega_moe_config::integer;
 using mega_moe_config::Precision;
 using mega_moe_config::TuningConfig;
