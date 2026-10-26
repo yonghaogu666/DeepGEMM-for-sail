@@ -18,9 +18,7 @@ struct DispatchConfig {
     int chunk_blocks = 0;
     int clamp = 0;
     float clamp_value = 0;
-    bool enable_gemm1 = false;
     bool gemm1_dynamic_queue = false;
-    bool enable_remote_pull = false;
     bool enable_remote_push = false;
     bool quantize_output = false;
     bool fused_situ = false;
@@ -52,7 +50,6 @@ struct DispatchConfig {
     float situ_beta = 0;
     float situ_linear_beta = 0;
     bool situ_tanh_bf16x2 = false;
-    bool sm_specialization = false;
     float swiglu_alpha = 0;
     bool swiglu_oai = false;
     int token_bytes = 0;
@@ -532,38 +529,16 @@ inline ScatterConfig fp8_blockwise_scatter_config(int n, int k, int groups, int 
 }
 
 // Keep dispatch scheduling independent of buffer ownership and kernel argument assembly.
-inline void fp4_dispatch_schedule(DispatchConfig& c, const DispatchConfig& capacity, int num_tokens,
-                                  bool bf16, bool dispatch_only, bool split, bool glu,
-                                  bool quantize_output, const Gemm1Tuning& tuning = {}) {
-    const bool gemm = !dispatch_only;
-    const bool push = dispatch_only && bf16 && num_tokens >= 512 && !split;
-    TORCH_CHECK(!push || (!split && capacity.sf_bytes == 0));
-    const bool pull = !push;
-    const int sms = c.num_sms, serial_rows = integer("MEGA_MOE_SERIAL_MAX_RECV_ROWS", 2 * sms);
-    TORCH_CHECK(serial_rows >= 0);
-    const bool latency =
-        flag("MEGA_MOE_LATENCY_OPTIMIZED",
-             num_tokens * c.num_topk <= serial_rows && glu && quantize_output && gemm && pull);
-    const bool specialized = !dispatch_only && !latency && flag("MEGA_MOE_SM_SPECIALIZATION", true);
-    c.gemm1_dynamic_queue = specialized && gemm && pull && tuning.dynamic_queue.value_or(true);
-    const int slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
-    int pulls, gemms;
-    if (specialized) {
-        pulls = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(std::min(6, sms - 1)));
-        gemms = sms - pulls;
-    } else {
-        pulls = latency ? sms : integer("MEGA_MOE_PULL_SMS", sms);
-        gemms = sms;
-    }
-    TORCH_CHECK(pulls >= 1 && pulls <= sms && gemms >= 1 && gemms <= sms);
-    TORCH_CHECK(!specialized || ((gemm || pull) && pulls + gemms == sms));
-    c.enable_gemm1 = gemm;
-    c.enable_remote_pull = pull;
-    c.enable_remote_push = push;
+inline void fp4_dispatch_schedule(DispatchConfig& c, const Gemm1Tuning& tuning = {}) {
+    const int sms = c.num_sms;
+    const int pulls = integer("MEGA_MOE_PULL_SMS", tuning.pull_sms.value_or(std::min(6, sms - 1)));
+    TORCH_CHECK(pulls >= 1 && pulls < sms,
+                "W4A4 pull CTAs must leave at least one compute CTA");
+    c.gemm1_dynamic_queue = tuning.dynamic_queue.value_or(true);
+    c.enable_remote_push = false;
     c.pull_sms = pulls;
-    c.gemm_sms = gemms;
-    c.sm_specialization = specialized;
-    c.pull_slots = slots;
+    c.gemm_sms = sms - pulls;
+    c.pull_slots = dispatch_pull_slots(c.num_threads, c.token_bytes, c.sf_bytes);
 }
 
 inline void w4a16_dispatch_tile(DispatchConfig& c, int n) {

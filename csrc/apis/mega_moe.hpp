@@ -247,7 +247,7 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
                                 bool fused_swiglu, OptTensor fp4_output, OptTensor scale_output,
                                 bool quantize_output, OptTensor gemm1_weight_replicas,
                                 OptTensor gemm1_weight_sf_u16_replicas, bool fused_situ, float situ_beta,
-                                float situ_linear_beta, bool situ_tanh_bf16x2, bool dispatch_only,
+                                float situ_linear_beta, bool situ_tanh_bf16x2,
                                 int pull_begin_block, int pull_end_block, bool resume_dispatch,
                                 bool finalize_dispatch, bool synchronize_pull, bool publish_arrivals,
                                 int num_launch_blocks, std::optional<std::string> activation_type,
@@ -259,14 +259,13 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
     const bool glu = !act.empty(),
                split = pull_begin_block != 0 || pull_end_block >= 0 || resume_dispatch || !finalize_dispatch;
     TORCH_CHECK(!situ_tanh_bf16x2 || act == "situ_and_mul");
-    TORCH_CHECK(!split || dispatch_only);
+    TORCH_CHECK(!split, "W4A4 GEMM1 requires a complete dispatch");
     TORCH_CHECK(pull_begin_block >= 0 && (pull_end_block < 0 || pull_end_block >= pull_begin_block));
     TORCH_CHECK(!resume_dispatch || pull_begin_block > 0 || publish_arrivals);
     if (num_launch_blocks < 0)
         num_launch_blocks = capacity.num_sms;
     TORCH_CHECK(num_launch_blocks >= 1 && num_launch_blocks <= 8 * capacity.num_sms);
-    TORCH_CHECK(num_launch_blocks == capacity.num_sms ||
-                (dispatch_only && resume_dispatch && !synchronize_pull && !finalize_dispatch));
+    TORCH_CHECK(num_launch_blocks == capacity.num_sms);
     TORCH_CHECK(synchronize_pull || !finalize_dispatch);
     TORCH_CHECK(!publish_arrivals || resume_dispatch);
     if (act == "situ_and_mul")
@@ -303,10 +302,7 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
     const int pool = field<int>(buffer, "num_pool");
     Tensor output;
     int stride = 0;
-    if (dispatch_only) {
-        TORCH_CHECK(!glu && !quantize_output);
-        output = torch::empty({1}, gemm1_weight.options().dtype(torch::kBFloat16));
-    } else if (quantize_output) {
+    if (quantize_output) {
         TORCH_CHECK(glu && fp4_output && scale_output);
         check_tensor(*fp4_output, torch::kUInt8);
         check_tensor(*scale_output, torch::kUInt16, false);
@@ -323,9 +319,9 @@ static int fp4_mega_moe_dispatch_gemm1(const py::object& buffer, int rank, int n
     const auto scratch = buffer.attr("get_sfa_scratch")(pool * (capacity.sf_bytes / 2)).cast<Tensor>();
 
     return mega_moe_native::fp4_mega_moe_dispatch_gemm1_impl(
-        c, capacity, field<Tensor>(buffer, "buf_ptrs"), gemm1_weight, gemm1_weight_sf, gemm1_weight_sf_u16,
+        c, field<Tensor>(buffer, "buf_ptrs"), gemm1_weight, gemm1_weight_sf, gemm1_weight_sf_u16,
         replica, replica_scale, output, scratch, rank, num_tokens, masters, stride, sfb_bn, fp4_output,
-        scale_output, py::hasattr(buffer, "bf16_hidden"), dispatch_only, split, glu, quantize_output,
+        scale_output, quantize_output,
         act, activation_clamp, situ_beta, situ_linear_beta, situ_tanh_bf16x2, pull_begin_block,
         pull_end_block, resume_dispatch, finalize_dispatch, synchronize_pull, publish_arrivals,
         num_launch_blocks, gemm2_block_m, tuning);
@@ -986,7 +982,7 @@ int mega_moe_dispatch_gemm1(const py::object& buffer, const Pair& rhs, const Ten
             activation_limit.value_or(0.0f), false, quant ? OptTensor(out) : std::nullopt, out_scales, quant,
             rhs_replicas ? OptTensor(rhs_replicas->first) : std::nullopt,
             rhs_replicas ? OptTensor(rhs_replicas->second) : std::nullopt, false, situ_beta, situ_linear_beta,
-            false, false, 0, -1, false, true, true, false, -1, act, quant ? std::nullopt : OptTensor(out),
+            false, 0, -1, false, true, true, false, -1, act, quant ? std::nullopt : OptTensor(out),
             gemm2_block_m, gemm1_tuning);
     }
     if (kind == Precision::W4A16) {

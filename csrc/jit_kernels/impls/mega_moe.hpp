@@ -39,8 +39,6 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"CHUNK_BLOCKS", std::to_string(c.chunk_blocks)},
         {"CLAMP", std::to_string(c.clamp)},
         {"CLAMP_VALUE", source_float_literal(c.clamp_value)},
-        {"ENABLE_GEMM1", (c.enable_gemm1 ? "true" : "false")},
-        {"ENABLE_REMOTE_PULL", (c.enable_remote_pull ? "true" : "false")},
         {"ENABLE_REMOTE_PUSH", (c.enable_remote_push ? "true" : "false")},
         {"QUANTIZE_OUTPUT", (c.quantize_output ? "true" : "false")},
         {"FUSED_SITU", (c.fused_situ ? "true" : "false")},
@@ -73,7 +71,6 @@ inline SourceFields source_fields(const DispatchConfig& c) {
         {"SITU_BETA", source_float_literal(c.situ_beta)},
         {"SITU_LINEAR_BETA", source_float_literal(c.situ_linear_beta)},
         {"SITU_TANH_BF16X2", (c.situ_tanh_bf16x2 ? "true" : "false")},
-        {"SM_SPECIALIZATION", (c.sm_specialization ? "true" : "false")},
         {"SWIGLU_ALPHA", source_float_literal(c.swiglu_alpha)},
         {"SWIGLU_OAI", (c.swiglu_oai ? "true" : "false")},
         {"TOKEN_BYTES", std::to_string(c.token_bytes)},
@@ -252,9 +249,9 @@ constexpr int stages = mega_moe::fp4::Gemm1PickStage<BLOCK_M, GEMM1_BLOCK_N, GEM
     GEMM1_WARP_M, GEMM1_WARP_N, GEMM1_STAGES, 262144, {SFB_LAYOUT_BLOCK_N}>::value;
 using Cfg = mega_moe::fp4::Gemm1MmaConfig<BLOCK_M, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
     GEMM1_WARP_M, GEMM1_WARP_N, stages, {SFB_LAYOUT_BLOCK_N}>;
-uint32_t collective = {ENABLE_GEMM1} ? sizeof(typename Cfg::CollectiveMainloop::SharedStorage) : 0;
+uint32_t collective = sizeof(typename Cfg::CollectiveMainloop::SharedStorage);
 uint32_t phase_a = NUM_EXPERTS * sizeof(uint32_t);
-uint32_t pull = {ENABLE_REMOTE_PULL} ? {PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES) : 0;
+uint32_t pull = {PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES);
 return collective > phase_a ? (collective > pull ? collective : pull) : (phase_a > pull ? phase_a : pull);
 }
 extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = ppu_smem_compute();
@@ -317,12 +314,10 @@ static_assert(kGemm1Stages >= 1, "gemm1 needs at least 1 pipeline stage");
 using Cfg = mega_moe::fp4::Gemm1MmaConfig<BLOCK_M, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
                                 GEMM1_WARP_M, GEMM1_WARP_N, kGemm1Stages,
                                 {SFB_LAYOUT_BLOCK_N}>;
-uint32_t smem_collective = {ENABLE_GEMM1}
-    ? (uint32_t)sizeof(typename Cfg::CollectiveMainloop::SharedStorage) : 0;
+uint32_t smem_collective = (uint32_t)sizeof(typename Cfg::CollectiveMainloop::SharedStorage);
 uint32_t smem_phaseA = NUM_EXPERTS * sizeof(uint32_t);
 uint32_t smem = smem_collective > smem_phaseA ? smem_collective : smem_phaseA;
-uint32_t smem_pull = {ENABLE_REMOTE_PULL}
-    ? (uint32_t){PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES) : 0;
+uint32_t smem_pull = (uint32_t){PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES);
 smem = smem > smem_pull ? smem : smem_pull;
 
 float activation_clamp = {CLAMP_VALUE};
@@ -338,11 +333,11 @@ deep_gemm::mega_moe::fp4::dispatch_gemm1_device<
     NUM_EXPERTS_PER_RANK, NUM_TOPK, BLOCK_M, CHUNK_BLOCKS,
     {PULL_SMS},
     {GEMM_SMS},
-    {SM_SPECIALIZATION},
+    true,
     {PULL_SLOTS},
-    {ENABLE_GEMM1}, GEMM1_N, TOKEN_BYTES, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
+    true, GEMM1_N, TOKEN_BYTES, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
     {SFB_LAYOUT_BLOCK_N},
-    {ENABLE_REMOTE_PULL},
+    true,
     {ENABLE_REMOTE_PUSH},
     GEMM1_WARP_M, GEMM1_WARP_N, kGemm1Stages,
     {QUANTIZE_OUTPUT},
@@ -841,21 +836,19 @@ inline void fp4_mega_moe_pre_dispatch_impl(const torch::Tensor& hidden_states, c
 }
 
 inline int fp4_mega_moe_dispatch_gemm1_impl(
-    DispatchConfig c, const DispatchConfig& capacity, const torch::Tensor& buffer_ptrs,
+    DispatchConfig c, const torch::Tensor& buffer_ptrs,
     const torch::Tensor& gemm1_weight, const torch::Tensor& gemm1_weight_sf,
     const torch::Tensor& gemm1_weight_sf_u16, const torch::Tensor& replica,
     const torch::Tensor& replica_scale, const torch::Tensor& output, const torch::Tensor& scratch, int rank,
     int num_tokens, int masters, int stride, int sfb_bn, std::optional<torch::Tensor> fp4_output,
-    std::optional<torch::Tensor> scale_output, bool bf16, bool dispatch_only, bool split,
-    bool glu, bool quantize_output, const std::string& act, float activation_clamp, float situ_beta,
+    std::optional<torch::Tensor> scale_output, bool quantize_output, const std::string& act,
+    float activation_clamp, float situ_beta,
     float situ_linear_beta, bool situ_tanh_bf16x2, int pull_begin_block, int pull_end_block,
     bool resume_dispatch, bool finalize_dispatch, bool synchronize_pull, bool publish_arrivals,
     int num_launch_blocks, int gemm2_block_m = 0,
     const mega_moe_config::Gemm1Tuning& tuning = {}) {
-    mega_moe_config::fp4_dispatch_schedule(c, capacity, num_tokens, bf16, dispatch_only, split, glu,
-                                           quantize_output, tuning);
+    mega_moe_config::fp4_dispatch_schedule(c, tuning);
     c.gemm2_block_m = gemm2_block_m ? gemm2_block_m : c.block_m;
-    TORCH_CHECK(c.enable_remote_pull, "MegaMoE GEMM1 metadata requires remote-pull dispatch");
     c.sfb_layout_block_n = sfb_bn;
     c.clamp_value = std::max(activation_clamp, 0.0f);
     c.fused_swiglu = act == "silu_and_mul" || act == "silu_and_mul_step";
