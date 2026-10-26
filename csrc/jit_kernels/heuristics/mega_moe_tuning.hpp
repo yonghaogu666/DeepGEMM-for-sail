@@ -67,10 +67,9 @@ struct TuningEntry {
     std::initializer_list<TuningCase> cases;
 };
 
-inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& device, int sms,
-                                   bool enabled = true) {
+inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& device, int sms) {
     TuningConfig result{w, {}, {}, {}, {}};
-    if (!enabled || device != "ZW-M890P" || sms != 39)
+    if (device != "ZW-M890P" || sms != 39)
         return result;
     using P = Precision;
     // Separate dispatch and GEMM launches keep their own CTA geometry. The

@@ -117,16 +117,12 @@ inline constexpr std::pair<const char*, int DispatchConfig::*> dispatch_config_f
 using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
 using Overrides = std::map<std::string, int>;
 
-inline bool flag(const char* name, bool fallback = false) {
-    return get_env<std::string>(name, fallback ? "1" : "0") != "0";
-}
 inline int integer(const char* name, int fallback) {
     return get_env<int>(name, fallback);
 }
 
 inline TuningConfig tuning_config(const TuningWorkload& workload) {
-    return select_tuning(workload, device_runtime->get_prop()->name, get_num_sms(),
-                         flag("DG_MOE_USE_TUNED_CONFIGS", true));
+    return select_tuning(workload, device_runtime->get_prop()->name, get_num_sms());
 }
 
 inline std::tuple<int, int, int> fp4_smem(int stages, int bm, int bn, int wm, int wn, int bk = 128,
@@ -331,8 +327,6 @@ inline DispatchConfig fp8_dispatch_config(int ranks, int experts, int topk, int 
     TORCH_CHECK(hidden > 0 && hidden % (blockwise ? 128 : 16) == 0);
     const int bm = fp8_dispatch_block_m(requested_block_m, blockwise);
     auto c = dispatch_config(ranks, experts, topk, capacity, hidden, blockwise ? 4 * hidden / 128 : 4);
-    c.num_sms = integer("SGLANG_PPU_FP8_MEGA_MOE_NUM_SMS", get_num_sms());
-    TORCH_CHECK(c.num_sms > 0 && c.num_sms <= get_num_sms());
     c.num_threads = blockwise ? 256 : 512;
     c.block_m = bm;
     return c;

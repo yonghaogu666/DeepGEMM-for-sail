@@ -189,8 +189,7 @@ Profiles cover quantized GEMM1 output (BF16 for W4A16) and BF16 scatter.
 
 Profiles provide only measured overrides; unset fields use the
 precision-specific heuristics. Explicit workspace options and supported
-environment overrides take precedence. Set `DG_MOE_USE_TUNED_CONFIGS=0`
-before workspace allocation to disable measured profiles. Internal selection
+environment overrides take precedence. Measured profiles are always enabled. Internal selection
 does not read routing tensors or copy their contents to the CPU.
 
 Decode profiles specify the collective buffer tile, GEMM1 tile and dispatch
