@@ -2,13 +2,25 @@
 
 Compute APIs and launch configuration are provided by deep_gemm_cpp.
 """
-from typing import Dict, Optional, NamedTuple, Union
+from typing import Dict, Optional, NamedTuple, Tuple, Union
 import torch
 from . import deep_gemm_cpp
 from .jit_kernels.utils import is_ppu1v5_device
 
 _DEFAULT_GEMM1_BLOCK_N = 256
 _DEFAULT_GEMM1_BLOCK_K = 128
+_GEMM1_TILE_KEYS = ("BLOCK_M", "GEMM1_BLOCK_N", "GEMM1_BLOCK_K",
+                    "GEMM1_WARP_M", "GEMM1_WARP_N", "GEMM1_STAGES")
+
+
+def _tile_config(value, name):
+    if value is None:
+        return None
+    if (not isinstance(value, (tuple, list)) or len(value) != 6 or
+            any(type(v) is not int or v <= 0 for v in value)):
+        raise ValueError(f"{name} must contain six positive integers: "
+                         "(BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages)")
+    return tuple(value)
 
 
 def _compute_fp4_layout(config):
@@ -449,6 +461,8 @@ def get_symm_buffer_for_mega_moe(
         gemm1_block_n: Optional[int] = None, gemm1_block_k: Optional[int] = None,
         config_override: Optional[Dict[str, int]] = None,
         num_tokens_per_rank: Optional[int] = None,
+        gemm1_config: Optional[Tuple[int, int, int, int, int, int]] = None,
+        gemm2_config: Optional[Tuple[int, int, int, int, int, int]] = None,
 ) -> Union[MegaMoEDispatchGemm1SymmBuffer, Fp8MegaMoEDispatchSymmBuffer]:
     """Allocate one reusable MegaMoE symmetric workspace on every rank.
 
@@ -460,7 +474,14 @@ def get_symm_buffer_for_mega_moe(
     route metadata, combine storage and communication state.
     ``hidden`` is always the logical input width.
 
-    W4A4 accepts GEMM1 N/K tile limits and config_override; W4A16 accepts
+    W4A4 accepts independent ``gemm1_config`` and ``gemm2_config`` tiles as
+    (BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages). BLOCK_K counts packed
+    FP4 bytes, so 64 represents 128 logical elements. Explicit tiles apply to
+    every forward using this workspace and take precedence over measured
+    tuning. An omitted stage is selected using the actual input token count.
+    GEMM1 and GEMM2 may use different BLOCK_M values; GEMM1 produces matching
+    GEMM2 metadata internally. GEMM1 N/K tile limits and config_override are
+    also accepted, but cannot be combined with gemm1_config. W4A16 accepts
     block_m. FP8 channelwise supports block_m=128 or 256; omitting it enables
     per-call tuning with a BM256 fallback. An explicit block_m takes precedence
     over the tuning table. FP8 blockwise uses block_m=128 for dispatch/padding;
@@ -480,6 +501,13 @@ def get_symm_buffer_for_mega_moe(
     """
     if not is_ppu1v5_device():
         raise RuntimeError("MegaMoE requires PPU1.5")
+    gemm1_config = _tile_config(gemm1_config, "gemm1_config")
+    gemm2_config = _tile_config(gemm2_config, "gemm2_config")
+    if gemm1_config is not None:
+        if gemm1_block_n is not None or gemm1_block_k is not None or config_override is not None:
+            raise ValueError("gemm1_config cannot be combined with GEMM1 tile limits or config_override")
+        config_override = dict(zip(_GEMM1_TILE_KEYS, gemm1_config))
+        gemm1_block_n, gemm1_block_k = gemm1_config[1:3]
     ranks = int(group.size())
     # Validate the whole calling contract in the C++ API before any collective.
     config = deep_gemm_cpp._mega_moe_dispatch_config(
@@ -487,7 +515,8 @@ def get_symm_buffer_for_mega_moe(
         num_max_tokens_per_rank=num_max_tokens_per_rank, precision=precision,
         intermediate_hidden=intermediate_hidden, block_m=block_m,
         gemm1_block_n=gemm1_block_n, gemm1_block_k=gemm1_block_k, overrides=config_override,
-        num_tokens_per_rank=num_tokens_per_rank)
+        num_tokens_per_rank=num_tokens_per_rank,
+        gemm1_config=gemm1_config, gemm2_config=gemm2_config)
     import torch.distributed._symmetric_memory as symm_mem
     try:
         symm_mem.enable_symm_mem_for_group(group.group_name)
@@ -510,4 +539,5 @@ def get_symm_buffer_for_mega_moe(
             config_override=config_override,
             bf16_hidden=hidden if bf16 else None)
     buffer._init_pipeline(precision, intermediate_hidden)
+    buffer._gemm2_config = gemm2_config
     return buffer

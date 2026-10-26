@@ -47,7 +47,7 @@ CASES = (
 class W4A4MoE:
     """Load weights and allocate once; pre-dispatch and compute on each forward."""
 
-    def __init__(self, case, group, gemm1_weights, gemm2_weights):
+    def __init__(self, case, group, gemm1_weights, gemm2_weights, *, workspace_options=None):
         self.case = case
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.epr = case.experts // self.world
@@ -56,7 +56,7 @@ class W4A4MoE:
             gemm1_weights, gemm2_weights, precision="w4a4")
         self.buf = dg.get_symm_buffer_for_mega_moe(
             group, case.experts, case.capacity, case.topk, case.hidden,
-            precision="w4a4", intermediate_hidden=case.intermediate)
+            precision="w4a4", intermediate_hidden=case.intermediate, **(workspace_options or {}))
         # Private storage is accessed only for the NaN fault-injection test.
         self.combine = self.buf._combine
 
@@ -140,7 +140,7 @@ def reference_output(moe, source, ids, weights, checked):
 
 @torch.inference_mode()
 def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
-             splits=(False,), benchmark=None, verbose=True):
+             splits=(False,), benchmark=None, verbose=True, workspace_options=None):
     """Shared CLI/pytest runner; references and data preparation are not timed."""
     rank, world = dist.get_rank(), dist.get_world_size()
     if check and case.name.startswith("smoke"):
@@ -149,7 +149,7 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
     source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     w1 = make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
     w2 = make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
-    moe = W4A4MoE(case, group, w1, w2)
+    moe = W4A4MoE(case, group, w1, w2, workspace_options=workspace_options)
     reports = []
     try:
         for token_index, requested in enumerate(case.tokens):
@@ -175,6 +175,14 @@ def run_case(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                     max_diff=.003, replicas=split, edge_cases=edge_cases,
                     benchmark=benchmark, verbose=verbose,
                     routing_weights=moe.weights, routing_ids=moe.ids)
+                if check and workspace_options:
+                    meta = moe.buf._metadata
+                    for option, rows in (("gemm1_config", meta.src_m_rows),
+                                         ("gemm2_config", meta.m_rows)):
+                        if option in workspace_options:
+                            bm = workspace_options[option][0]
+                            expected_rows = (meta.valid_m_rows + bm - 1) // bm * bm
+                            torch.testing.assert_close(rows, expected_rows, rtol=0, atol=0)
                 reports.append(report)
     finally:
         moe.close()
@@ -187,6 +195,24 @@ def test_pipeline(case, moe_group):
     splits = (False, True) if case.experts // dist.get_world_size() > 1 else (False,)
     run_case(case, moe_group, edge_cases=True, splits=splits, verbose=False,
              reference_tokens=0 if case.name.startswith("smoke") else case.reference_tokens)
+
+
+@pytest.mark.parametrize("options", [
+    {"gemm1_config": (64, 256, 128, 32, 64, 3)},
+    {"gemm2_config": (64, 256, 128, 32, 64, 3)},
+    {"gemm1_config": (128, 256, 64, 64, 64, 3),
+     "gemm2_config": (64, 256, 128, 32, 64, 3)},
+    {"gemm1_config": (64, 256, 128, 32, 64, 3),
+     "gemm2_config": (128, 256, 64, 64, 64, 3)},
+], ids=["smoke_g1_only", "smoke_g2_only", "smoke_g1_larger", "smoke_g2_larger"])
+def test_tile_configs(options, moe_group):
+    # Reuse the public-entry reference, changing routes, empty-rank and graph
+    # checks with different source and GEMM2 padding in the same workspace.
+    case = CASES[0]
+    case.require_world()
+    splits = (False, True) if case.experts // dist.get_world_size() > 1 else (False,)
+    run_case(case, moe_group, edge_cases=True, splits=splits, verbose=False,
+             workspace_options=options)
 
 
 if __name__ == "__main__":

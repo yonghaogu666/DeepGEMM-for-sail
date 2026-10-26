@@ -225,6 +225,21 @@ def check_workspace_options(case, group):
         invalid += [({"num_experts": 128 * group.size()}, "fewer than 128 local physical experts")]
     else:
         invalid += [({"block_m": 16}, "set BLOCK_M through overrides")]
+    for stage in ("gemm1_config", "gemm2_config"):
+        invalid += [({stage: (64, 256)}, "six positive integers"),
+                    ({stage: (64, 256, 128, 32, 64, 0)}, "six positive integers")]
+        if case.precision != "w4a4":
+            invalid.append(({stage: (64, 256, 128, 32, 64, 3)}, "only supported for w4a4"))
+        else:
+            invalid += [({stage: (96, 256, 128, 32, 64, 3)}, "requires BLOCK_M"),
+                        ({stage: (64, 384, 128, 32, 64, 3)}, "unsupported BLOCK_N"),
+                        ({stage: (64, 256, 48, 32, 64, 3)}, "dividing packed K"),
+                        ({stage: (64, 256, 128, 48, 64, 3)}, "invalid warp tile")]
+    if case.precision == "w4a4":
+        invalid.append(({"gemm2_config": (256, 256, 128, 64, 64, 64)}, "shared-memory capacity"))
+        for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}}):
+            invalid.append(({"gemm1_config": (64, 256, 128, 32, 64, 3), **legacy},
+                            "cannot be combined"))
     for changed, message in invalid:
         with pytest.raises((ValueError, RuntimeError), match=message):
             dg.get_symm_buffer_for_mega_moe(group, **{**options, **changed})

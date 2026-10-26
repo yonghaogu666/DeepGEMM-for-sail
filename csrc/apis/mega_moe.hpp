@@ -151,11 +151,35 @@ static void validate_rank(const DispatchConfig& c, int rank, int tokens) {
 }
 
 // Internal allocation configuration for the Python symmetric-buffer factory.
+static void check_fp4_pipeline_tile(const mega_moe_config::Tile& tile, int n, int k,
+                                    bool gemm1) {
+    const auto [bm, bn, bk, wm, wn, stages] = tile;
+    const char* name = gemm1 ? "gemm1_config" : "gemm2_config";
+    TORCH_CHECK(bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256,
+                name, " requires BLOCK_M in {16,32,64,128,256}");
+    TORCH_CHECK(bn > 0 && (gemm1 ? (bn == 128 || bn == 256) : bn % 256 == 0) && n % bn == 0,
+                name, " has an unsupported BLOCK_N for this output width");
+    TORCH_CHECK(bk > 0 && bk % 32 == 0 && k % bk == 0,
+                name, " requires BLOCK_K divisible by 32 and dividing packed K");
+    TORCH_CHECK(wm > 0 && wn > 0 && wm % 16 == 0 && wn % 16 == 0 &&
+                bm % wm == 0 && bn % wn == 0,
+                name, " has an invalid warp tile");
+    const int threads = mega_moe_config::threads(bm, bn, wm, wn);
+    TORCH_CHECK(threads >= 32 && threads <= 1024 && stages > 0,
+                name, " has an invalid thread or stage count");
+    // GEMM1 reduces its requested stage count to fit shared memory. GEMM2
+    // uses the requested count directly; reject oversized tiles before allocation.
+    const auto smem = mega_moe_config::fp4_smem(gemm1 ? 1 : stages, bm, bn, wm, wn, bk);
+    TORCH_CHECK(std::get<0>(smem) <= 256 * 1024, name, " exceeds shared-memory capacity");
+}
+
 static std::map<std::string, int> dispatch_config(
     int num_ranks, int num_experts, int num_topk, int hidden, int num_max_tokens_per_rank,
     const std::string& precision, std::optional<int> intermediate_hidden,
     std::optional<int> block_m, std::optional<int> gemm1_block_n, std::optional<int> gemm1_block_k,
-    const std::optional<mega_moe_config::Overrides>& overrides, std::optional<int> token_bucket) {
+    const std::optional<mega_moe_config::Overrides>& overrides, std::optional<int> token_bucket,
+    const std::optional<mega_moe_config::Tile>& gemm1_config,
+    const std::optional<mega_moe_config::Tile>& gemm2_config) {
     check_device();
     const auto kind = parse_precision(precision);
     TORCH_CHECK(num_ranks > 0 && num_ranks <= (kind == Precision::FP8Blockwise ? 64 : 32) &&
@@ -177,6 +201,12 @@ static std::map<std::string, int> dispatch_config(
     TORCH_CHECK(!token_bucket || (kind == Precision::W4A16 && *token_bucket > 0 &&
                                  *token_bucket <= num_max_tokens_per_rank),
                 "num_tokens_per_rank requires a common W4A16 bucket within capacity");
+    TORCH_CHECK(kind == Precision::W4A4 || (!gemm1_config && !gemm2_config),
+                "gemm1_config and gemm2_config are only supported for w4a4");
+    if (gemm1_config)
+        check_fp4_pipeline_tile(*gemm1_config, 2 * *intermediate_hidden, hidden / 2, true);
+    if (gemm2_config)
+        check_fp4_pipeline_tile(*gemm2_config, hidden, *intermediate_hidden / 2, false);
     if (kind == Precision::W4A4) {
         TORCH_CHECK(intermediate_hidden && !block_m,
                     "w4a4 requires intermediate_hidden; set BLOCK_M through overrides");
@@ -1262,9 +1292,14 @@ void complete_mega_moe(const Tensor& out, const Pair& w1, const Pair& w2, const 
     check_pipeline_weights(w1, w2, w1_replicas, w2_replicas, kind, experts / world, hidden, intermediate, device);
     auto cache = field<py::dict>(buffer, "_tuning_cache");
     const auto key = py::make_tuple(tokens, activation);
-    if (!cache.contains(key))
-        cache[key] = py::cast(get_mega_moe_tuning_config(world, experts, topk, hidden, intermediate,
-                                                      tokens, precision, activation));
+    if (!cache.contains(key)) {
+        auto selected = get_mega_moe_tuning_config(world, experts, topk, hidden, intermediate,
+                                                  tokens, precision, activation);
+        const auto tile = field<std::optional<mega_moe_config::Tile>>(buffer, "_gemm2_config");
+        if (tile)
+            selected.gemm2.tile = tile;
+        cache[key] = py::cast(selected);
+    }
     const OptTuning tuning = cache[key].cast<TuningConfig>();
     const auto activated = field<Tensor>(buffer, "_activated");
     const auto scales = field<OptTensor>(buffer, "_activation_scales");
@@ -1324,7 +1359,8 @@ void register_apis(py::module_& m) {
           py::kw_only(), py::arg("precision"), py::arg("intermediate_hidden") = py::none(),
           py::arg("block_m") = py::none(),
           py::arg("gemm1_block_n") = py::none(), py::arg("gemm1_block_k") = py::none(),
-          py::arg("overrides") = py::none(), py::arg("num_tokens_per_rank") = py::none());
+          py::arg("overrides") = py::none(), py::arg("num_tokens_per_rank") = py::none(),
+          py::arg("gemm1_config") = py::none(), py::arg("gemm2_config") = py::none());
 }
 
 } // namespace deep_gemm::mega_moe

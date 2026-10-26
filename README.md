@@ -404,6 +404,12 @@ torch.cuda.synchronize()
 buffer.destroy()
 ```
 
+W4A4 workspace allocation accepts optional `gemm1_config` and `gemm2_config`
+tuples `(BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages)` to fix either
+stage's tile. Unspecified stages select their configuration using the actual
+input token count. See [the MegaMoE examples](tests/README.MD) for units,
+constraints and configuration precedence.
+
 ##### State and routing contract
 
 Allocation is collective, outside capture. The workspace owns activation and

@@ -6,7 +6,6 @@
 #include <iterator>
 #include <map>
 #include <optional>
-#include <sstream>
 #include "common_fp4.hpp"
 #include "common_w4a16.hpp"
 #include "mega_moe_tuning.hpp"
@@ -346,21 +345,7 @@ inline Config fp4_scatter_config(int m, int n, int k, int groups, std::optional<
                 "FP4 scatter requires N divisible by 256");
     const int sms = get_num_sms(), em = expected.value_or(ceil_div(m, groups));
     int bm, bn = 256, bk, wm, wn, stages;
-    const auto override = get_env<std::string>("DG_MOE_SCATTER_CONFIG");
-    if (!override.empty()) {
-        std::istringstream input(override);
-        std::string field;
-        std::vector<int> fields;
-        while (std::getline(input, field, ','))
-            fields.push_back(std::stoi(field));
-        TORCH_CHECK(fields.size() == 6, "DG_MOE_SCATTER_CONFIG requires six integers");
-        bm = fields[0];
-        bn = fields[1];
-        bk = fields[2];
-        wm = fields[3];
-        wn = fields[4];
-        stages = fields[5];
-    } else if (low_latency) {
+    if (low_latency) {
         const bool quant = fp8.value_or(false);
         // Select measured low-latency tile configurations by group count and expected M.
         if (!quant && groups == 12 && em <= 64) {
@@ -422,8 +407,7 @@ inline Config fp4_pipeline_scatter_config(int m, int n, int k, int groups,
     const int em = expected ? std::max(1, *expected)
                    : tuning ? std::max(1, ceil_div(tuning->workload.tokens * tuning->workload.topk, groups))
                             : ceil_div(m, groups);
-    if (!requested && get_env<std::string>("DG_MOE_SCATTER_CONFIG").empty() &&
-        tuning && tuning->gemm2.tile) {
+    if (!requested && tuning && tuning->gemm2.tile) {
         const auto& t = *tuning->gemm2.tile;
         requested = Config{get_num_sms(), t[0], t[1], t[2], t[3], t[4], t[5],
                            fp4_smem(t[5], t[0], t[1], t[3], t[4], t[2])};

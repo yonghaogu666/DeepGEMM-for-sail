@@ -132,8 +132,26 @@ matching the compute APIs. Every precision requires `intermediate_hidden=I`,
 the activated intermediate width; GEMM1 width 2I is derived internally. The
 workspace owns both stages' scratch, route metadata, combine and barrier state.
 
-Tile selection is handled internally. W4A4 accepts
-`gemm1_block_n`, `gemm1_block_k` and `config_override`; W4A16 and FP8 accept
+W4A4 selects each stage automatically from the actual input token count, or
+accepts independent `gemm1_config` and `gemm2_config` workspace options:
+
+```python
+buffer = dg.get_symm_buffer_for_mega_moe(
+    group, num_experts, capacity, num_topk, hidden,
+    precision="w4a4", intermediate_hidden=intermediate,
+    gemm1_config=(128, 256, 128, 64, 64, 3),
+    gemm2_config=(64, 256, 128, 32, 64, 3),
+)
+```
+
+Each tuple is `(BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages)`.
+`BLOCK_K` counts packed FP4 bytes (64 means 128 logical elements).
+An explicit tile takes precedence over the internal parameter table and applies
+to every token count using this workspace. Omit either option to keep that
+stage automatic. Different M tiles are supported; GEMM1 generates the matching
+GEMM2 metadata. GEMM1 may reduce the requested stages to fit shared memory.
+W4A4 also accepts `gemm1_block_n`, `gemm1_block_k` and `config_override`, which
+cannot be combined with `gemm1_config`. W4A16 and FP8 accept
 `block_m`. Omitting these options preserves the backend defaults and allows
 measured tuning hints to apply. Explicit W4A16 `block_m` takes precedence over
 the tuning table. Unsupported combinations fail before collective allocation.
