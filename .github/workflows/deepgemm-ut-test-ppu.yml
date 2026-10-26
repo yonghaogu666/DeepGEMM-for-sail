@@ -23,7 +23,7 @@ env:
 
 jobs:
   build-test:
-    name: Build & Test (${{ matrix.runner }})
+    name: Build & Test (${{ matrix.suite }})
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -34,9 +34,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each board selects a functional caselist via run_checkin.py --suite.
-        # Compile in isolated processes, then execute accuracy checks serially.
-        runner: [ZW-M890P, OAM-810E]
+        # Board check-in keeps the staged runner; MegaMoE has EP1/EP2 suites.
+        include:
+          - runner: ZW-M890P
+            suite: ZW-M890P
+            nproc_per_node: 1
+          - runner: OAM-810E
+            suite: OAM-810E
+            nproc_per_node: 1
+          - runner: ZW-M890P
+            suite: ZW-M890P-MegaMoE
+            nproc_per_node: 1
+          - runner: ZW-M890P
+            suite: ZW-M890P-EP2
+            nproc_per_node: 2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,7 +63,7 @@ jobs:
           container_options: |
             cpus: "40"
           nnodes: 0
-          nproc_per_node: 1
+          nproc_per_node: ${{ matrix.nproc_per_node }}
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
           # Ceiling for environment setup, wheel build and both check-in phases.
@@ -95,7 +106,7 @@ jobs:
             echo $PPU_SDK
             pip install ray[adag]==2.40.0 --no-deps
             pip install setuptools==69.5.1
-            # Match setup.py setup_requires exactly so the build never re-fetches it from the (unreachable) internal index.
+            # Preinstall the SCM version plugin used by setup.py.
             pip install setuptools-scm==9.2.2
             pip install numpy==1.26.4 junit-xml rich
             pip install --upgrade pytest
@@ -122,17 +133,27 @@ jobs:
             fi
             echo "START TO INSTALL WHEEL"
             pip install ./dist/*.whl --force-reinstall
+            # MoE CLIs and EP2 pytest import this checkout. Populate its extension
+            # and third-party JIT include links through the existing develop hook.
+            python ./setup.py develop --no-deps
+            python -c 'from pathlib import Path; import deep_gemm; assert Path(deep_gemm.__file__).resolve().parent == Path("deep_gemm").resolve(); print("Testing checkout:", deep_gemm.__file__)'
             echo "START TO TEST CASES"
             set +e
-            python tests/checkin/run_checkin.py \
-              --suite ${{ matrix.runner }} \
-              --compile-workers 16
+            if [ '${{ matrix.suite }}' = '${{ matrix.runner }}' ]; then
+              python tests/checkin/run_checkin.py \
+                --suite ${{ matrix.runner }} \
+                --compile-workers 16
+            else
+              python .github/workflows/scripts/pr-deepgemm-ut.py \
+                --caselist .github/workflows/scripts/testcase.json \
+                --suite ${{ matrix.suite }}
+            fi
             TEST_EXIT_CODE=$?
             python3 .github/workflows/scripts/generate-env-info.py \
             --docker-image "${{ env.SAIL_IMAGE }}" \
             --output env_info.json
-            # Keep results per runner so the parallel matrix jobs do not collide.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            # Keep board check-in and MegaMoE reports in separate directories.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite }}"
             mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
@@ -140,14 +161,14 @@ jobs:
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 
-      - name: Test summary (${{ matrix.runner }})
+      - name: Test summary (${{ matrix.suite }})
         if: always()
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite }}"
           XML_FILE="$NAS_RESULT_DIR/test-results.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## Runner: ${{ matrix.runner }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Suite: ${{ matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"

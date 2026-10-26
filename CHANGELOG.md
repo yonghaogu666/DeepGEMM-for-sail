@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## 2.1.0 — Unreleased
 
 ### Added
 
@@ -109,6 +109,26 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - Fixes compilation with PyTorch 2.13.
 - Fixes the dynamic INT8 GEMM architecture selection on Zhenwu 810E and
   calculates INT8 shared-memory requirements from the final tile configuration.
+
+### MegaMoE
+
+- Keeps GEMM2/scatter and barrier/reduce in separate kernels within Linear2;
+  the barrier/reduce kernel also recycles per-call dispatch counters.
+- Aligns the common complete-call arguments with SM90 MegaMoE, retaining
+  `recipe=(1, 1, 32)` for MXFP4. Supports cumulative INT32 local expert receive
+  statistics, `fast_math` selection, and keyword-only SiTU/UltraEP extensions.
+- Adds W4A4 / MXFP4 MegaMoE on ZW-M890P with common workspace allocation,
+  load-time weight transformation and output-first `fp4_fp4_mega_moe`, exported
+  together through `deep_gemm.mega` and the package root. `SymmBuffer` exposes
+  `x`, `x_sf`, `topk_idx` and `topk_weights`; the output shape selects tokens.
+- Supports SwiGLU, Step and SiTU, master/replica expert weights, and original
+  routing weights applied once in final combine. `intermediate_hidden` is I.
+- Owns and recycles scratch, route metadata and communication state, including
+  empty ranks, changing routes and graph replay.
+- Provides independent end-to-end correctness and performance tests, explicit
+  G1/G2 workspace tiles, and measured token-specific tuning with fallback.
+- Uses PPU instruction wrappers for synchronization, asynchronous copy and
+  numeric conversion. W4A16 and FP8 MegaMoE pipelines are outside this release.
 
 ## [1.1.0+v0.1.0](https://github.com/t-head/DeepGEMM-for-sail/tree/v1.1.0_v0.1.0_release) — Initial Public Release
 

@@ -181,15 +181,30 @@ class ScriptChecksTests(unittest.TestCase):
             runner.parent.mkdir(parents=True)
             runner.write_text("import json,sys; from pathlib import Path; "
                               "Path('runner-args.json').write_text(json.dumps(sys.argv[1:]))")
+            moe_runner = root / '.github/workflows/scripts/pr-deepgemm-ut.py'
+            moe_runner.parent.mkdir(parents=True)
+            moe_runner.write_text("import json,sys; from pathlib import Path; "
+                                  "Path('moe-runner-args.json').write_text(json.dumps(sys.argv[1:]))")
             for mode in ('deepgemm', 'actlize1.0.0'):
-                for suite in run_checkin.SUITES:
+                for suite in (*run_checkin.SUITES, 'ZW-M890P-MegaMoE', 'ZW-M890P-EP2'):
                     with self.subTest(mode=mode, suite=suite):
+                        board = suite if suite in run_checkin.SUITES else 'ZW-M890P'
                         env = dict(os.environ, SOURCE_MODE=mode,
                                    PATH=str(bin_dir) + os.pathsep + os.environ.get('PATH', ''))
-                        subprocess.run(['bash', '-c', command.replace('${{ matrix.runner }}', suite)],
-                                       cwd=root, env=env, check=True)
-                        self.assertEqual(json.loads((root / 'runner-args.json').read_text()),
-                                         ['--suite', suite, '--compile-workers', '16'])
+                        for name in ('runner-args.json', 'moe-runner-args.json'):
+                            (root / name).unlink(missing_ok=True)
+                        rendered = command.replace('${{ matrix.runner }}', board)
+                        rendered = rendered.replace('${{ matrix.suite }}', suite)
+                        subprocess.run(['bash', '-c', rendered], cwd=root, env=env, check=True)
+                        if suite in run_checkin.SUITES:
+                            self.assertEqual(json.loads((root / 'runner-args.json').read_text()),
+                                             ['--suite', suite, '--compile-workers', '16'])
+                            self.assertFalse((root / 'moe-runner-args.json').exists())
+                        else:
+                            self.assertEqual(json.loads((root / 'moe-runner-args.json').read_text()),
+                                             ['--caselist', '.github/workflows/scripts/testcase.json',
+                                              '--suite', suite])
+                            self.assertFalse((root / 'runner-args.json').exists())
 
     def test_daily_retains_original_script_and_tile_commands_verbatim(self):
         original = json.loads((ROOT / '.github/workflows/scripts/testcase.json').read_text())
