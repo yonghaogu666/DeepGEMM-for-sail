@@ -159,7 +159,7 @@ CUTLASS_DEVICE void mega_moe_dispatch_handshake(
         auto* dst_ptr = workspace.get_src_token_topk_idx_ptr(local_expert_idx, sym_buffer.rank_idx, dst_slot_idx);
         *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
     });
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/0, /*kPollBackoffCycles=*/128>(
+    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/0, /*kPollBackoffCycles=*/0>(
         workspace, cta_idx, thread_idx, block_sync);
 
     if (cta_idx == 0) {
@@ -181,10 +181,12 @@ CUTLASS_DEVICE void mega_moe_dispatch_handshake(
     }
     __syncthreads();
 
+    // Route stores are already grid-synchronized above. Only CTA0 publishes
+    // counts afterward, ordered by the preceding CTA barrier.
     comm::cross_rank_barrier<
         kNumRanks, kNumCTAs, kNumThreads, /*idx=*/0, /*tag=*/0>(
         workspace, sym_buffer, cta_idx, thread_idx, block_sync,
-        true, true);
+        false, true);
 }
 
 // ----------------------------------------------------------------------------
@@ -260,6 +262,17 @@ dispatch_gemm1_device(
     extern __shared__ __align__(16) unsigned char smem_buf[];
     auto* smem_expert_count = reinterpret_cast<uint32_t*>(smem_buf);  // [kNumExperts]
     const auto block_sync = [=]() { __syncthreads(); };
+
+    // Reset the arrival span before the handshake's existing grid barriers.
+    // The runtime tile determines the maximum reachable prefix; clearing that
+    // prefix avoids a separate grid barrier after metadata construction.
+    if constexpr (kDynamicWork)
+        if (cta_idx == 0 && thread_idx == 0)
+            *workspace.get_gemm1_work_count_ptr() = 0;
+    for (uint32_t g = cta_idx * kNumThreads + thread_idx;
+         g < workspace.num_max_pool_tokens / BLOCK_M;
+         g += kNumCTAs * kNumThreads)
+        *workspace.get_l1_arrival_count_ptr(g) = 0;
 
     // ==================== Phase A: dispatch handshake ====================
 
@@ -420,20 +433,6 @@ dispatch_gemm1_device(
             umin(nr_e, (mb + 1) * BLOCK_M)};
     };
 
-    // Arrival counters are persistent workspace state.  The full grid
-    // clears the active prefix before specialized producer/consumer CTAs
-    // diverge, then rendezvous once so no consumer can observe stale ready
-    // counts from a previous launch.
-
-    if constexpr (kDynamicWork)
-        if (cta_idx == 0 && thread_idx == 0)
-            *workspace.get_gemm1_work_count_ptr() = 0;
-    for (uint32_t g = cta_idx * kNumThreads + thread_idx; g < total_blocks;
-         g += kNumCTAs * kNumThreads)
-        *workspace.get_l1_arrival_count_ptr(g) = 0;
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/2>(
-        workspace, cta_idx, thread_idx, block_sync);
-
     // Pull one M block cooperatively. Every producer CTA owns a contiguous
     // token slice; each active warp stages one token and its scales at a time.
     const auto coop_pull = [&] (
@@ -525,15 +524,19 @@ dispatch_gemm1_device(
 
     };
 
-    // Producer CTAs pull every block; specialized consumers can start
-    // each block as soon as all producers publish its arrival count.
+    // A small M block fits one producer; distribute those blocks among
+    // producers instead of splitting a few rows across every producer CTA.
+    // Larger blocks retain cooperative pulls through the same group loop.
+    constexpr uint32_t kPullGroupSize = BLOCK_M <= 32 ? 1 : kNumPullCTAs;
+    constexpr uint32_t kNumPullGroups = math::ceil_div(kNumPullCTAs, kPullGroupSize);
 
     if (cta_idx < kNumPullCTAs) {
-        for (uint32_t g = 0; g < total_blocks; ++g) {
-            coop_pull(g, cta_idx, kNumPullCTAs);
+        const uint32_t group_idx = cta_idx / kPullGroupSize;
+        const uint32_t group_size = umin(kPullGroupSize, kNumPullCTAs - group_idx * kPullGroupSize);
+        for (uint32_t g = group_idx; g < total_blocks; g += kNumPullGroups) {
+            coop_pull(g, cta_idx % kPullGroupSize, group_size);
 
-            // Release this block only after every producer warp has
-            // finished its token, SFA, weight, and metadata stores.
+            // Publish only after this producer's token, SFA and metadata stores.
             __syncthreads();
             if (thread_idx == 0)
                 tix::red_add_rel(
@@ -555,6 +558,8 @@ dispatch_gemm1_device(
     // Non-queue configurations use static assignment.
     const auto run_gemm1 = [&] () {
         uint32_t current_iter = 0;
+        uint32_t ready_base = ~uint32_t{0};
+        uint32_t ready_mask = 0;
         uint32_t curr_group_idx = 0;
         uint32_t curr_group_block_off = 0;
         // Every participant claims one tile from the same queue.
@@ -572,8 +577,8 @@ dispatch_gemm1_device(
 
                 queue.prime(thread_idx);
                 next_block_idx = queue.current();
-                // Retire ticket reads before MMA reuses this storage.
-                __syncthreads();
+                // Retire ticket reads in the readiness rendezvous below,
+                // before MMA can reuse this shared storage.
             } else {
                 next_block_idx = (current_iter++) * kNumGemmCTAs + initial_gemm_sm_idx;
             }
@@ -628,8 +633,31 @@ dispatch_gemm1_device(
                 m_block_idx * BLOCK_M,
                 umin(group_m, (m_block_idx + 1) * BLOCK_M)};
 
-            while (tix::ld_acq(
-                       workspace.get_l1_arrival_count_ptr(g)) < kNumPullCTAs);
+            const uint32_t group_size = umin(
+                kPullGroupSize, kNumPullCTAs - (g % kNumPullGroups) * kPullGroupSize);
+            // One warp observes producer releases for the whole CTA.
+            // Its cache is kernel-local; all consumers join the same block
+            // barrier, also retiring reads of the shared work ticket.
+            if (warp_idx == 0) {
+                const uint32_t window_base = g & ~uint32_t{31};
+                const uint32_t ready_bit = 1u << (g & 31u);
+                if (window_base != ready_base || !(ready_mask & ready_bit)) {
+                    const uint32_t peer_block = window_base + lane_idx;
+                    const uint32_t peer_group_size = umin(kPullGroupSize,
+                        kNumPullCTAs - (peer_block % kNumPullGroups) * kPullGroupSize);
+                    const bool ready = peer_block < total_blocks &&
+                        tix::ld_acq(workspace.get_l1_arrival_count_ptr(peer_block)) >= peer_group_size;
+                    ready_mask = __ballot_sync(0xffffffffu, ready);
+                    // Carry each lane's acquire to the warp before caching readiness.
+                    __syncwarp();
+                    ready_base = window_base;
+                    if (!(ready_mask & ready_bit)) {
+                        while (tix::ld_acq(workspace.get_l1_arrival_count_ptr(g)) < group_size);
+                        ready_mask |= ready_bit;
+                    }
+                }
+            }
+            __syncthreads();
 
             const bool is_gate = (n_block_idx * kBlockN < kGemm1N / 2);
             // Store one canonical SFB layout (normally BN256).  A
@@ -695,14 +723,6 @@ dispatch_gemm1_device(
         __syncthreads();
     }
 
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/1>(workspace, cta_idx, thread_idx, block_sync);
-    {
-        const uint32_t flat   = cta_idx * kNumThreads + thread_idx;
-        const uint32_t stride = kNumCTAs * kNumThreads;
-        constexpr uint32_t count_words = kNumExperts;
-        for (uint32_t i = flat; i < count_words; i += stride)
-            *workspace.get_expert_send_count_ptr(i) = 0;
-    }
 }
 
 } // namespace deep_gemm::mega_moe::fp4
