@@ -214,6 +214,13 @@ removing the keyword alone is insufficient. See the
 [preprocessing implementation](csrc/jit_kernels/heuristics/common_preprocess.hpp)
 for the required weight and scale layouts.
 
+#### NVFP4 W4A8 GEMMs (M890P)
+
+NVFP4 dense and grouped GEMMs support fused decoding and per-call
+decode-to-FP8 execution, with FP8 activations and BF16 output.
+See [NVFP4 W4A8 usage and tests](README_NVFP4.md) for scale layouts,
+runnable examples, workspace requirements, configurations and test commands.
+
 #### A8W4 INT8 MoE GEMMs
 
 The A8W4 INT8 path accepts INT8 activations with FP32 per-token scales and portable packed signed-INT4 weights with FP32 per-channel scales, and writes BF16. It runs on Zhenwu 610 / 610E / 810 / 810E (PPU001) and supports the grouped nopad and masked expert layouts:

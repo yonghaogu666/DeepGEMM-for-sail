@@ -60,3 +60,23 @@ python ./test_core.py
 test_core.py options:
   -h, --help            show this help message and exit
   --func {DenseGemm,GroupedContiguous,GroupedMasked,DenseGemm}  target test func
+
+
+## W4A8
+
+On PPU1.5, [test_w4a8.py](test_w4a8.py) covers MXFP4;
+[test_nvfp4.py](test_nvfp4.py) covers NVFP4 decode, prefill and offline FP8
+scale absorption.
+
+[bench_nvfp4.py](bench_nvfp4.py) measures model-sized NVFP4 grouped GEMMs
+for EP32/EP64 and compares fused execution, decode plus FP8, and FP8.
+See the [benchmark command and scope](../README_NVFP4.md#performance-benchmark).
+
+Run all NVFP4 tests from the repository root:
+
+```bash
+python -m pytest tests/test_nvfp4.py -q -s
+```
+
+See [NVFP4 usage and tests](../README_NVFP4.md) for examples, scale/workspace
+requirements, test coverage and definitions of the accuracy references.
