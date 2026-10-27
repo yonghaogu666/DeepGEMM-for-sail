@@ -272,7 +272,7 @@ public:
                                     " -Xllvm -ppu-pref-fma-reuse=true"
                                     " -Xllvm -ppu-pref-mma-reuse=true";
             }
-            if (name.find("w4a16") != std::string::npos) {
+            if (name.find("w4a16") != std::string::npos || name.find("w4a8") != std::string::npos) {
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
         }
@@ -385,7 +385,7 @@ public:
                         "--ppu-tuning-options=-ppu-pref-mma-reuse=true",
                     });
                 }
-                if (name.find("w4a16") != std::string::npos) {
+                if (name.find("w4a16") != std::string::npos || name.find("w4a8") != std::string::npos) {
                     opts_insert({
                         "--ppu-tuning-options=-sort-copy-before-coalesce",
                     });

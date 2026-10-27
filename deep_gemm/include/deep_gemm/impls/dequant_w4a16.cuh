@@ -3,6 +3,7 @@
 #include <cutlass/arch/arch.h>
 #include <cutlass/bfloat16.h>
 #include <cutlass/float4.h>
+#include <cutlass/gemm/config/gemm_operands.hpp>
 
 namespace deep_gemm {
 
@@ -118,4 +119,50 @@ struct DequantE8M0
     }
 };
 
+} // namespace deep_gemm
+
+namespace deep_gemm {
+// W4A16 and W4A8 share the warp-K tensor reshaping and epilogue layout.
+// Only the MMA K atom (16 BF16 / 32 FP8) and operand/scale conversion differ.
+template <int MmaK, int BlockK, int WarpsOnK, int mode, typename Tensor>
+CUTLASS_DEVICE constexpr auto w4_reshape_warpk(Tensor& t) {
+  using namespace cute;
+  static_assert(mode == 0 || mode == 1);
+  if constexpr (mode == 0) {
+    constexpr int k = decltype(size<mode>(t))::value;
+    constexpr int ko = k / WarpsOnK;
+    auto atom_tiler = make_layout(make_shape(Int<WarpsOnK>{}, Int<ko>{}), make_stride(Int<ko>{}, _1{}));
+    auto tiler = make_shape(atom_tiler, size<1>(t));
+    return flat_divide(t, tiler)(_,_,0,0,_);
+  } else {
+    constexpr int ko = BlockK / MmaK / WarpsOnK;
+    auto atom_tiler = make_layout(make_shape(Int<MmaK>{}, make_shape(Int<WarpsOnK>{}, Int<ko>{})),
+                                 make_stride(_1{}, make_stride(Int<ko * MmaK>{}, Int<MmaK>{})));
+    auto tiler = make_shape(size<0>(t), atom_tiler);
+    return flat_divide(t, tiler)(_,_,0,0,_);
+  }
+}
+
+template <typename ElementD, int BlockM, int BlockN, int WarpM, int Threads>
+struct W4EpilogueLayout {
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  using CopyOp = cute::AutoVectorizingCopyWithAssumedAlignment<128>;
+  using Config = cutlass::gemm::config::DefaultGemm_Epilogue_Configuration<
+      CopyOp, ElementD, AlignmentD, cute::Int<BlockM>, cute::Int<BlockN>, cute::Int<BlockM / WarpM>, Threads>;
+  using SmemLayout = typename Config::SmemLayoutO;
+  using CopyAtomR2S = cute::Copy_Atom<CopyOp, ElementD>;
+  using TiledCopyS2R = typename Config::GmemTiledCopyO;
+  using CopyAtomR2G = cute::Copy_Atom<CopyOp, ElementD>;
+};
+#if defined(__HGGC__)
+template <bool kRoundNearest>
+CUTLASS_DEVICE __forceinline__ uint32_t w4_pack_bf16_pair(float high, float low) {
+  uint32_t result;
+  if constexpr (kRoundNearest)
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(result) : "f"(high), "f"(low));
+  else
+    asm volatile("ppu.cvt.rtte.bf16x2.f32 %0, %1, %2;\n" : "=r"(result) : "f"(high), "f"(low));
+  return result;
+}
+#endif
 } // namespace deep_gemm

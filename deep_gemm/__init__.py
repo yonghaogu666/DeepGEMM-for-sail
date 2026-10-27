@@ -90,6 +90,13 @@ from .deep_gemm_cpp import (
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
+    # W4FA8 (NVFP4 weights, FP8 activation, BF16 output)
+    dequantize_nvfp4_fp8,
+    gemm_fp8_nvfp4_bf16_nt,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_masked,
+    m_grouped_gemm_fp8_nvfp4_bf16_nt_fused,
+    get_gemm_fp8_nvfp4_config,
     # A8W4 INT8 GEMMs / device weight preprocessing
     m_grouped_gemm_int8_int4_bf16_nt_masked,
     m_grouped_gemm_int8_int4_bf16_nt_nopad,

@@ -17,6 +17,7 @@
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
+#include "../jit_kernels/impls/nvfp4_w4a8_gemm.hpp"
 #include "../jit_kernels/impls/smxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
@@ -25,6 +26,10 @@ using ConfigTuple = std::tuple<int, int, int, int, int, int, int, std::tuple<int
 // (num_sms, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, n_expand)
 using W4A16ConfigTuple = deep_gemm_w4a16_common::W4A16ConfigTuple;
 using W4A8ConfigTuple = deep_gemm::w4fa8::W4A8ConfigTuple;
+using NVFP4Activation = nvfp4::Activation;
+using NVFP4Weight = nvfp4::Weight;
+using NVFP4ConfigTuple = nvfp4::ConfigTuple;
+using NVFP4ExecutionConfig = nvfp4::ExecutionConfig;
 
 extern "C" {
 static bool early_return(const int& m, const int &n, const int& k,
@@ -1480,7 +1485,7 @@ MoeAlignReturn moe_align_block_size(
     const torch::Tensor& rhs,
     const torch::Tensor& topk_ids,
     bool perchannel_quant = false,
-    std::optional<FusedCommonConfigTuple> config = std::nullopt,
+    std::optional<FusedConfigTuple> config = std::nullopt,
     bool enable_act_and_quant_fusing = false) {
     DG_HOST_ASSERT(topk_ids.dtype() == torch::kInt32);
     DG_HOST_ASSERT(topk_ids.dim() == 2);
@@ -1720,6 +1725,50 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
                          ceil_div(int(out.size(0)), num_groups), c, experts, tokens, aligned);
 }
 
+static void gemm_fp8_nvfp4_bf16_nt(const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+                             std::optional<NVFP4ExecutionConfig> configs, int lhs_scale_group_size,
+                             std::optional<torch::Tensor> weight_global_scale, std::optional<torch::Tensor> rhs_scales,
+                             int rhs_scale_block_size, const std::string& execution, std::optional<torch::Tensor> fp8_workspace) {
+    return nvfp4::gemm_fp8_nvfp4_bf16_nt_impl(lhs, rhs, out, configs, lhs_scale_group_size, weight_global_scale,
+        rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad(const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& m_indices, std::optional<torch::Tensor> m_rows, std::optional<NVFP4ExecutionConfig> configs,
+        int lhs_scale_group_size, std::optional<torch::Tensor> weight_global_scale, std::optional<torch::Tensor> rhs_scales,
+        int rhs_scale_block_size, const std::string& execution, std::optional<torch::Tensor> fp8_workspace) {
+    return nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad_impl(lhs, rhs, out, m_indices, m_rows, configs,
+        lhs_scale_group_size, weight_global_scale, rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_masked(const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& masked_m, int expected_m, std::optional<NVFP4ExecutionConfig> configs,
+        int lhs_scale_group_size, std::optional<torch::Tensor> weight_global_scale, std::optional<torch::Tensor> rhs_scales,
+        int rhs_scale_block_size, const std::string& execution, std::optional<torch::Tensor> fp8_workspace) {
+    return nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_masked_impl(lhs, rhs, out, masked_m, expected_m, configs,
+        lhs_scale_group_size, weight_global_scale, rhs_scales, rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static void m_grouped_gemm_fp8_nvfp4_bf16_nt_fused(const NVFP4Activation& lhs, const NVFP4Weight& rhs, const torch::Tensor& out,
+        const torch::Tensor& m_rows, const torch::Tensor& expert_ids_and_cumsum,
+        const torch::Tensor& sorted_token_ids, const torch::Tensor& aligned_num_m_blocks,
+        std::optional<NVFP4ExecutionConfig> configs, int lhs_scale_group_size, std::optional<torch::Tensor> weight_global_scale,
+        std::optional<torch::Tensor> rhs_scales, int rhs_scale_block_size, const std::string& execution, std::optional<torch::Tensor> fp8_workspace) {
+    return nvfp4::m_grouped_gemm_fp8_nvfp4_bf16_nt_fused_impl(lhs, rhs, out, m_rows, expert_ids_and_cumsum,
+        sorted_token_ids, aligned_num_m_blocks, configs, lhs_scale_group_size, weight_global_scale, rhs_scales,
+        rhs_scale_block_size, execution, fp8_workspace);
+}
+
+static NVFP4ConfigTuple get_gemm_fp8_nvfp4_config(const std::string& gemm_type, int expected_m, int n, int k,
+                                            int lhs_scale_group_size, int rhs_scale_block_size) {
+    return nvfp4::get_gemm_fp8_nvfp4_config_impl(gemm_type, expected_m, n, k, lhs_scale_group_size,
+        rhs_scale_block_size);
+}
+
+static void dequantize_nvfp4_fp8(const NVFP4Weight& rhs, const torch::Tensor& out) {
+    return nvfp4::dequantize_nvfp4_fp8_impl(rhs, out);
+}
+
 static void acblaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
                              const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     const auto major_a = get_major_type_ab(a);
@@ -1907,6 +1956,47 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"));
+    // NVFP4 W4A8 GEMMs
+    const char* nvfp4_doc = R"doc(E4M3 activation x NVFP4 weight GEMM with BF16 output.
+
+lhs is (FP8 values, FP32 scales); scales may be None for unit per-token scaling
+only with execution='fused'.
+rhs is (prepared int32 weights, native K16 E4M3 scale bytes), produced by
+preprocess_weights_and_scales. Use W4A8_NVFP4 for execution='fused' (default),
+or W4A8_NVFP4_FP8 for execution='dequantize' with caller-owned fp8_workspace.
+The dequantize path refreshes the workspace on every call on the current stream.
+lhs_scale_group_size=0 means per-token; 16 or a multiple of 32 selects K blocks.
+rhs_scale_block_size=0 means per-channel; 128 selects outer FP32 128x128 blocks.
+weight_global_scale is an optional FP32 scalar or one multiplier per expert.
+N must be divisible by 64 and K by 32; all scales are multiplicative.
+)doc";
+    m.def("gemm_fp8_nvfp4_bf16_nt", &gemm_fp8_nvfp4_bf16_nt, py::arg("lhs"), py::arg("rhs"), py::arg("out"),
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused", py::arg("fp8_workspace") = std::nullopt, nvfp4_doc);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad", &m_grouped_gemm_fp8_nvfp4_bf16_nt_nopad,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused", py::arg("fp8_workspace") = std::nullopt, nvfp4_doc);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_masked", &m_grouped_gemm_fp8_nvfp4_bf16_nt_masked,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("masked_m"), py::arg("expected_m"),
+          py::arg("configs") = std::nullopt, py::kw_only(), py::arg("lhs_scale_group_size") = 0,
+          py::arg("weight_global_scale") = std::nullopt, py::arg("rhs_scales") = std::nullopt,
+          py::arg("rhs_scale_block_size") = 0, py::arg("execution") = "fused", py::arg("fp8_workspace") = std::nullopt, nvfp4_doc);
+    m.def("m_grouped_gemm_fp8_nvfp4_bf16_nt_fused", &m_grouped_gemm_fp8_nvfp4_bf16_nt_fused,
+          py::arg("lhs"), py::arg("rhs"), py::arg("out"), py::arg("m_rows"), py::arg("expert_ids_and_cumsum"),
+          py::arg("sorted_token_ids"), py::arg("aligned_num_m_blocks"), py::arg("configs"),
+          py::kw_only(), py::arg("lhs_scale_group_size") = 0, py::arg("weight_global_scale") = std::nullopt,
+          py::arg("rhs_scales") = std::nullopt, py::arg("rhs_scale_block_size") = 0,
+          py::arg("execution") = "fused", py::arg("fp8_workspace") = std::nullopt, nvfp4_doc);
+    m.def("get_gemm_fp8_nvfp4_config", &get_gemm_fp8_nvfp4_config,
+          py::arg("gemm_type"), py::arg("expected_m"), py::arg("n"), py::arg("k"), py::kw_only(),
+          py::arg("lhs_scale_group_size") = 0, py::arg("rhs_scale_block_size") = 0,
+          "Select an eight-entry fused NVFP4 config. gemm_type: Normal or MGrouped{NoPad,Masked,Fused}.");
+    m.def("dequantize_nvfp4_fp8", &dequantize_nvfp4_fp8, py::arg("rhs"), py::arg("out"),
+          "Decode prepared NVFP4 weights into the caller's contiguous E4M3 workspace on the current stream.");
+
     // W4A16 / W4FA16 GEMMs
     m.def("m_grouped_gemm_w4a16_nopad", &m_grouped_gemm_w4a16_nopad, py::arg("lhs"), py::arg("rhs_"),
           py::arg("out"), py::arg("m_indices"), py::arg("m_rows") = std::nullopt,
