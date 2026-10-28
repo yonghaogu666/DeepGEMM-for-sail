@@ -140,23 +140,23 @@ both tensors are all zero; W4A4 requires error below 0.003.
 Relative L2 is also reported. `--reference-tokens N` samples N tokens per rank
 for large-model mathematical reference checks; omit it to check all tokens.
 
-The same runner validates direct `SymmBuffer` input-view writes, output-derived
-token counts, output offset views, independent G1/G2 tile sizes,
-empty ranks, invalid IDs, zero weights with NaN-filled unwritten combine slots,
-and master/replica partitions. Consecutive calls and graph replays change
-inputs, routes and weights and compare against fresh references, including
-hot experts, cross-rank destinations and fully inactive routes. It checks
-counter recycling and workspace scratch reuse without caller-managed offsets.
-Unsupported MMA type, activation, tile, dtype and shape combinations are
-rejected before entering the distributed compute protocol. `--edge-cases`
-enables the CLI's empty-rank and masked-route variants.
+Model and tile tests check complete outputs against independent references,
+basic graph replay and master/replica partitions. Shared API and state-reuse
+checks are run once with the small SwiGLU case in the same test file:
 
-Smoke tests also check SM90-style positional calls and reject incompatible
-recipes and malformed receive-statistics tensors. INT32 cumulative statistics
-are compared against independent all-rank routing histograms, starting from a
-nonzero accumulator. Tests cover master/replica experts, empty ranks, invalid
-and zero-weight routes, compile-only mode, repeated calls and graph replay
-with changing routes. Capture must not increment statistics; each replay must.
+- `test_mega_moe_smoke_api` checks unsupported MMA/activation/recipe options,
+  scale layouts, stage counts, local expert limits and malformed tensors.
+- `test_mega_moe_smoke_stateful` requires at least two ranks and checks direct
+  input-view writes, SM90-style positional calls, offset views, an empty rank,
+  `-1` route masks, zero weights and NaN-filled unwritten combine slots.
+  Consecutive calls and graph replays change inputs, routes and weights and
+  compare against fresh references. Dispatch counts must be recycled; INT32
+  cumulative receive statistics must match independent routing histograms.
+  Capture must not increment statistics; each replay must.
+
+`-k smoke` includes these two tests. The CLI and benchmark `--edge-cases`
+option explicitly enable extended empty-rank, masked-route and state-reuse
+checks for a requested model; ordinary runs use the basic replay check.
 
 Timing starts with the same BF16 inputs and includes required input preparation,
 quantization, dispatch, GEMM1/activation/output quantization, metadata,

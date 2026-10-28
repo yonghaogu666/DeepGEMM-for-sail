@@ -135,8 +135,8 @@ CUTLASS_DEVICE void mega_moe_dispatch_handshake(
         const uint32_t first = cta_idx * kNumThreads + thread_idx;
         const uint32_t stride = kNumCTAs * kNumThreads;
         for (uint32_t p = first; p < total; p += stride) {
-            const int expert_idx = static_cast<int>(__ldg(input_topk_idx + p));
-            if (expert_idx >= 0 && expert_idx < static_cast<int>(kNumExperts))
+            const int64_t expert_idx = __ldg(input_topk_idx + p);
+            if (expert_idx >= 0 && expert_idx < kNumExperts)
                 process(p, static_cast<uint32_t>(expert_idx));
         }
     };

@@ -17,8 +17,9 @@ public:
         const void* combine_buffer;
         const uint64_t* combine_scales;
         const float* topk_weights;
+        const int64_t* topk_idx;
         at::BFloat16* y;
-        int num_tokens, hidden, num_max_tokens_per_rank;
+        int num_tokens, hidden, num_max_tokens_per_rank, num_experts;
         int scale_tiles, scale_block_n, shift;
         int32_t** barrier_pointers;
         int rank_idx, num_ranks;
@@ -37,12 +38,12 @@ public:
         const auto& info = args.launch_info;
         const int threads = args.launch_args.block_dim.x;
         const auto body = fmt::format(
-            "barrier_reduce_kernel<{}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d, counts, nc);",
+            "barrier_reduce_kernel<{}, {}, {}, {}>(b, s, w, ids, y, t, h, c, e, st, sn, shift, p, r, ws, d, counts, nc);",
             info.num_topk, info.fp8, info.scaled, threads);
         return "#include <deep_gemm/impls/mega_moe_combine.cuh>\n"
                "extern \"C\" __global__ void __launch_bounds__(" + std::to_string(threads) +
                ") ppu_moe_aux_barrier_reduce("
-               "const void* b, const uint64_t* s, const float* w, __ppu_bfloat16* y, int t, int h, int c, "
+               "const void* b, const uint64_t* s, const float* w, const int64_t* ids, __ppu_bfloat16* y, int t, int h, int c, int e, "
                "int st, int sn, int shift, int32_t** p, int r, int ws, int32_t* d, uint64_t* counts, int nc"
                ") {\nusing namespace deep_gemm::mega_moe::detail;\n" + body + "\n}\n";
     }
@@ -50,7 +51,7 @@ public:
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         auto& p = args.kernel_params;
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, p.combine_buffer, p.combine_scales,
-            p.topk_weights, p.y, p.num_tokens, p.hidden, p.num_max_tokens_per_rank, p.scale_tiles,
+            p.topk_weights, p.topk_idx, p.y, p.num_tokens, p.hidden, p.num_max_tokens_per_rank, p.num_experts, p.scale_tiles,
             p.scale_block_n, p.shift, p.barrier_pointers, p.rank_idx, p.num_ranks, p.barrier_done,
             p.dispatch_counts, p.num_dispatch_counts));
     }
@@ -64,7 +65,8 @@ inline void reset_done(const torch::Tensor& barrier_done) {
 }
 
 inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
-    const torch::Tensor& combine_buffer, const torch::Tensor& topk_weights, int num_tokens,
+    const torch::Tensor& combine_buffer, const torch::Tensor& topk_weights,
+    const torch::Tensor& topk_idx, int num_experts, int num_tokens,
     int hidden, int num_topk, int num_max_tokens_per_rank, const torch::Tensor& barrier_pointers,
     int rank_idx, int num_ranks, const torch::Tensor& barrier_done, const torch::Tensor& dispatch_counts,
     const std::optional<torch::Tensor>& combine_scales, int scale_block_n, const torch::Tensor& y) {
@@ -76,8 +78,8 @@ inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
     return {
         {num_topk, fp8, scaled}, {dim3(std::max(num_tokens, 1), 1), dim3(threads), 0},
         {combine_buffer.data_ptr(), scaled ? reinterpret_cast<const uint64_t*>(combine_scales->data_ptr()) : nullptr,
-         topk_weights.data_ptr<float>(), y.data_ptr<at::BFloat16>(),
-         num_tokens, hidden, num_max_tokens_per_rank, scale_tiles, scale_block_n, shift,
+         topk_weights.data_ptr<float>(), topk_idx.data_ptr<int64_t>(), y.data_ptr<at::BFloat16>(),
+         num_tokens, hidden, num_max_tokens_per_rank, num_experts, scale_tiles, scale_block_n, shift,
          reinterpret_cast<int32_t**>(barrier_pointers.data_ptr()), rank_idx, num_ranks, barrier_done.data_ptr<int32_t>(),
          static_cast<uint64_t*>(dispatch_counts.data_ptr()), static_cast<int>(dispatch_counts.nbytes() / sizeof(uint64_t))}};
 }

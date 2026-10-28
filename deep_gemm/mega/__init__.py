@@ -328,6 +328,6 @@ def fp4_fp4_mega_moe(
         sym_buffer._state, sym_buffer._l2_acts, sym_buffer._l2_acts_sf, sym_buffer._sfa_scratch,
         metadata.m_rows, metadata.valid_m_rows, metadata.src_m_offsets, metadata.token_meta,
         sym_buffer._gemm2_block_info, sym_buffer._combine, sym_buffer._combine_offsets,
-        sym_buffer._dispatch_counts, sym_buffer._topk_weights,
+        sym_buffer._dispatch_counts, sym_buffer._topk_weights, sym_buffer.topk_idx,
         sym_buffer._barrier_pointers, sym_buffer._barrier_done,
         l1_weights_replicas, l2_weights_replicas, situ_beta, situ_linear_beta)

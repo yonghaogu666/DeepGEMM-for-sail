@@ -103,6 +103,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
+- **MegaMoE validation and route masking**: rejects incompatible transformed
+  scale views, more than 1024 local physical experts, and FP4 tiles that cannot
+  support at least two pipeline stages. Both staged and direct inputs ignore
+  invalid expert IDs before reading combine slots, including graph replay.
+- **MegaMoE DeepEP baseline addressing**: uses 64-bit grouped-row offsets to
+  avoid overflow when packed FP4 buffers exceed 2 GiB.
 - Defaults `fp8_paged_mqa_logits` to `clean_logits=False`, matching the
   existing requirement to mask out-of-context positions externally.
   `clean_logits=True` remains unsupported for paged MQA.

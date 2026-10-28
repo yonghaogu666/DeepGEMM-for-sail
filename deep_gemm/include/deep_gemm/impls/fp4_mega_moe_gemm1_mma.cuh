@@ -208,22 +208,24 @@ struct Gemm1StageFits {
 template <int BlockM, int BlockN, int BlockK, int WarpM, int WarpN,
           int DesiredStages, int kSmemCap, int SfbBlockN = BlockN>
 struct Gemm1PickStage {
+    static_assert(DesiredStages >= 2, "GEMM1 requires at least two pipeline stages");
     static constexpr int value =
-        (DesiredStages <= 1 ||
-         Gemm1StageFits<BlockM, BlockN, BlockK, WarpM, WarpN, DesiredStages,
-                        kSmemCap, SfbBlockN>::value)
+        Gemm1StageFits<BlockM, BlockN, BlockK, WarpM, WarpN, DesiredStages,
+                      kSmemCap, SfbBlockN>::value
         ? DesiredStages
         : Gemm1PickStage<BlockM, BlockN, BlockK, WarpM, WarpN, DesiredStages - 1,
                          kSmemCap, SfbBlockN>::value;
 };
 
-// Floor: stage 1 always "wins" the recursion (a single-stage tile must fit; if
-// it does not the downstream hggcFuncSetAttribute will surface the error).
+// The mainloop needs double buffering; reject tiles that cannot fit two stages.
 template <int BlockM, int BlockN, int BlockK, int WarpM, int WarpN,
           int kSmemCap, int SfbBlockN>
-struct Gemm1PickStage<BlockM, BlockN, BlockK, WarpM, WarpN, 1,
+struct Gemm1PickStage<BlockM, BlockN, BlockK, WarpM, WarpN, 2,
                       kSmemCap, SfbBlockN> {
-    static constexpr int value = 1;
+    static_assert(Gemm1StageFits<BlockM, BlockN, BlockK, WarpM, WarpN, 2,
+                                kSmemCap, SfbBlockN>::value,
+                  "GEMM1 minimum two-stage pipeline exceeds shared-memory capacity");
+    static constexpr int value = 2;
 };
 
 // ----------------------------------------------------------------------------

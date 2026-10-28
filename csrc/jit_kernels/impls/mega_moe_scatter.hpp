@@ -157,6 +157,7 @@ inline std::string generate_fp4_mega_moe_linear2(const FP4MegaMoELinear2Args& ar
 
 inline int32_t* prepare_scatter_layout(int groups, int block_m, const torch::Tensor& rows,
                                       const torch::Tensor& block_info) {
+    TORCH_CHECK(groups > 0 && groups <= 1024, "scatter preprocessing supports 1 to 1024 local experts");
     auto* layout = rows.data_ptr<int32_t>();
     if (groups < 128)
         return layout;

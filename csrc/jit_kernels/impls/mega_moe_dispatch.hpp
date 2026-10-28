@@ -217,7 +217,7 @@ void* scale_output_ptr = (void*)scale_output;
 constexpr int kGemm1Stages = mega_moe::fp4::Gemm1PickStage<
     BLOCK_M, GEMM1_BLOCK_N, GEMM1_BLOCK_K, GEMM1_WARP_M, GEMM1_WARP_N,
     (int)GEMM1_STAGES, 262144, {SFB_LAYOUT_BLOCK_N}>::value;
-static_assert(kGemm1Stages >= 1, "gemm1 needs at least 1 pipeline stage");
+static_assert(kGemm1Stages >= 2, "gemm1 needs at least 2 pipeline stages");
 
 float activation_clamp = {CLAMP_VALUE};
 bool fused_swiglu = {FUSED_SWIGLU};

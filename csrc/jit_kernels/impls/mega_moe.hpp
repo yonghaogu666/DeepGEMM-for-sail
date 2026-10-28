@@ -14,7 +14,7 @@ struct MegaMoEWorkspace {
     torch::Tensor sym_buffer_ptrs, l2_acts, l2_acts_sf, sfa_scratch;
     torch::Tensor m_rows, valid_m_rows, src_m_offsets, token_meta;
     std::optional<torch::Tensor> block_info;
-    torch::Tensor combine, combine_offsets, dispatch_counts, topk_weights;
+    torch::Tensor combine, combine_offsets, dispatch_counts, topk_weights, topk_idx;
     torch::Tensor barrier_pointers, barrier_done;
 };
 
@@ -130,7 +130,7 @@ public:
         // Linear2 owns completion on the same stream, including empty ranks.
         // Keep reduce separate so it can use its own resource budget.
         auto combine_args = mega_moe_aux::make_mega_moe_combine_args(
-            buffer.combine, buffer.topk_weights.narrow(0, 0, args.num_tokens),
+            buffer.combine, buffer.topk_weights.narrow(0, 0, args.num_tokens), buffer.topk_idx, config.num_experts,
             args.num_tokens, hidden, config.num_topk, config.nmtpr, buffer.barrier_pointers,
             args.rank_idx, config.num_ranks, buffer.barrier_done, buffer.dispatch_counts,
             std::nullopt, 0, args.y);

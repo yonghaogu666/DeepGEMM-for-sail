@@ -98,11 +98,11 @@ static void check_fp4_pipeline_tile(const mega_moe_config::Tile& tile, const int
                 bm % wm == 0 && bn % wn == 0,
                 name, " has an invalid warp tile");
     const int threads = mega_moe_config::threads(bm, bn, wm, wn);
-    TORCH_CHECK(threads >= 32 && threads <= 1024 && stages > 0,
-                name, " has an invalid thread or stage count");
+    TORCH_CHECK(threads >= 32 && threads <= 1024, name, " has an invalid thread count");
+    TORCH_CHECK(stages >= 2, name, " requires at least two pipeline stages");
     // GEMM1 reduces its requested stage count to fit shared memory. GEMM2
     // uses the requested count directly; reject oversized tiles before allocation.
-    const auto smem = mega_moe_config::fp4_smem(gemm1 ? 1 : stages, bm, bn, bk);
+    const auto smem = mega_moe_config::fp4_smem(gemm1 ? 2 : stages, bm, bn, bk);
     TORCH_CHECK(std::get<0>(smem) <= 256 * 1024, name, " exceeds shared-memory capacity");
 }
 
@@ -131,9 +131,8 @@ static void fp4_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor&
 }
 
 static bool is_fp4_scale_layout(const Tensor& scale) {
-    return scale.scalar_type() == torch::kUInt16 &&
-           ((scale.dim() == 2 && (scale.stride(0) == 1 || scale.size(0) == 1)) ||
-            (scale.dim() == 3 && (scale.stride(1) == 1 || scale.size(1) == 1)));
+    return scale.scalar_type() == torch::kUInt16 && scale.dim() == 3 &&
+           scale.transpose(1, 2).is_contiguous();
 }
 // Symmetric layout and row metadata.
 static std::map<std::string, int64_t> symmetric_layout(const DispatchConfig& config) {
@@ -198,6 +197,8 @@ get_symm_buffer_size_for_mega_moe(
                 num_topk > 0 && num_topk <= 16 && num_topk <= num_experts &&
                 num_max_tokens_per_rank > 0 && num_max_tokens_per_rank < (1 << 24),
                 "Invalid MegaMoE ranks, expert count, top-k or token capacity");
+    TORCH_CHECK(num_experts / num_ranks <= 1024,
+                "MegaMoE supports at most 1024 local physical experts per rank");
     TORCH_CHECK(intermediate_hidden > 0 && intermediate_hidden % 128 == 0,
                 "intermediate_hidden must be the activated width I, a positive multiple of 128");
     TORCH_CHECK(hidden > 0 && hidden % 512 == 0, "MegaMoE hidden must be divisible by 512 for W4A4");
@@ -334,7 +335,7 @@ void fp4_fp4_mega_moe(
     const Tensor& l2_acts, const Tensor& l2_acts_sf, const Tensor& sfa_scratch,
     const Tensor& m_rows, const Tensor& valid_m_rows, const Tensor& src_m_offsets, const Tensor& token_meta,
     const OptTensor& block_info, const Tensor& combine, const Tensor& combine_offsets,
-    const Tensor& dispatch_counts, const Tensor& topk_weights,
+    const Tensor& dispatch_counts, const Tensor& topk_weights, const Tensor& topk_idx,
     const Tensor& barrier_pointers, const Tensor& barrier_done,
     const OptPair& l1_weights_replicas, const OptPair& l2_weights_replicas,
     const float& situ_beta, const float& situ_linear_beta) {
@@ -352,6 +353,9 @@ void fp4_fp4_mega_moe(
     TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(sym_buffer.data_ptr()),
                 "symmetric pointer table must reference the local workspace buffer");
     const auto device = sym_buffer.device();
+    check_tensor(topk_idx, torch::kInt64);
+    check_shape(topk_idx, {num_max_tokens_per_rank, num_topk});
+    TORCH_CHECK(topk_idx.device() == device, "routing IDs must be on the workspace device");
     check_tensor(y, torch::kBFloat16);
     check_shape(y, {num_tokens, hidden});
     TORCH_CHECK(num_tokens <= num_max_tokens_per_rank, "output token count exceeds workspace capacity");
@@ -384,7 +388,7 @@ void fp4_fp4_mega_moe(
         sym_buffer_ptrs, l2_acts, l2_acts_sf,
         sfa_scratch.narrow(0, 0, int64_t(num_pool_tokens) * (dispatch.sf_bytes / 2)),
         m_rows, valid_m_rows, src_m_offsets, token_meta, block_info,
-        combine, combine_offsets, dispatch_counts, topk_weights, barrier_pointers, barrier_done};
+        combine, combine_offsets, dispatch_counts, topk_weights, topk_idx, barrier_pointers, barrier_done};
     mega_moe_native::fp4_fp4_mega_moe_impl(y, l1_weights, l2_weights, workspace, rank_idx, num_tokens, activation_op,
         activation_clamp.value_or(0.0f), fast_math, situ_beta, situ_linear_beta,
         l1_weights_replicas, l2_weights_replicas, tuning, cumulative_local_expert_recv_stats);

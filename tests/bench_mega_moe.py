@@ -97,7 +97,8 @@ def _import_baseline():
         slot = tl.arange(0, SLOTS)
         expert = tl.load(ids + token * K + slot, slot < K, -1)
         valid = (slot < K) & (expert >= 0) & (expert < E)
-        destination = tl.atomic_add(cursors + expert, 1, mask=valid)
+        # Widen before row-stride multiplication; grouped FP4 can exceed 2 GiB.
+        destination = tl.atomic_add(cursors + expert, 1, mask=valid).to(tl.int64)
         tl.store(row_map + token * K + slot, destination, valid)
         tl.store(group_ids + destination, expert, valid)
         for begin in range(tl.cdiv(H // 2, B)):

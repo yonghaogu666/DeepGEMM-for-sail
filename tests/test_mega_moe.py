@@ -287,6 +287,14 @@ def _check_workspace_options(case, group):
                         num_topk=16, hidden=512, intermediate_hidden=256)
         allocate.assert_not_called()
 
+    with patch("torch.distributed._symmetric_memory.empty",
+               side_effect=AssertionError("expert limit must fail before allocation")) as allocate:
+        for factory in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
+            with pytest.raises(RuntimeError, match="at most 1024 local physical experts"):
+                factory(SimpleNamespace(size=lambda: 1), num_experts=1025,
+                        num_max_tokens_per_rank=1, num_topk=2, hidden=512, intermediate_hidden=256)
+        allocate.assert_not_called()
+
     options = dict(num_experts=case.experts, num_max_tokens_per_rank=case.capacity,
                    num_topk=case.topk, hidden=case.hidden, activation=case.activation,
                    intermediate_hidden=case.intermediate)
@@ -301,11 +309,14 @@ def _check_workspace_options(case, group):
     for stage in ("gemm1_config", "gemm2_config"):
         invalid += [({stage: (64, 256)}, "six positive integers"),
                     ({stage: (64, 256, 128, 32, 64, 0)}, "six positive integers"),
+                    ({stage: (64, 256, 128, 32, 64, 1)}, "at least two pipeline stages"),
                     ({stage: (96, 256, 128, 32, 64, 3)}, "requires BLOCK_M"),
                     ({stage: (64, 384, 128, 32, 64, 3)}, "unsupported BLOCK_N"),
                     ({stage: (64, 256, 48, 32, 64, 3)}, "dividing packed K"),
                     ({stage: (64, 256, 128, 48, 64, 3)}, "invalid warp tile")]
     invalid.append(({"gemm2_config": (256, 256, 128, 64, 64, 64)}, "shared-memory capacity"))
+    invalid.append(({"hidden": 1024, "gemm1_config": (64, 256, 512, 32, 64, 3)},
+                    "shared-memory capacity"))
     for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}}):
         for factory in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
             with pytest.raises(TypeError, match=next(iter(legacy))):
@@ -335,9 +346,11 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
         with pytest.raises(RuntimeError, match=message):
             entry(y, l1_weights, l2_weights, sym_buffer, **{**options, **changed})
     num_experts_per_rank = sym_buffer.num_experts // sym_buffer.num_ranks
-    for stats in (torch.zeros(num_experts_per_rank, device=y.device),
-                  torch.zeros(num_experts_per_rank, dtype=torch.int32),
-                  torch.zeros(2 * num_experts_per_rank, device=y.device, dtype=torch.int32)[::2]):
+    invalid_stats = [torch.zeros(num_experts_per_rank, device=y.device),
+                     torch.zeros(num_experts_per_rank, dtype=torch.int32)]
+    if num_experts_per_rank > 1:
+        invalid_stats.append(torch.zeros(2 * num_experts_per_rank, device=y.device, dtype=torch.int32)[::2])
+    for stats in invalid_stats:
         with pytest.raises(RuntimeError, match="tensor device, dtype or layout"):
             entry(y, l1_weights, l2_weights, sym_buffer,
                   **{**options, "cumulative_local_expert_recv_stats": stats})
@@ -350,6 +363,28 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
     bad_w2 = (l2_weights[0][:, :-1].contiguous(), l2_weights[1])
     with pytest.raises(RuntimeError, match="tensor shape"):
         entry(y, l1_weights, bad_w2, sym_buffer, **options)
+    # Preserve shape and N stride while breaking the packed expert/scale strides.
+    def invalid_scale_views(scale):
+        yield scale[:, :, :1].expand_as(scale)
+        yield scale.transpose(1, 2).repeat(1, 2, 1).transpose(1, 2)[:, :, ::2]
+        if scale.size(0) > 1:
+            yield scale.transpose(1, 2).repeat(2, 1, 1).transpose(1, 2)[::2]
+
+    for scale in invalid_scale_views(l2_weights[1]):
+        with pytest.raises(RuntimeError, match="invalid transformed W4A4 GEMM2 scales"):
+            entry(y, l1_weights, (l2_weights[0], scale), sym_buffer, **options)
+    if num_experts_per_rank > 1:
+        master1, replica1 = _split_expert_weights(l1_weights)
+        master2, replica2 = _split_expert_weights(l2_weights)
+        for scale in invalid_scale_views(replica2[1]):
+            with pytest.raises(RuntimeError, match="invalid transformed W4A4 GEMM2 scales"):
+                entry(y, master1, master2, sym_buffer, **options,
+                      l1_weights_replicas=replica1, l2_weights_replicas=(replica2[0], scale))
+
+
+def _check_input_views(entry, y, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options):
+    """Public input views and positional calls match BF16 input preparation."""
+    deep_gemm.mega_moe_pre_dispatch(source, ids, weights, sym_buffer)
     # A caller may fill public views directly and choose tokens through y.
     # Preserve exact staged bytes so this checks the API contract independently
     # of Torch versus kernel quantization at FP4 rounding boundaries.
@@ -372,6 +407,19 @@ def _check_public_entry(entry, y, l1_weights, l2_weights, sym_buffer, source, id
     entry(y, l1_weights, l2_weights, sym_buffer, **options)
     torch.testing.assert_close(y, expected, rtol=0, atol=0)
     _check_offset_views(entry, l1_weights, l2_weights, sym_buffer, source, ids, weights, **options)
+    # Direct input writes also support -1 with nonzero routing weights.
+    for view, value in zip(views, staged):
+        view[:count].copy_(value)
+    sym_buffer.topk_weights[:count].copy_(weights)
+
+    def direct():
+        entry(y, l1_weights, l2_weights, sym_buffer, **options)
+        return y
+
+    torch.testing.assert_close(direct(), expected, rtol=0, atol=0)
+    _check_graph_replay(direct, expected, routing_ids=sym_buffer.topk_idx[:count],
+                       routing_weights=sym_buffer.topk_weights[:count],
+                       combine=sym_buffer._combine, num_experts=sym_buffer.num_experts)
 
 
 def _check_recv_stats(pipeline, y, routing_ids, routing_weights, num_experts):
@@ -625,18 +673,27 @@ def _check_mega_moe(case, source, requested, pipeline, reference, *, combine, ch
         report["correctness"] = dict(status="passed", max_pipeline_diff=metrics[0].item(),
                                      max_relative_l2=metrics[1].item(),
                                      checked_tokens_per_rank=[min(n, checked) for n in counts])
-        _check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights,
-                           routing_ids=routing_ids, check_reference=check_reference, combine=combine,
-                           num_experts=case.experts if edge_cases else None,
-                           barrier_flag=workspace._barrier_flag if edge_cases and workspace is not None else None,
-                           dispatch_counts=workspace._dispatch_counts if edge_cases and workspace is not None else None)
+        if edge_cases:
+            _check_graph_replay(pipeline, actual, input_tensor=source, routing_weights=routing_weights,
+                               routing_ids=routing_ids, check_reference=check_reference, combine=combine,
+                               num_experts=case.experts,
+                               barrier_flag=workspace._barrier_flag if workspace is not None else None,
+                               dispatch_counts=workspace._dispatch_counts if workspace is not None else None)
+            report["correctness"]["changed_routes_reference_checked"] = True
+            if world > 1:
+                report["correctness"]["cross_rank_visibility_checked"] = True
+            if routing_weights is not None:
+                report["correctness"]["routing_weight_replay_checked"] = True
+        else:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replayed = pipeline()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(replayed, actual, rtol=0, atol=0)
+            check_reference(replayed)
         report["correctness"]["max_replay_pipeline_diff"] = max(m[0] for m in replay_metrics[1:])
         report["correctness"]["max_replay_relative_l2"] = max(m[1] for m in replay_metrics[1:])
-        report["correctness"]["changed_routes_reference_checked"] = True
-        if edge_cases and world > 1:
-            report["correctness"]["cross_rank_visibility_checked"] = True
-        if routing_weights is not None:
-            report["correctness"]["routing_weight_replay_checked"] = True
         if workspace is not None:
             assert workspace._gemm2_block_info is block_info, "GEMM2 replaced workspace scratch"
             report["correctness"]["workspace_reuse_checked"] = True
@@ -649,14 +706,73 @@ def _check_mega_moe(case, source, requested, pipeline, reference, *, combine, ch
 # End-to-end correctness driver: setup -> public complete call -> reference.
 
 
+@pytest.fixture
+def mega_moe_smoke(mega_moe_group):
+    """One small public pipeline shared by API and state-reuse regressions."""
+    case = replace(CASES[0], tokens=(33,))
+    case.require_world()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    rng = torch.Generator(device="cuda").manual_seed(20261016 + rank)
+    source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
+    ids = _make_routes(case, case.capacity, rng)
+    weights = torch.rand(case.capacity, case.topk, device="cuda", generator=rng).softmax(-1)
+    count = 0 if world > 1 and rank == world - 1 else 33
+    ids[count:], weights[count:] = -1, 0
+    if count:
+        ids[0, 0] = -1
+    w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
+    w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
+    w1, w2 = deep_gemm.transform_weights_for_mega_moe(w1_raw, w2_raw)
+    buffer = deep_gemm.SymmBuffer(mega_moe_group, case.experts, case.capacity, case.topk,
+                                 case.hidden, case.intermediate)
+    x, routed_ids, routed_weights = source[:count], ids[:count], weights[:count]
+    y = torch.empty_like(x)
+    options = dict(activation=case.activation, activation_clamp=case.clamp, fast_math=True)
+
+    def pipeline(stats=None):
+        deep_gemm.mega_moe_pre_dispatch(x, routed_ids, routed_weights, buffer)
+        deep_gemm.fp4_fp4_mega_moe(y, w1, w2, buffer, stats, **options)
+        return y
+
+    def reference(checked):
+        return _reference_mega_moe(case, source, ids, weights, w1_raw, w2_raw, count, checked)
+
+    try:
+        yield SimpleNamespace(case=case, buffer=buffer, x=x, ids=routed_ids, weights=routed_weights,
+                              y=y, w1=w1, w2=w2, options=options, pipeline=pipeline, reference=reference)
+    finally:
+        buffer.destroy()
+
+
+def test_mega_moe_smoke_api(mega_moe_smoke, mega_moe_group):
+    sample = mega_moe_smoke
+    _check_workspace_options(sample.case, mega_moe_group)
+    _check_public_entry(deep_gemm.fp4_fp4_mega_moe, sample.y, sample.w1, sample.w2, sample.buffer,
+                        sample.x, sample.ids, sample.weights, **sample.options)
+    # A valid call must still work after rejected arguments.
+    _check_mega_moe(sample.case, sample.x, 33, sample.pipeline, sample.reference,
+                    combine=sample.buffer._combine, workspace=sample.buffer, verbose=False)
+
+
+def test_mega_moe_smoke_stateful(mega_moe_smoke):
+    sample = mega_moe_smoke
+    if dist.get_world_size() < 2:
+        pytest.skip("state-reuse regression requires at least two ranks")
+    _compile_kernels(sample.pipeline)
+    _check_input_views(deep_gemm.fp4_fp4_mega_moe, sample.y, sample.w1, sample.w2, sample.buffer,
+                       sample.x, sample.ids, sample.weights, **sample.options)
+    _check_recv_stats(sample.pipeline, sample.y, sample.ids, sample.weights, sample.case.experts)
+    _check_mega_moe(sample.case, sample.x, 33, sample.pipeline, sample.reference,
+                    combine=sample.buffer._combine, workspace=sample.buffer, edge_cases=True,
+                    routing_ids=sample.ids, routing_weights=sample.weights, verbose=False)
+
+
 @torch.inference_mode()
 def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=False,
                   splits=(False,), verbose=True, workspace_options=None, fast_math=True):
     """Run public MegaMoE calls against independent and stateful references."""
     rank_idx, num_ranks = dist.get_rank(), dist.get_world_size()
     num_experts_per_rank = case.experts // num_ranks
-    if check and case.name.startswith("smoke"):
-        _check_workspace_options(case, group)
     rng = torch.Generator(device="cuda").manual_seed(20261016 + rank_idx)
     x_bf16 = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .5
     l1_weights_raw = _make_weights(num_experts_per_rank, 2 * case.intermediate, case.hidden, .5, rng)
@@ -671,7 +787,7 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
     split_l1_weights = split_l2_weights = None
     reports = []
     try:
-        for token_index, requested in enumerate(case.tokens):
+        for requested in case.tokens:
             empty_rank = edge_cases and num_ranks > 1 and requested == 1 and rank_idx == num_ranks - 1
             num_tokens = 0 if empty_rank else requested
             topk_idx = _make_routes(case, case.capacity, rng)
@@ -702,13 +818,6 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
                         l1_weights_replicas=l1_replicas, l2_weights_replicas=l2_replicas)
                     return y
 
-                if check and case.name.startswith("smoke") and not split and token_index == 0:
-                    _check_public_entry(
-                        deep_gemm.fp4_fp4_mega_moe, y, l1_master, l2_master, sym_buffer,
-                        x, routed_idx, routed_weights, activation=case.activation,
-                        activation_clamp=case.clamp or None, fast_math=fast_math)
-                if check and case.name.startswith("smoke") and requested in (1, 33):
-                    _check_recv_stats(run_fused, y, routed_idx, routed_weights, case.experts)
                 report = _check_mega_moe(
                     case, x, requested, run_fused,
                     lambda checked: _reference_mega_moe(
@@ -742,12 +851,14 @@ def _run_mega_moe(case, group, *, check=True, reference_tokens=0, edge_cases=Fal
 def test_mega_moe(case, fast_math, mega_moe_group):
     case.require_world()
     splits = (False, True) if case.experts // dist.get_world_size() > 1 else (False,)
-    _run_mega_moe(case, mega_moe_group, edge_cases=True, splits=splits, verbose=False,
+    _run_mega_moe(case, mega_moe_group, splits=splits, verbose=False,
                   reference_tokens=0 if case.name.startswith("smoke") else case.reference_tokens,
                   fast_math=fast_math)
 
 
 @pytest.mark.parametrize("options", [
+    {"gemm1_config": (64, 256, 128, 32, 64, 2),
+     "gemm2_config": (64, 256, 128, 32, 64, 2)},
     {"gemm1_config": (64, 256, 128, 32, 64, 3)},
     {"gemm1_config": (64, 128, 128, 32, 64, 3)},
     {"gemm2_config": (64, 256, 128, 32, 64, 3)},
@@ -755,14 +866,14 @@ def test_mega_moe(case, fast_math, mega_moe_group):
      "gemm2_config": (64, 256, 128, 32, 64, 3)},
     {"gemm1_config": (64, 256, 128, 32, 64, 3),
      "gemm2_config": (128, 256, 64, 64, 64, 3)},
-], ids=["smoke_g1_only", "smoke_g1_bn128", "smoke_g2_only", "smoke_g1_larger", "smoke_g2_larger"])
+], ids=["smoke_two_stages", "smoke_g1_only", "smoke_g1_bn128", "smoke_g2_only", "smoke_g1_larger", "smoke_g2_larger"])
 def test_mega_moe_tiles(options, mega_moe_group):
     # Reuse the public-entry reference, changing routes, empty-rank and graph
     # checks with different source and GEMM2 padding in the same workspace.
     case = CASES[0]
     case.require_world()
     splits = (False, True) if case.experts // dist.get_world_size() > 1 else (False,)
-    _run_mega_moe(case, mega_moe_group, edge_cases=True, splits=splits, verbose=False,
+    _run_mega_moe(case, mega_moe_group, splits=splits, verbose=False,
                   workspace_options=options)
 
 

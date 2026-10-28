@@ -106,8 +106,8 @@ __device__ __forceinline__ void load_combine_vector(
 
 template <int kTopk, bool kFp8, bool kScaled, int kThreads>
 __device__ __forceinline__ void barrier_reduce_kernel(
-    const void* buf, const uint64_t* scales, const float* weights, __ppu_bfloat16* output,
-    int tokens, int hidden, int capacity, int scale_tiles, int scale_block_n, int fp8_exp_shift,
+    const void* buf, const uint64_t* scales, const float* weights, const int64_t* ids, __ppu_bfloat16* output,
+    int tokens, int hidden, int capacity, int num_experts, int scale_tiles, int scale_block_n, int fp8_exp_shift,
     int32_t** flags, int rank, int world, int32_t* done,
     uint64_t* dispatch_counts, int num_dispatch_counts) {
     combine_barrier(flags, rank, world, done, dispatch_counts, num_dispatch_counts);
@@ -117,7 +117,9 @@ __device__ __forceinline__ void barrier_reduce_kernel(
     float route_weights[kTopk];
     #pragma unroll
     for (int slot = 0; slot < kTopk; ++slot) {
-        route_weights[slot] = __ldg(weights + static_cast<int64_t>(token) * kTopk + slot);
+        const int64_t offset = static_cast<int64_t>(token) * kTopk + slot;
+        const int64_t expert = __ldg(ids + offset);
+        route_weights[slot] = expert >= 0 && expert < num_experts ? __ldg(weights + offset) : 0.0f;
         if constexpr (kFp8 && !kScaled)
             route_weights[slot] *= ldexpf(1.0f, fp8_exp_shift);
     }

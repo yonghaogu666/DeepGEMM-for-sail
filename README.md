@@ -452,7 +452,9 @@ before activation; Step clamps after SiLU. `activation_clamp` must be positive
 when supplied and is unsupported for SiTU. SiTU uses `situ_beta=4` and
 `situ_linear_beta=25` by default. Original routing weights are applied once
 in final combine, independently of quantization scales. Zero weights mask
-unwritten slots. Moving weights across FP4 quantization changes the numerical
+unwritten slots. IDs outside `[0, num_experts)` are ignored, including when
+public input views are filled directly; their routing weights need not be zero.
+Moving weights across FP4 quantization changes the numerical
 path, so comparisons use a matching independent reference.
 
 `fast_math=True` (the upstream default) uses PPU approximate activation math.
@@ -461,7 +463,8 @@ GEMM accumulation precision, BF16 rounding and MXFP4 quantization stay the same.
 
 `hidden` means input/output width H, and `intermediate_hidden` means activated
 width I; GEMM1 derives 2I internally. H must be divisible by 512 and I by 128.
-EP is at most 32; global physical expert slots must be divisible by EP; top-k
+EP is at most 32; global physical expert slots must be divisible by EP, with
+at most 1024 physical experts per rank (masters plus replicas); top-k
 is 1–16 and no larger than the expert count. Capacity is positive and below
 2^24. Supported models in the test table are DeepSeek V4 Pro/Flash, GLM5.2,
 Kimi K3, Qwen3.8 2.4T and MiMo V2.6 Pro. Test coverage, rather than these
@@ -473,6 +476,9 @@ first; group-32 UE8M0 scales use uint8 `[E,N,K/32]`. Logical GEMM1 rows are
 `[gate; up]`. The Python transform in `deep_gemm/mega/__init__.py` interleaves
 rows in groups of eight and packs scales with PyTorch operations, without
 requantizing values. Do not transform the returned pairs again.
+Transformed GEMM2 uint16 scales have shape `[E,H,I/64]` and dense
+column-major strides `[H*(I/64),1,H]`. Broadcast views or strided expert/scale
+selections must be materialized in that layout before use.
 UltraEP uses remapped physical routing IDs and optional `l1_weights_replicas` and
 `l2_weights_replicas` pairs; each rank stores masters before replicas in both stages.
 
@@ -527,7 +533,9 @@ select `(BLOCK_M,BLOCK_N,BLOCK_K,WARP_M,WARP_N,stages)`; K counts packed FP4
 bytes. Complete explicit tiles take precedence over measured tuning and
 default selection. Individual tile limits and dictionary overrides are not
 accepted. Omitted tiles use actual-token tuning with heuristic fallback. The
-workspace keeps capacity independent of runtime tile selection, and GEMM1
+FP4 mainloop requires at least two stages; a GEMM1 tile must fit two stages
+in shared memory even when a larger requested stage count can be reduced.
+The workspace keeps capacity independent of runtime tile selection, and GEMM1
 produces the row metadata required by GEMM2.
 
 The fallback compares complete legal pipeline configurations using expected

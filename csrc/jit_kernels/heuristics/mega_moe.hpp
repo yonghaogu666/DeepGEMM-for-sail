@@ -354,7 +354,7 @@ inline DispatchConfig w4_dispatch_config(DispatchConfig c, int intermediate, int
     const auto [bm, bn, bk, wm, wn, stages] = tile;
     TORCH_CHECK((bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256) &&
                 (bn == 128 || bn == 256), "Invalid MegaMoE GEMM1 tile");
-    TORCH_CHECK(bk > 0 && stages > 0 && intermediate % bn == 0 && bytes % bk == 0);
+    TORCH_CHECK(bk > 0 && stages >= 2 && intermediate % bn == 0 && bytes % bk == 0);
     set_gemm1_tile(c, tile);
     TORCH_CHECK(c.num_threads >= 32 && c.num_threads <= 1024);
     c.gemm1_n = intermediate;
