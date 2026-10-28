@@ -10,7 +10,7 @@
 #include "mega_moe_runtime.hpp"
 #include "../heuristics/mega_moe.hpp"
 
-namespace deep_gemm::mega_moe_native {
+namespace deep_gemm {
 
 static_assert(sizeof(layout::SymBuffer<1>) == 592, "MegaMoE symmetric buffer ABI changed");
 
@@ -188,7 +188,7 @@ uint32_t phase_a = NUM_EXPERTS * sizeof(uint32_t);
 uint32_t pull = {PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES);
 return collective > phase_a ? (collective > pull ? collective : pull) : (phase_a > pull ? phase_a : pull);
 }
-extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = ppu_smem_compute();
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = ppu_smem_compute();
 extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
 void PPU_KERNEL_ENTRY(layout::SymBuffer<{NUM_RANKS}> sb, int rank, int num_tokens, uint8_t* gemm1_weight, uint16_t* gemm1_weight_sf_u16, uint8_t* gemm1_weight_replicas, uint16_t* gemm1_weight_sf_u16_replicas, int num_master_experts, uint16_t* sfa_scratch, uint8_t* fp4_output, uint16_t* scale_output, int32_t* cumulative_local_expert_recv_stats) {
 constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_ISF};
@@ -290,7 +290,7 @@ public:
     static std::string generate_impl(const Args& args) {
         return rendered_source<FP4MegaMoEPreDispatchRuntime>("fp4_mega_moe_pre_dispatch", R"DGMEGA(#include <deep_gemm/impls/fp4_mega_moe_pre_dispatch.cuh>
 using namespace deep_gemm;
-extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = 0;
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = 0;
 extern "C" __global__ __launch_bounds__({BLOCK_THREADS}, 4)
 void PPU_KERNEL_ENTRY(__ppu_bfloat16* hidden_states, int64_t* topk_ids, float* topk_weights, uint8_t* input_token, uint8_t* input_sf, int64_t* input_topk_idx, float* input_topk_weights, int num_tokens) {
 mega_moe::fp4::fp4_mega_moe_pre_dispatch_kernel_device<{HIDDEN}, {TOP_K}, {BLOCK_THREADS}>(hidden_states,topk_ids,topk_weights,input_token,input_sf,input_topk_idx,input_topk_weights,(uint32_t)num_tokens);
@@ -336,9 +336,9 @@ inline void fp4_mega_moe_pre_dispatch_impl(const torch::Tensor& hidden_states, c
     config.num_topk = num_topk;
     config.block_threads = threads;
     config.num_sms = get_num_sms();
-    mega_moe_native::fp4_mega_moe_pre_dispatch_kernel(config, hidden_states, topk_idx, topk_weights,
-                                                      x, x_sf, staged_topk_idx,
-                                                      staged_topk_weights, num_tokens);
+    fp4_mega_moe_pre_dispatch_kernel(config, hidden_states, topk_idx, topk_weights,
+                                     x, x_sf, staged_topk_idx,
+                                     staged_topk_weights, num_tokens);
 }
 
-} // namespace deep_gemm::mega_moe_native
+} // namespace deep_gemm

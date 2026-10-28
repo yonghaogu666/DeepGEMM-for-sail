@@ -4,7 +4,7 @@
 #include "mega_moe_runtime.hpp"
 #include "../heuristics/mega_moe.hpp"
 
-namespace deep_gemm::mega_moe_aux {
+namespace deep_gemm {
 
 class MegaMoECombineRuntime final : public LaunchRuntime<MegaMoECombineRuntime> {
 public:
@@ -42,7 +42,7 @@ public:
             info.num_topk, info.fp8, info.scaled, threads);
         return "#include <deep_gemm/impls/mega_moe_combine.cuh>\n"
                "extern \"C\" __global__ void __launch_bounds__(" + std::to_string(threads) +
-               ") ppu_moe_aux_barrier_reduce("
+               ") ppu_mega_moe_barrier_reduce("
                "const void* b, const uint64_t* s, const float* w, const int64_t* ids, __ppu_bfloat16* y, int t, int h, int c, int e, "
                "int st, int sn, int shift, int32_t** p, int r, int ws, int32_t* d, uint64_t* counts, int nc"
                ") {\nusing namespace deep_gemm::mega_moe::detail;\n" + body + "\n}\n";
@@ -84,4 +84,4 @@ inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
          static_cast<uint64_t*>(dispatch_counts.data_ptr()), static_cast<int>(dispatch_counts.nbytes() / sizeof(uint64_t))}};
 }
 
-} // namespace deep_gemm::mega_moe_aux
+} // namespace deep_gemm

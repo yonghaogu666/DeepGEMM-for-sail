@@ -6,7 +6,7 @@
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
 
-namespace deep_gemm::mega_moe_native {
+namespace deep_gemm {
 
 inline int get_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime,
                                 int threads, int dynamic_smem = 0) {
@@ -37,15 +37,15 @@ inline int get_kernel_smem_size(const std::shared_ptr<KernelRuntime>& runtime) {
     void* address = nullptr;
 #if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
     DG_HGGC_UNIFIED_CHECK(hggcLibraryGetGlobal(&address, &bytes, runtime->library,
-                                      "ppu_native_smem_bytes"));
+                                      "ppu_mega_moe_smem_bytes"));
 #else
     HGdeviceptr device_address = 0;
 #ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
     DG_HGGC_UNIFIED_CHECK(hgLibraryGetGlobal(&device_address, &bytes, runtime->library,
-                                    "ppu_native_smem_bytes"));
+                                    "ppu_mega_moe_smem_bytes"));
 #else
     DG_HGGC_UNIFIED_CHECK(hgModuleGetGlobal(&device_address, &bytes, runtime->library,
-                                   "ppu_native_smem_bytes"));
+                                   "ppu_mega_moe_smem_bytes"));
 #endif
     address = reinterpret_cast<void*>(device_address);
 #endif
@@ -56,4 +56,4 @@ inline int get_kernel_smem_size(const std::shared_ptr<KernelRuntime>& runtime) {
     return sizes.emplace(Key(runtime), static_cast<int>(smem)).first->second;
 }
 
-} // namespace deep_gemm::mega_moe_native
+} // namespace deep_gemm

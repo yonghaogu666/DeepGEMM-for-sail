@@ -6,7 +6,7 @@
 #include "fp8_gemm.hpp" // Existing grouped-scheduler block-info preprocessing.
 #include "mega_moe_dispatch.hpp"
 
-namespace deep_gemm::mega_moe_native {
+namespace deep_gemm {
 
 using PackedStride = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 using ScaleStride = cute::Stride<cute::Int<1>, int64_t, int64_t>;
@@ -73,7 +73,7 @@ static_assert(offsetof(Kernel::Params,hw_info) == {ABI_HW_OFFSET}, "scatter hard
 static_assert(offsetof(Kernel::Params,scheduler) == {ABI_SCHEDULER_OFFSET}, "scatter scheduler offset mismatch");
 static_assert(offsetof(Kernel::Params,workspace) == {ABI_WORKSPACE_OFFSET}, "scatter workspace offset mismatch");
 static_assert(offsetof(Kernel::Params,signal) == {ABI_SIGNAL_OFFSET}, "scatter signal offset mismatch");
-extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = Kernel::SharedStorageSize;
+extern "C" __device__ __constant__ uint32_t ppu_mega_moe_smem_bytes = Kernel::SharedStorageSize;
 extern "C" __global__
 __launch_bounds__(Kernel::MaxThreadsPerBlock,Kernel::MinBlocksPerMultiprocessor)
 void PPU_SCATTER_ENTRY(typename Kernel::Params params) {
@@ -185,7 +185,9 @@ inline FP4MegaMoELinear2Args make_fp4_mega_moe_scatter_args(
     const torch::Tensor& valid_rows, const torch::Tensor& src_offsets) {
     const int m = num_rows, n = config.n, k = config.k, groups = config.num_groups;
     const auto layout = prepare_scatter_layout(groups, config.block_m, rows, block_info);
-    const auto sa = packed_stride(m, k), sb = packed_stride(n, k), sc = packed_stride(m, 0),
+    const auto sa = packed_stride(m, k),
+               sb = packed_stride(n, k),
+               sc = packed_stride(m, 0),
                sd = packed_stride(m, n);
     const auto sfa = cutlass::make_cute_packed_stride(ScaleStride{}, cute::make_shape(m, ceil_div(k, 32), 1));
     const auto sfb = cutlass::make_cute_packed_stride(ScaleStride{}, cute::make_shape(n, ceil_div(k, 32), 1));
@@ -310,4 +312,4 @@ inline FP4MegaMoELinear2Args make_fp4_mega_moe_linear2_args(
 }
 
 
-} // namespace deep_gemm::mega_moe_native
+} // namespace deep_gemm

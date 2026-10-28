@@ -125,9 +125,9 @@ static void fp4_mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor&
         TORCH_CHECK(tensor.size(0) >= num_tokens);
     const int threads = mega_moe_config::pre_dispatch_threads(hidden);
     TORCH_CHECK(threads > 0 && threads % 32 == 0 && threads <= hidden / 8);
-    mega_moe_native::fp4_mega_moe_pre_dispatch_impl(hidden_states, topk_idx, topk_weights, x,
-                                                    x_sf, staged_topk_idx, staged_topk_weights, num_tokens,
-                                                    hidden, num_topk, threads);
+    fp4_mega_moe_pre_dispatch_impl(hidden_states, topk_idx, topk_weights, x,
+                                   x_sf, staged_topk_idx, staged_topk_weights, num_tokens,
+                                   hidden, num_topk, threads);
 }
 
 static bool is_fp4_scale_layout(const Tensor& scale) {
@@ -349,7 +349,7 @@ void fp4_fp4_mega_moe(
     TORCH_CHECK(num_experts == allocation.num_experts && num_topk == allocation.num_topk &&
                 hidden == allocation.token_bytes * 2 && num_max_tokens_per_rank == allocation.nmtpr,
                 "MegaMoE workspace dimensions must not change after allocation");
-    const auto transport = mega_moe_native::make_sym_buffer(sym_buffer_ptrs, rank_idx, num_ranks);
+    const auto transport = make_sym_buffer(sym_buffer_ptrs, rank_idx, num_ranks);
     TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(sym_buffer.data_ptr()),
                 "symmetric pointer table must reference the local workspace buffer");
     const auto device = sym_buffer.device();
@@ -383,13 +383,13 @@ void fp4_fp4_mega_moe(
                 "W4A4 activation scales must be column-major");
     const auto& dispatch = state->dispatch(num_tokens, tuning);
     validate_rank(dispatch, rank_idx, num_tokens);
-    const mega_moe_native::MegaMoEWorkspace workspace{
+    const MegaMoEWorkspace workspace{
         dispatch, 256,
         sym_buffer_ptrs, l2_acts, l2_acts_sf,
         sfa_scratch.narrow(0, 0, int64_t(num_pool_tokens) * (dispatch.sf_bytes / 2)),
         m_rows, valid_m_rows, src_m_offsets, token_meta, block_info,
         combine, combine_offsets, dispatch_counts, topk_weights, topk_idx, barrier_pointers, barrier_done};
-    mega_moe_native::fp4_fp4_mega_moe_impl(y, l1_weights, l2_weights, workspace, rank_idx, num_tokens, activation_op,
+    fp4_fp4_mega_moe_impl(y, l1_weights, l2_weights, workspace, rank_idx, num_tokens, activation_op,
         activation_clamp.value_or(0.0f), fast_math, situ_beta, situ_linear_beta,
         l1_weights_replicas, l2_weights_replicas, tuning, cumulative_local_expert_recv_stats);
 }

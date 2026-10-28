@@ -4,7 +4,7 @@
 #include "mega_moe_scatter.hpp"
 #include "mega_moe_combine.hpp"
 
-namespace deep_gemm::mega_moe_native {
+namespace deep_gemm {
 
 // Typed views of library-owned storage. The Python API resolves its workspace
 // once; implementation code does not access Python objects or private offsets.
@@ -81,7 +81,7 @@ public:
             auto runtime = compiler->build(tag, generate(phase_args));
             phase_args.launch_args.smem_size = get_kernel_smem_size(runtime);
             const int occupancy = get_kernel_occupancy(runtime, phase_args.launch_args.block_dim.x,
-                                                        phase_args.launch_args.smem_size);
+                                                       phase_args.launch_args.smem_size);
             TORCH_CHECK(occupancy >= 1,
                         "MegaMoE launch cannot keep a block resident");
             const int hardware_sms = device_runtime->get_prop()->multiProcessorCount;
@@ -129,15 +129,15 @@ public:
         }
         // Linear2 owns completion on the same stream, including empty ranks.
         // Keep reduce separate so it can use its own resource budget.
-        auto combine_args = mega_moe_aux::make_mega_moe_combine_args(
+        auto combine_args = make_mega_moe_combine_args(
             buffer.combine, buffer.topk_weights.narrow(0, 0, args.num_tokens), buffer.topk_idx, config.num_experts,
             args.num_tokens, hidden, config.num_topk, config.nmtpr, buffer.barrier_pointers,
             args.rank_idx, config.num_ranks, buffer.barrier_done, buffer.dispatch_counts,
             std::nullopt, 0, args.y);
-        using CombineRuntime = mega_moe_aux::MegaMoECombineRuntime;
+        using CombineRuntime = MegaMoECombineRuntime;
         const auto code = CombineRuntime::generate(combine_args);
-        const auto runtime = compiler->build("ppu_moe_aux_barrier_reduce", code);
-        mega_moe_aux::reset_done(buffer.barrier_done);
+        const auto runtime = compiler->build("ppu_mega_moe_barrier_reduce", code);
+        reset_done(buffer.barrier_done);
         CombineRuntime::launch(runtime, combine_args);
     }
 };
@@ -183,4 +183,4 @@ inline void fp4_fp4_mega_moe_impl(
     launch_with_phase(PPUFP4MegaMoERuntime::KernelPhase::Linear2, "m_grouped_gemm_fp4_moe_scatter");
 }
 
-} // namespace deep_gemm::mega_moe_native
+} // namespace deep_gemm
