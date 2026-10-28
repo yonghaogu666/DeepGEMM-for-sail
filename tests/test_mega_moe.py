@@ -307,8 +307,9 @@ def _check_workspace_options(case, group):
                     ({stage: (64, 256, 128, 48, 64, 3)}, "invalid warp tile")]
     invalid.append(({"gemm2_config": (256, 256, 128, 64, 64, 64)}, "shared-memory capacity"))
     for legacy in ({"gemm1_block_n": 256}, {"gemm1_block_k": 128}, {"config_override": {}}):
-        invalid.append(({"gemm1_config": (64, 256, 128, 32, 64, 3), **legacy},
-                        "cannot be combined"))
+        for factory in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
+            with pytest.raises(TypeError, match=next(iter(legacy))):
+                factory(group, **options, **legacy)
     for changed, message in invalid:
         for allocate in (deep_gemm.get_symm_buffer_for_mega_moe, deep_gemm.SymmBuffer):
             with pytest.raises((ValueError, RuntimeError), match=message):
@@ -748,12 +749,13 @@ def test_mega_moe(case, fast_math, mega_moe_group):
 
 @pytest.mark.parametrize("options", [
     {"gemm1_config": (64, 256, 128, 32, 64, 3)},
+    {"gemm1_config": (64, 128, 128, 32, 64, 3)},
     {"gemm2_config": (64, 256, 128, 32, 64, 3)},
     {"gemm1_config": (128, 256, 64, 64, 64, 3),
      "gemm2_config": (64, 256, 128, 32, 64, 3)},
     {"gemm1_config": (64, 256, 128, 32, 64, 3),
      "gemm2_config": (128, 256, 64, 64, 64, 3)},
-], ids=["smoke_g1_only", "smoke_g2_only", "smoke_g1_larger", "smoke_g2_larger"])
+], ids=["smoke_g1_only", "smoke_g1_bn128", "smoke_g2_only", "smoke_g1_larger", "smoke_g2_larger"])
 def test_mega_moe_tiles(options, mega_moe_group):
     # Reuse the public-entry reference, changing routes, empty-rank and graph
     # checks with different source and GEMM2 padding in the same workspace.

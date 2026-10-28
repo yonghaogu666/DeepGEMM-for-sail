@@ -545,14 +545,14 @@ dispatch_gemm1_device(
         }
     }
 
-    constexpr uint32_t kGemmSMOffset = kNumPullCTAs;
+    constexpr uint32_t kGemmCTAOffset = kNumPullCTAs;
     constexpr uint32_t kNumNBlocks = kGemm1N / kBlockN;
     // Finish the N tiles of one M block before advancing M.
     constexpr uint32_t kMBlocksPerSwizzleGroup = 1;
     const uint32_t total_gemm_work = total_blocks * kNumNBlocks;
-    const bool initial_gemm_sm =
-        cta_idx >= kGemmSMOffset && cta_idx < kGemmSMOffset + kNumGemmCTAs;
-    const uint32_t initial_gemm_sm_idx = cta_idx - kGemmSMOffset;
+    const bool initial_gemm_cta =
+        cta_idx >= kGemmCTAOffset && cta_idx < kGemmCTAOffset + kNumGemmCTAs;
+    const uint32_t initial_gemm_cta_idx = cta_idx - kGemmCTAOffset;
 
     // All queue participants retain per-M-block readiness checks.
     // Non-queue configurations use static assignment.
@@ -580,7 +580,7 @@ dispatch_gemm1_device(
                 // Retire ticket reads in the readiness rendezvous below,
                 // before MMA can reuse this shared storage.
             } else {
-                next_block_idx = (current_iter++) * kNumGemmCTAs + initial_gemm_sm_idx;
+                next_block_idx = (current_iter++) * kNumGemmCTAs + initial_gemm_cta_idx;
             }
             if (next_block_idx >= total_gemm_work)
                 return false;
@@ -717,7 +717,7 @@ dispatch_gemm1_device(
         }
     };
 
-    if (initial_gemm_sm || kDynamicWork) {
+    if (initial_gemm_cta || kDynamicWork) {
         if (thread_idx < Cfg::ThreadNum)
             run_gemm1();
         __syncthreads();

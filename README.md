@@ -395,10 +395,14 @@ BF16 inputs and original top-k IDs/weights are staged by `mega_moe_pre_dispatch`
 `fp4_fp4_mega_moe(y, l1_weights, l2_weights, buffer, ...)` then runs cross-rank dispatch with
 GEMM1, activation and FP4 output quantization, followed by GEMM2/scatter and
 a separate kernel that recycles dispatch counters, synchronizes ranks and
-performs weighted reduction into BF16 `y`. Both launches are managed by
-Linear2; callers invoke the complete MoE entry once.
+performs weighted reduction into BF16 `y`. Linear2 manages GEMM2/scatter and
+the separate combine launch; callers invoke the complete MoE entry once.
 The workspace owns scratch, route metadata, combine storage and counters;
 the library recycles per-call state on the same stream.
+
+The fallback configuration estimates distinct random top-k routing with
+comparable token counts across ranks. Other routing distributions remain
+supported; this estimate does not guarantee their best performance.
 
 The public exports follow upstream DeepGEMM `nv_dev` commit
 [`b64107f2`](https://github.com/deepseek-ai/DeepGEMM/blob/b64107f2b9599ca76445b7f62eedf66bae1d095b/deep_gemm/mega/__init__.py).
@@ -520,9 +524,18 @@ concurrent forwards require separate workspaces.
 
 Optional `gemm1_config` and `gemm2_config` workspace arguments independently
 select `(BLOCK_M,BLOCK_N,BLOCK_K,WARP_M,WARP_N,stages)`; K counts packed FP4
-bytes. Omitted tiles use actual-token tuning with heuristic fallback. The
+bytes. Complete explicit tiles take precedence over measured tuning and
+default selection. Individual tile limits and dictionary overrides are not
+accepted. Omitted tiles use actual-token tuning with heuristic fallback. The
 workspace keeps capacity independent of runtime tile selection, and GEMM1
 produces the row metadata required by GEMM2.
+
+The fallback compares complete legal pipeline configurations using expected
+expert row counts and pre-JIT resource estimates. GEMM1 accounts for the
+configured pull and CTA targets; GEMM2 accounts for variable expert loads,
+padded computation, operand/output traffic and scheduling work. Thread and
+shared-memory budgets estimate relative cost; the compiled kernel's occupancy
+still limits its launch. Selections are cached by actual token count and activation.
 
 The complete public entry uses BF16 scatter/combine. The W4A4 kernel also
 retains optional FP8 scatter and scaled FP8 combine support internally.

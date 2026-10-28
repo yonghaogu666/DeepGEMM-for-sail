@@ -28,29 +28,23 @@ static void check_device() {
 }
 
 // Host-only state owned by one SymmBuffer. Python never interprets launch
-// configurations; each actual token count retains the same cached selection.
+// configurations; each token count and activation retains its cached selection.
 struct SymmBufferState {
     DispatchConfig allocation_config;
-    std::optional<mega_moe_config::Overrides> overrides;
-    int gemm1_block_n, gemm1_block_k;
-    std::optional<mega_moe_config::Tile> gemm2_config;
-    std::map<int, DispatchConfig> dispatch_cache;
+    std::optional<mega_moe_config::Tile> gemm1_config, gemm2_config;
+    std::map<std::pair<int, std::string>, DispatchConfig> dispatch_cache;
     std::map<std::pair<int, std::string>, TuningConfig> tuning_cache;
 
-    const DispatchConfig& dispatch(const int& num_tokens) {
+    const DispatchConfig& dispatch(const int& num_tokens, const TuningConfig& tuning) {
         const auto& c = allocation_config;
         TORCH_CHECK(num_tokens >= 0 && num_tokens <= c.nmtpr);
-        auto found = dispatch_cache.find(num_tokens);
+        const auto key = std::make_pair(num_tokens, tuning.workload.activation);
+        auto found = dispatch_cache.find(key);
         if (found == dispatch_cache.end()) {
             auto config = mega_moe_config::fp4_dispatch_config(
                 c.num_ranks, c.num_experts, c.num_topk, c.token_bytes * 2, c.gemm1_n,
-                c.nmtpr, num_tokens, gemm1_block_n, gemm1_block_k, 32, 64, 3, overrides);
-            if (!overrides || overrides->empty()) {
-                const int bm = config.block_m, bn = config.gemm1_block_n;
-                TORCH_CHECK((bm == 16 || bm == 32 || bm == 64 || bm == 128 || bm == 256) &&
-                            (bn == 128 || bn == 256));
-            }
-            found = dispatch_cache.emplace(num_tokens, std::move(config)).first;
+                c.nmtpr, num_tokens, gemm1_config ? gemm1_config : tuning.gemm1.tile, tuning.gemm1);
+            found = dispatch_cache.emplace(key, std::move(config)).first;
         }
         return found->second;
     }
@@ -63,7 +57,14 @@ struct SymmBufferState {
             auto config = mega_moe_config::tuning_config(
                 {c.num_ranks, c.num_experts, c.num_topk, c.token_bytes * 2,
                  c.gemm1_n / 2, num_tokens, activation});
+            if (gemm1_config)
+                config.gemm1.tile = gemm1_config;
             if (gemm2_config) config.gemm2.tile = gemm2_config;
+            if (!config.gemm2.tile) {
+                const auto [sms, bm, bn, bk, wm, wn, stages, smem] = mega_moe_config::fp4_scatter_config(
+                    c.token_bytes * 2, c.gemm1_n / 4, c.num_experts_per_rank, config);
+                config.gemm2.tile = mega_moe_config::Tile{bm, bn, bk, wm, wn, stages};
+            }
             found = tuning_cache.emplace(key, std::move(config)).first;
         }
         return found->second;
@@ -101,7 +102,7 @@ static void check_fp4_pipeline_tile(const mega_moe_config::Tile& tile, const int
                 name, " has an invalid thread or stage count");
     // GEMM1 reduces its requested stage count to fit shared memory. GEMM2
     // uses the requested count directly; reject oversized tiles before allocation.
-    const auto smem = mega_moe_config::fp4_smem(gemm1 ? 1 : stages, bm, bn, wm, wn, bk);
+    const auto smem = mega_moe_config::fp4_smem(gemm1 ? 1 : stages, bm, bn, bk);
     TORCH_CHECK(std::get<0>(smem) <= 256 * 1024, name, " exceeds shared-memory capacity");
 }
 
@@ -165,22 +166,17 @@ static std::map<std::string, int64_t> symmetric_layout(const DispatchConfig& con
         {"total", off_packed + num_pool_tokens * sizeof(int64_t)},
         {"off_gemm2_meta", off_meta},
         {"off_gemm2_packed", off_packed},
-        {"off_ws", 0},
         {"off_it", off_it},
         {"off_isf", off_isf},
         {"off_iti", off_iti},
         {"off_itw", off_itw},
-        {"off_pt", off_pt},
-        {"off_psf", off_psf},
         {"num_pool", num_pool_tokens},
         {"num_pool_blocks", workspace.num_max_pool_blocks},
         {"woff_sc", reinterpret_cast<uintptr_t>(workspace.get_expert_send_count_ptr(0))},
         {"woff_rc", reinterpret_cast<uintptr_t>(workspace.get_expert_recv_count_ptr(0, 0))},
         {"woff_rcs", reinterpret_cast<uintptr_t>(workspace.get_expert_recv_count_sum_ptr(0))},
         {"woff_meta", reinterpret_cast<uintptr_t>(workspace.get_token_src_metadata_ptr(0))},
-        {"ws_bytes", ws_bytes},
     };
-    output["off_out"] = 0;
     output["woff_arr"] = reinterpret_cast<uintptr_t>(workspace.get_l1_arrival_count_ptr(0));
     return output;
 }
@@ -191,8 +187,7 @@ static std::tuple<int64_t, std::function<py::tuple(const Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts, const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden, const std::string& mma_type,
-    const std::string& activation, const std::optional<int>& gemm1_block_n,
-    const std::optional<int>& gemm1_block_k, const std::optional<mega_moe_config::Overrides>& config_override,
+    const std::string& activation,
     const std::optional<mega_moe_config::Tile>& gemm1_config,
     const std::optional<mega_moe_config::Tile>& gemm2_config) {
     check_device();
@@ -206,33 +201,15 @@ get_symm_buffer_size_for_mega_moe(
     TORCH_CHECK(intermediate_hidden > 0 && intermediate_hidden % 128 == 0,
                 "intermediate_hidden must be the activated width I, a positive multiple of 128");
     TORCH_CHECK(hidden > 0 && hidden % 512 == 0, "MegaMoE hidden must be divisible by 512 for W4A4");
-    int block_n = gemm1_block_n.value_or(256), block_k = gemm1_block_k.value_or(128);
-    auto overrides = config_override;
-    if (gemm1_config) {
+    if (gemm1_config)
         check_fp4_pipeline_tile(*gemm1_config, 2 * intermediate_hidden, hidden / 2, true);
-        TORCH_CHECK(!gemm1_block_n && !gemm1_block_k && !overrides,
-                    "gemm1_config cannot be combined with GEMM1 tile limits or config_override");
-        const auto& t = *gemm1_config;
-        overrides = mega_moe_config::Overrides{
-            {"BLOCK_M", t[0]}, {"GEMM1_BLOCK_N", t[1]}, {"GEMM1_BLOCK_K", t[2]},
-            {"GEMM1_WARP_M", t[3]}, {"GEMM1_WARP_N", t[4]}, {"GEMM1_STAGES", t[5]}};
-        block_n = t[1];
-        block_k = t[2];
-    }
     if (gemm2_config)
         check_fp4_pipeline_tile(*gemm2_config, hidden, intermediate_hidden / 2, false);
     auto config = mega_moe_config::fp4_dispatch_config(
         num_ranks, num_experts, num_topk, hidden, 2 * intermediate_hidden,
-        num_max_tokens_per_rank, num_max_tokens_per_rank,
-        block_n, block_k, 32, 64, 3, overrides);
-    TORCH_CHECK(config.num_ranks == num_ranks && config.num_experts == num_experts &&
-                config.num_experts_per_rank == num_experts / num_ranks && config.num_topk == num_topk &&
-                config.nmtpr == num_max_tokens_per_rank && config.token_bytes == hidden / 2 &&
-                config.sf_bytes == hidden / 32 && config.gemm1_n == 2 * intermediate_hidden,
-                "config_override must not change workspace dimensions");
+        num_max_tokens_per_rank, num_max_tokens_per_rank, gemm1_config);
     auto state = std::make_shared<SymmBufferState>(SymmBufferState{
-        config, std::move(overrides), block_n, block_k,
-        gemm2_config, {{num_max_tokens_per_rank, config}}, {}});
+        config, gemm1_config, gemm2_config, {}, {}});
     const auto offsets = symmetric_layout(config);
     const int64_t num_bytes = offsets.at("total");
     auto slice_input_buffers = [=](const Tensor& buffer) {
@@ -400,11 +377,10 @@ void fp4_fp4_mega_moe(
     check_shape(l2_acts_sf, {num_pool_tokens, intermediate_hidden / 64});
     TORCH_CHECK(l2_acts_sf.stride(0) == 1 && l2_acts_sf.stride(1) == num_pool_tokens,
                 "W4A4 activation scales must be column-major");
-    const auto& dispatch = state->dispatch(num_tokens);
+    const auto& dispatch = state->dispatch(num_tokens, tuning);
     validate_rank(dispatch, rank_idx, num_tokens);
     const mega_moe_native::MegaMoEWorkspace workspace{
-        dispatch,
-        state->overrides, state->gemm1_block_n, state->gemm1_block_k, 256,
+        dispatch, 256,
         sym_buffer_ptrs, l2_acts, l2_acts_sf,
         sfa_scratch.narrow(0, 0, int64_t(num_pool_tokens) * (dispatch.sf_bytes / 2)),
         m_rows, valid_m_rows, src_m_offsets, token_meta, block_info,

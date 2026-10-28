@@ -3,7 +3,7 @@
 Matches the export organization of upstream ``deep_gemm.mega``. Quantized
 operands use the PPU MXFP4 format; C++ validates tensors and runs the pipeline.
 """
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -55,14 +55,15 @@ class SymmBuffer:
     All ranks allocate matching workspaces. Scratch, metadata, combine storage
     and communication state are owned here and recycled by the complete call.
     Use one stream per workspace; destroy it after outstanding work completes.
+
+    Optional ``gemm1_config`` and ``gemm2_config`` are PPU extensions. Each
+    specifies a complete tile; omitted tiles use the library's configuration.
     """
 
     def __init__(self, group: dist.ProcessGroup, num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int, *,
                  mma_type: str = "fp4xfp4", activation: str = "swiglu",
-                 gemm1_block_n: Optional[int] = None, gemm1_block_k: Optional[int] = None,
-                 config_override: Optional[Dict[str, int]] = None,
                  gemm1_config: Optional[Tile] = None, gemm2_config: Optional[Tile] = None):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -78,7 +79,7 @@ class SymmBuffer:
         total, slice_input_buffers = deep_gemm_cpp.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts, num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden, mma_type, activation,
-            gemm1_block_n, gemm1_block_k, config_override, gemm1_config, gemm2_config)
+            gemm1_config, gemm2_config)
         try:
             symm_mem.enable_symm_mem_for_group(group.group_name)
         except Exception:
@@ -190,21 +191,19 @@ def get_symm_buffer_for_mega_moe(
         group: dist.ProcessGroup, num_experts: int, num_max_tokens_per_rank: int,
         num_topk: int, hidden: int, intermediate_hidden: int, *,
         mma_type: str = "fp4xfp4", activation: str = "swiglu",
-        gemm1_block_n: Optional[int] = None, gemm1_block_k: Optional[int] = None,
-        config_override: Optional[Dict[str, int]] = None,
         gemm1_config: Optional[Tile] = None, gemm2_config: Optional[Tile] = None,
 ) -> SymmBuffer:
     """Construct a SymmBuffer; dimensions and defaults match its constructor.
 
-    Tiles contain (BM, BN, BK, WM, WN, stages); BK counts packed FP4 bytes.
+    The PPU tile extensions contain (BM, BN, BK, WM, WN, stages); BK counts
+    packed FP4 bytes.
     Explicit tiles override measured tuning. Otherwise the complete call uses
     actual tokens with heuristic fallback. UltraEP counts physical expert slots
     and requires remapped IDs plus matching master/replica weights in both stages.
     """
     return SymmBuffer(
         group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
-        mma_type=mma_type, activation=activation, gemm1_block_n=gemm1_block_n,
-        gemm1_block_k=gemm1_block_k, config_override=config_override,
+        mma_type=mma_type, activation=activation,
         gemm1_config=gemm1_config, gemm2_config=gemm2_config)
 
 

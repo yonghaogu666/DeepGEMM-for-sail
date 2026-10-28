@@ -45,16 +45,16 @@ inline SourceFields source_fields(const DispatchConfig& config) {
         {"GEMM1_STAGES", std::to_string(config.gemm1_stages)},
         {"GEMM1_WARP_M", std::to_string(config.gemm1_warp_m)},
         {"GEMM1_WARP_N", std::to_string(config.gemm1_warp_n)},
-        {"GEMM_SMS", std::to_string(config.gemm_sms)},
+        {"GEMM_CTAS", std::to_string(config.gemm_ctas)},
         {"NMTPR", std::to_string(config.nmtpr)},
         {"NUM_EXPERTS", std::to_string(config.num_experts)},
         {"NUM_EXPERTS_PER_RANK", std::to_string(config.num_experts_per_rank)},
         {"NUM_RANKS", std::to_string(config.num_ranks)},
-        {"NUM_SMS", std::to_string(config.num_sms)},
+        {"NUM_CTAS", std::to_string(config.num_ctas)},
         {"NUM_THREADS", std::to_string(config.num_threads)},
         {"NUM_TOPK", std::to_string(config.num_topk)},
         {"PULL_SLOTS", std::to_string(config.pull_slots)},
-        {"PULL_SMS", std::to_string(config.pull_sms)},
+        {"PULL_CTAS", std::to_string(config.pull_ctas)},
         {"SFB_LAYOUT_BLOCK_N", std::to_string(config.sfb_layout_block_n)},
         {"SF_BYTES", std::to_string(config.sf_bytes)},
         {"SILU_THEN_CLAMP", (config.silu_then_clamp ? "true" : "false")},
@@ -76,18 +76,12 @@ inline SourceFields source_fields(const DispatchConfig& config) {
     const uint64_t psf = align16(pt + pool * config.token_bytes);
     const uint64_t pw = align16(psf + pool * config.sf_bytes);
     for (const auto& [key, value] : std::vector<std::pair<const char*, uint64_t>>{
-             {"LAYOUT_WS_BYTES", workspace.get_num_bytes()},
-             {"LAYOUT_NUM_POOL", pool},
-             {"LAYOUT_NUM_POOL_BLOCKS", workspace.num_max_pool_blocks},
              {"LAYOUT_OFF_IT", it},
              {"LAYOUT_OFF_ISF", isf},
              {"LAYOUT_OFF_ITI", iti},
-             {"LAYOUT_OFF_ITW", itw},
              {"LAYOUT_OFF_PT", pt},
              {"LAYOUT_OFF_PSF", psf},
-             {"LAYOUT_OFF_PW", pw},
-             {"LAYOUT_OFF_W4_GEMM2_META", pw},
-             {"LAYOUT_WOFF_RCS", reinterpret_cast<uintptr_t>(workspace.get_expert_recv_count_sum_ptr(0))}})
+             {"LAYOUT_OFF_W4_GEMM2_META", pw}})
         values.emplace_back(key, std::to_string(value));
     return values;
 }
@@ -96,8 +90,6 @@ inline SourceFields source_fields(const PreDispatchConfig& config) {
     SourceFields values{
         {"BLOCK_THREADS", std::to_string(config.block_threads)},
         {"HIDDEN", std::to_string(config.hidden)},
-        {"NUM_SMS", std::to_string(config.num_sms)},
-        {"TOPK", std::to_string(config.num_topk)},
         {"TOP_K", std::to_string(config.num_topk)},
     };
     return values;
@@ -171,7 +163,7 @@ inline std::string generate_fp4_mega_moe_linear1(const FP4MegaMoELinear1Args& ar
 using namespace deep_gemm;
 static_assert(sizeof(layout::SymBuffer<{NUM_RANKS}>) == 592, "MegaMoE symmetric buffer ABI changed");
 constexpr uint32_t NUM_RANKS = {NUM_RANKS};
-constexpr uint32_t NUM_SMS = {NUM_SMS};
+constexpr uint32_t NUM_CTAS = {NUM_CTAS};
 constexpr uint32_t NUM_THREADS = {NUM_THREADS};
 constexpr uint32_t NUM_EXPERTS = {NUM_EXPERTS};
 constexpr uint32_t NUM_EXPERTS_PER_RANK = {NUM_EXPERTS_PER_RANK};
@@ -199,29 +191,6 @@ return collective > phase_a ? (collective > pull ? collective : pull) : (phase_a
 extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = ppu_smem_compute();
 extern "C" __global__ __launch_bounds__(NUM_THREADS, 1)
 void PPU_KERNEL_ENTRY(layout::SymBuffer<{NUM_RANKS}> sb, int rank, int num_tokens, uint8_t* gemm1_weight, uint16_t* gemm1_weight_sf_u16, uint8_t* gemm1_weight_replicas, uint16_t* gemm1_weight_sf_u16_replicas, int num_master_experts, uint16_t* sfa_scratch, uint8_t* fp4_output, uint16_t* scale_output, int32_t* cumulative_local_expert_recv_stats) {
-
-using namespace deep_gemm;
-
-constexpr uint32_t NUM_RANKS = {NUM_RANKS};
-constexpr uint32_t NUM_SMS = {NUM_SMS};
-constexpr uint32_t NUM_THREADS = {NUM_THREADS};
-constexpr uint32_t NUM_EXPERTS = {NUM_EXPERTS};
-constexpr uint32_t NUM_EXPERTS_PER_RANK = {NUM_EXPERTS_PER_RANK};
-constexpr uint32_t NUM_TOPK = {NUM_TOPK};
-constexpr uint32_t BLOCK_M = {BLOCK_M};
-constexpr uint32_t NMTPR = {NMTPR};
-constexpr uint32_t TOKEN_BYTES = {TOKEN_BYTES};
-constexpr uint32_t SF_BYTES = {SF_BYTES};
-constexpr uint32_t GEMM1_N = {GEMM1_N};
-constexpr uint32_t GEMM1_BLOCK_N = {GEMM1_BLOCK_N};
-constexpr uint32_t GEMM1_BLOCK_K = {GEMM1_BLOCK_K};
-constexpr uint32_t GEMM1_WARP_M = {GEMM1_WARP_M};
-constexpr uint32_t GEMM1_WARP_N = {GEMM1_WARP_N};
-constexpr uint32_t GEMM1_STAGES = {GEMM1_STAGES};
-
-constexpr uint64_t ws_bytes = {LAYOUT_WS_BYTES};
-constexpr uint64_t num_pool = {LAYOUT_NUM_POOL};
-constexpr uint64_t num_pool_blocks = {LAYOUT_NUM_POOL_BLOCKS};
 constexpr uint64_t off_ws = 0, off_it = {LAYOUT_OFF_IT}, off_isf = {LAYOUT_OFF_ISF};
 constexpr uint64_t off_iti = {LAYOUT_OFF_ITI};
 constexpr uint64_t off_pt = {LAYOUT_OFF_PT}, off_psf = {LAYOUT_OFF_PSF};
@@ -250,15 +219,6 @@ constexpr int kGemm1Stages = mega_moe::fp4::Gemm1PickStage<
     (int)GEMM1_STAGES, 262144, {SFB_LAYOUT_BLOCK_N}>::value;
 static_assert(kGemm1Stages >= 1, "gemm1 needs at least 1 pipeline stage");
 
-using Cfg = mega_moe::fp4::Gemm1MmaConfig<BLOCK_M, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
-                                GEMM1_WARP_M, GEMM1_WARP_N, kGemm1Stages,
-                                {SFB_LAYOUT_BLOCK_N}>;
-uint32_t smem_collective = (uint32_t)sizeof(typename Cfg::CollectiveMainloop::SharedStorage);
-uint32_t smem_phaseA = NUM_EXPERTS * sizeof(uint32_t);
-uint32_t smem = smem_collective > smem_phaseA ? smem_collective : smem_phaseA;
-uint32_t smem_pull = (uint32_t){PULL_SLOTS} * (TOKEN_BYTES + SF_BYTES);
-smem = smem > smem_pull ? smem : smem_pull;
-
 float activation_clamp = {CLAMP_VALUE};
 bool fused_swiglu = {FUSED_SWIGLU};
 bool fused_situ = {FUSED_SITU};
@@ -268,10 +228,10 @@ uint8_t* fp4_out = (uint8_t*)fp4_output_ptr;
 uint8_t* scale_out = (uint8_t*)scale_output_ptr;
 
 deep_gemm::mega_moe::fp4::dispatch_gemm1_device<
-    NUM_RANKS, NUM_SMS, NUM_THREADS, NUM_EXPERTS,
+    NUM_RANKS, NUM_CTAS, NUM_THREADS, NUM_EXPERTS,
     NUM_EXPERTS_PER_RANK, NUM_TOPK, BLOCK_M,
-    {PULL_SMS},
-    {GEMM_SMS},
+    {PULL_CTAS},
+    {GEMM_CTAS},
     {PULL_SLOTS},
     GEMM1_N, TOKEN_BYTES, GEMM1_BLOCK_N, GEMM1_BLOCK_K,
     {SFB_LAYOUT_BLOCK_N},
@@ -299,7 +259,7 @@ inline FP4MegaMoELinear1Args make_fp4_mega_moe_linear1_args(
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     return FP4MegaMoELinear1Args{
-        config, {dim3(config.num_sms), dim3(config.num_threads), 0},
+        config, {dim3(config.num_ctas), dim3(config.num_threads), 0},
         {make_sym_buffer(sym_buffer_ptrs, rank_idx, config.num_ranks), rank_idx, num_tokens,
          device_pointer<uint8_t>(l1_weights), device_pointer<uint16_t>(l1_weights_sf),
          device_pointer<uint8_t>(l1_weights_replicas), device_pointer<uint16_t>(l1_weights_replicas_sf),

@@ -10,8 +10,7 @@ namespace deep_gemm::mega_moe_native {
 // once; implementation code does not access Python objects or private offsets.
 struct MegaMoEWorkspace {
     DispatchConfig dispatch_config;
-    std::optional<mega_moe_config::Overrides> overrides;
-    int gemm1_block_n, gemm1_block_k, sfb_block_n;
+    int sfb_block_n;
     torch::Tensor sym_buffer_ptrs, l2_acts, l2_acts_sf, sfa_scratch;
     torch::Tensor m_rows, valid_m_rows, src_m_offsets, token_meta;
     std::optional<torch::Tensor> block_info;
@@ -71,16 +70,35 @@ public:
         const auto& l1_replicas = args.l1_weights_replicas;
         const auto& l2_replicas = args.l2_weights_replicas;
         if (args.kernel_phase == KernelPhase::Linear1) {
-            auto phase_args = make_fp4_mega_moe_linear1_args(
-                args.l1_config, buffer.sym_buffer_ptrs, args.rank_idx, args.num_tokens,
-                l1.first, l1.second, l1_replicas.first, l1_replicas.second, l1.first.size(0),
-                buffer.sfa_scratch, buffer.l2_acts, buffer.l2_acts_sf, args.cumulative_local_expert_recv_stats);
-            const auto code = generate(phase_args);
-            const auto runtime = compiler->build(tag, code);
+            auto config = args.l1_config;
+            const auto prepare = [&] {
+                return make_fp4_mega_moe_linear1_args(
+                    config, buffer.sym_buffer_ptrs, args.rank_idx, args.num_tokens,
+                    l1.first, l1.second, l1_replicas.first, l1_replicas.second, l1.first.size(0),
+                    buffer.sfa_scratch, buffer.l2_acts, buffer.l2_acts_sf, args.cumulative_local_expert_recv_stats);
+            };
+            auto phase_args = prepare();
+            auto runtime = compiler->build(tag, generate(phase_args));
             phase_args.launch_args.smem_size = get_kernel_smem_size(runtime);
-            TORCH_CHECK(get_kernel_occupancy(runtime, phase_args.launch_args.block_dim.x,
-                                            phase_args.launch_args.smem_size) >= 1,
+            const int occupancy = get_kernel_occupancy(runtime, phase_args.launch_args.block_dim.x,
+                                                        phase_args.launch_args.smem_size);
+            TORCH_CHECK(occupancy >= 1,
                         "MegaMoE launch cannot keep a block resident");
+            const int hardware_sms = device_runtime->get_prop()->multiProcessorCount;
+            // Every CTA must remain resident at the grid barriers. A measured
+            // target can be reduced by register limits, including explicit tiles.
+            if (config.num_ctas > hardware_sms * occupancy) {
+                config.num_ctas = hardware_sms * occupancy;
+                config.gemm_ctas = config.num_ctas - config.pull_ctas;
+                TORCH_CHECK(config.gemm_ctas > 0, "MegaMoE needs a resident compute CTA");
+                phase_args = prepare();
+                runtime = compiler->build(tag, generate(phase_args));
+                phase_args.launch_args.smem_size = get_kernel_smem_size(runtime);
+                TORCH_CHECK(config.num_ctas <= hardware_sms *
+                            get_kernel_occupancy(runtime, phase_args.launch_args.block_dim.x,
+                                                 phase_args.launch_args.smem_size),
+                            "MegaMoE grid exceeds kernel residency");
+            }
             launch(runtime, phase_args);
             return;
         }
@@ -135,13 +153,13 @@ inline void fp4_fp4_mega_moe_impl(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     auto dispatch_config = sym_buffer.dispatch_config;
     const int hidden = dispatch_config.token_bytes * 2;
+    const int intermediate_hidden = dispatch_config.gemm1_n / 2;
     const int num_experts_per_rank = dispatch_config.num_experts_per_rank;
-    const auto config = mega_moe_config::fp4_scatter_config(hidden, num_experts_per_rank, tuning);
+    const auto config = mega_moe_config::fp4_scatter_config(
+        hidden, intermediate_hidden / 2, num_experts_per_rank, tuning);
     const int gemm2_block_m = std::get<1>(config);
-    mega_moe_config::apply_gemm1_tuning(dispatch_config, tuning.gemm1, sym_buffer.overrides,
-        sym_buffer.gemm1_block_n, sym_buffer.gemm1_block_k);
     TORCH_CHECK(sym_buffer.sfb_block_n % dispatch_config.gemm1_block_n == 0);
-    mega_moe_config::fp4_dispatch_schedule(dispatch_config, tuning.gemm1);
+    mega_moe_config::fp4_dispatch_schedule(dispatch_config, tuning);
     dispatch_config.gemm2_block_m = gemm2_block_m;
     dispatch_config.sfb_layout_block_n = sym_buffer.sfb_block_n;
     dispatch_config.activation_clamp = std::max(activation_clamp, 0.0f);
