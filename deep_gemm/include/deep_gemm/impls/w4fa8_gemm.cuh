@@ -195,6 +195,22 @@ public:
     return id;
   }
 
+  // Solve the fixed column permutation for each packed identity word.
+  CUTLASS_DEVICE auto init_identity_inverse(int tid) {
+    auto id = make_tensor<uint32_t>(Shape<_4, _4>{});
+    const int g = tid / 4, q = tid % 4;
+    CUTE_UNROLL
+    for (int w = 0; w < 4; ++w) {
+      const int sigma = (g & 1) + 2*(w >> 1) + 4*((g >> 1) & 3);
+      CUTE_UNROLL
+      for (int h = 0; h < 4; ++h) {
+        const unsigned offset = 16*h + sigma - 8*q - 32*(w & 1);
+        id(w,h) = offset < 8 ? (2u << (4*(offset & 7))) : 0;
+      }
+    }
+    return id;
+  }
+
   template<int mode=0, typename Tensor>
   CUTLASS_DEVICE constexpr
   auto reshape_warpk(Tensor& t) {
@@ -235,7 +251,11 @@ public:
     int warpn_idx = (warp_idx / WarpsOnM) % WarpsOnN;
     int warpk_idx = (warp_idx / WarpsOnM) / WarpsOnN;
     int lane_idx = thread_idx % NumThreadsPerWarp;
-    Tensor tCrID = init_identity(lane_idx);
+    Tensor tCrID = [&]() {
+      if constexpr (BlockM == 16 && !cute::is_same_v<Epilogue, DefaultEpilogue>)
+        return init_identity_inverse(lane_idx);
+      else return init_identity(lane_idx);
+    }();
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K2,PIPE)
@@ -638,20 +658,35 @@ public:
               s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
             s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
 
-            #pragma unroll
-            for (int n_block = 0; n_block < 4; n_block++) {
+            if constexpr (BatchDequant && BlockM == 16 &&
+                          !cute::is_same_v<Epilogue, DefaultEpilogue>) {
+              // Issue independent FP4 operations before consuming their results.
               CUTE_UNROLL
               for (int half = 0; half < 2; ++half) {
-                auto dequant_accum = fp4_accum(_, n_block);
-                clear(dequant_accum);
-                fp4_mma_dequant(n_block, 2*k_block + half);
-                quant_fp32C_to_e5m2B(n_block, k_block, half);
+                CUTE_UNROLL
+                for (int n = 0; n < 4; ++n) {
+                  auto dequant_accum = fp4_accum(_, n);
+                  clear(dequant_accum);
+                  fp4_mma_dequant(n, 2*k_block + half);
+                }
+                CUTE_UNROLL
+                for (int n = 0; n < 4; ++n)
+                  quant_fp32C_to_e5m2B(n, k_block, half);
               }
-
-              if constexpr (!BatchDequant) {
-                #pragma unroll
-                for (int m_block = 0; m_block < size<1>(accum); m_block++) {
-                  cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
+            } else {
+              CUTE_UNROLL
+              for (int n_block = 0; n_block < 4; ++n_block) {
+                CUTE_UNROLL
+                for (int half = 0; half < 2; ++half) {
+                  auto dequant_accum = fp4_accum(_, n_block);
+                  clear(dequant_accum);
+                  fp4_mma_dequant(n_block, 2*k_block + half);
+                  quant_fp32C_to_e5m2B(n_block, k_block, half);
+                }
+                if constexpr (!BatchDequant) {
+                  CUTE_UNROLL
+                  for (int m_block = 0; m_block < size<1>(accum); ++m_block)
+                    cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
                 }
               }
             }

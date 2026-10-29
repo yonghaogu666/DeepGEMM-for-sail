@@ -103,7 +103,7 @@ static void w4a8_mega_moe(const Tensor& out, const W4A8Weights& w1, const W4A8We
     c.gemm1_block_n = g1.block_n; c.gemm1_block_k = 128;
     c.gemm1_warp_m = g1.warp_m; c.gemm1_warp_n = 64; c.gemm1_stages = g1.num_stages;
     c.num_threads = w4fa8::get_num_threads(g1); c.num_sms = get_num_sms();
-    c.num_pull_sms = integer("MEGA_MOE_PULL_SMS", 6);
+    c.num_pull_sms = integer("MEGA_MOE_PULL_SMS", tuning.gemm1.pull_sms.value_or(6));
     TORCH_CHECK(c.num_pull_sms > 0 && c.num_pull_sms < c.num_sms && c.num_pull_sms % 3 == 0,
                 "W4A8 pull CTA count must be a positive multiple of three below the total CTA count");
     c.swiglu_oai = act == "swiglu_oai"; c.swiglu_alpha = alpha.value_or(1.702f);
@@ -125,7 +125,7 @@ static void w4a8_mega_moe(const Tensor& out, const W4A8Weights& w1, const W4A8We
         std::get<0>(w2), std::get<1>(w2), std::get<2>(w2),
         std::get<0>(replica2), std::get<1>(replica2), std::get<2>(replica2),
         field<Tensor>(meta, "m_rows"), field<Tensor>(meta, "valid_m_rows"), field<Tensor>(meta, "token_meta"),
-        combine, field<Tensor>(buffer, "_combine_offsets"), capacity, field<OptTensor>(buffer, "_gemm2_block_info"));
+        combine, field<Tensor>(buffer, "_combine_offsets"), capacity, field<OptTensor>(buffer, "_gemm2_block_info"), rank);
     mega_moe_aux::barrier_reduce_impl(combine, field<Tensor>(buffer, "_routing_weights").narrow(0, 0, tokens),
         tokens, h, topk, capacity, field<Tensor>(buffer, "_barrier_pointers"), rank, world,
         field<Tensor>(buffer, "_barrier_done"), std::nullopt, 0, out,

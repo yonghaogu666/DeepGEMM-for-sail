@@ -98,6 +98,10 @@ struct Gemm1 {
 
 template <int N, int K, int BlockM, int BlockN>
 struct Scatter {
+    // A bulk store covers 256 BF16 columns with all 32 lanes on one peer.
+    static_assert(N % 256 == 0 && BlockN % 256 == 0);
+    static constexpr int Stride = BlockN / 2 + 4;
+    static constexpr uint32_t SharedBytes = BlockM * Stride * sizeof(uint32_t);
     __ppu_bfloat16* output;
     const float* row_scales;
     const int32_t* valid;
@@ -106,6 +110,8 @@ struct Scatter {
     const uint8_t *replica_weights, *replica_scales;
     int masters, capacity;
     float inv_scale, replica_inv_scale;
+    char* smem;
+    int self_rank;
 
     CUTLASS_DEVICE const uint8_t* weight(const uint8_t* p, int e, int size) const {
         return (e < masters ? p : replica_weights) + int64_t(e < masters ? e : e - masters) * size;
@@ -119,33 +125,48 @@ struct Scatter {
     CUTLASS_DEVICE void store(Accum& acc, const Coords& coords, const Scheduler& scheduler,
                               int m_block, int n_block, int residual_m) const {
         using namespace cute;
+        auto* tile = reinterpret_cast<uint32_t*>(smem);
+        // The W4A8 mainloop ends every K iteration with a CTA barrier.
+        // N_EXPAND=1 and WarpK=BlockK leave no shared operands in use here.
+        __syncthreads();
         CUTE_UNROLL
         for (int m = 0; m < size<1>(acc); ++m) {
             CUTE_UNROLL
             for (int r = 0; r < 2; ++r) {
                 const int row = get<0>(coords(2*r, m, 0));
                 if (row >= residual_m) continue;
-                const int64_t pool_row = scheduler.curr_offset_a() / K + m_block * BlockM + row;
-                const uint64_t route = routes[pool_row];
-                const uint32_t rank = route >> 32, slot = (route >> 24) & 255, token = route & 0xffffff;
-                auto* dst = reinterpret_cast<__ppu_bfloat16*>(
-                    reinterpret_cast<char*>(output) + rank_offsets[rank])
-                    + (int64_t(slot) * capacity + token) * N + n_block * BlockN;
-                const float sf = row_scales[pool_row]
-                    * (scheduler.curr_group_idx < masters ? inv_scale : replica_inv_scale);
+                const int64_t pool_row = scheduler.curr_offset_a()/K + m_block*BlockM + row;
+                const float sf = row_scales[pool_row] *
+                    (scheduler.curr_group_idx < masters ? inv_scale : replica_inv_scale);
                 CUTE_UNROLL
                 for (int n = 0; n < size<2>(acc); ++n) {
                     CUTE_UNROLL
                     for (int half = 0; half < 2; ++half) {
                         const int v = 2*r + 4*half;
                         const int col = get<1>(coords(v, m, n));
-                        if (n_block * BlockN + col >= N) continue;
-                        const uint32_t pair = tix::cvt_rte_bf16x2_f32(acc(v+1,m,n)*sf, acc(v,m,n)*sf);
-                        *reinterpret_cast<uint32_t*>(dst + col) = pair;
+                        tile[row*Stride + col/2] = tix::cvt_rte_bf16x2_f32(acc(v+1,m,n)*sf, acc(v,m,n)*sf);
                     }
                 }
             }
         }
+        __syncthreads();
+        const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+        for (int row = warp; row < min(BlockM, residual_m); row += blockDim.x/32) {
+            const int64_t pool_row = scheduler.curr_offset_a()/K + m_block*BlockM + row;
+            const uint64_t route = routes[pool_row];
+            const uint32_t rank = route >> 32, slot = (route >> 24) & 255, token = route & 0xffffff;
+            auto* dst = reinterpret_cast<__ppu_bfloat16*>(reinterpret_cast<char*>(output) + rank_offsets[rank])
+                + (int64_t(slot)*capacity+token)*N + n_block*BlockN;
+            for (int vec = 0; vec < BlockN/8; vec += 32) {
+                if (n_block*BlockN + vec*8 >= N) break;
+                const uint4 payload = __ppu_shared_load_bulk_b32x4(
+                    reinterpret_cast<const uint4*>(tile+row*Stride) + vec + lane);
+                auto* address = reinterpret_cast<uint4*>(dst) + vec + lane;
+                if (rank == self_rank) __ppu_global_store_bulk_b32x4(address, payload);
+                else __ppu_remote_store_bulk_ncp_b32x4(address, payload);
+            }
+        }
+        __syncthreads();
     }
 };
 

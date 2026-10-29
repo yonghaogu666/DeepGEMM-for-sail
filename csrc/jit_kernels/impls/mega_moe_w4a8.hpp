@@ -72,7 +72,7 @@ inline void w4a8_scatter(const w4fa8::W4A8Config& tile, int groups,
     const torch::Tensor& rw, const torch::Tensor& rs, float rinv,
     const torch::Tensor& rows, const torch::Tensor& valid, const torch::Tensor& routes,
     const torch::Tensor& combine, const torch::Tensor& offsets, int capacity,
-    const std::optional<torch::Tensor>& scratch) {
+    const std::optional<torch::Tensor>& scratch, int self_rank) {
     const int n = w.size(1), k = a.size(1), pool = a.size(0);
     auto* layout = rows.data_ptr<int32_t>();
     if (groups >= 128) {
@@ -97,12 +97,14 @@ using namespace deep_gemm;
 using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<
     {N}, {K}, {BLOCK_M}, {BLOCK_N}, 128, {WARP_M}, 64, 128,
     {NUM_GROUPS}, {NUM_STAGES}, GemmType::MGroupedNoPad>;
-extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = sizeof(Kernel::SharedStorage);
+using Epilogue = mega_moe::w4a8::Scatter<{N}, {K}, {BLOCK_M}, {BLOCK_N}>;
+extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes =
+    Epilogue::SharedBytes > sizeof(Kernel::SharedStorage) ? Epilogue::SharedBytes : sizeof(Kernel::SharedStorage);
 extern "C" __global__ __launch_bounds__({NUM_THREADS}, 1)
 void PPU_KERNEL_ENTRY(const cutlass::float_e4m3_t* a, const float* a_scale,
     const uint8_t* w, const uint8_t* s, float inv, const uint8_t* rw, const uint8_t* rs, float rinv,
     int masters, int32_t* rows, const int32_t* valid, const int64_t* routes,
-    __ppu_bfloat16* output, const int64_t* offsets, int capacity, int pool) {
+    __ppu_bfloat16* output, const int64_t* offsets, int capacity, int pool, int self_rank) {
     extern __shared__ char smem[];
     Kernel::Params params{};
     params.ptr_a = a; params.ptr_b = w; params.ptr_scale = s;
@@ -110,13 +112,13 @@ void PPU_KERNEL_ENTRY(const cutlass::float_e4m3_t* a, const float* a_scale,
     params.ptr_a_scale = a_scale;
     params.scheduler = TileSchedulerArguments(pool, rows);
     Kernel::TileScheduler scheduler(params.scheduler);
-    const mega_moe::w4a8::Scatter<{N}, {K}, {BLOCK_M}, {BLOCK_N}> epilogue{
-        output, a_scale, valid, routes, offsets, rw, rs, masters, capacity, inv, rinv};
+    const Epilogue epilogue{
+        output, a_scale, valid, routes, offsets, rw, rs, masters, capacity, inv, rinv, smem, self_rank};
     Kernel{}.run(params, smem, scheduler, epilogue);
 }
 )", c, {a.data_ptr(), scales.data_ptr(), w.data_ptr(), s.data_ptr(), inv,
         rw.data_ptr(), rs.data_ptr(), rinv, int32_t(w.size(0)), layout, valid.data_ptr(), routes.data_ptr(),
-        combine.data_ptr(), offsets.data_ptr(), int32_t(capacity), int32_t(pool)},
+        combine.data_ptr(), offsets.data_ptr(), int32_t(capacity), int32_t(pool), int32_t(self_rank)},
         dim3(tile.num_sms), c.num_threads, true);
 }
 

@@ -139,6 +139,14 @@ def test_dynamic_tiles(block_m, moe_group):
              reference_tokens=8)
 
 
+@pytest.mark.parametrize("hidden", (256, 512, 768))
+def test_scatter_widths(hidden, moe_group):
+    # Exercise bulk-store row widths with partial M tiles and changing routes.
+    case = replace(CASES[0], hidden=hidden, intermediate=512,
+                   tokens=(1, 33, 0, 65), routing="skewed")
+    run_case(case, moe_group, edge_cases=True, splits=(False, True), verbose=False)
+
+
 @pytest.mark.parametrize("routing", ("random", "skewed"))
 def test_quantize_lookup(routing, moe_group):
     # Change the valid-row count across both expert-search regimes, including
