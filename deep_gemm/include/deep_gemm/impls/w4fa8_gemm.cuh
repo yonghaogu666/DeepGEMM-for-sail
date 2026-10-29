@@ -217,9 +217,18 @@ public:
     }
   }
 
-  CUTLASS_DEVICE
-  void
-  operator()(Params const& params, char* smem_buf) {
+  struct DefaultEpilogue {};
+
+  CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
+    TileScheduler scheduler{params.scheduler};
+    run(params, smem_buf, scheduler, DefaultEpilogue{});
+  }
+
+  // MegaMoE supplies a tile scheduler and a direct activation/scatter epilogue.
+  // Ordinary grouped GEMM retains its original parameters and store path.
+  template <class Scheduler, class Epilogue>
+  CUTLASS_DEVICE void run(Params const& params, char* smem_buf,
+                         Scheduler& deep_scheduler, const Epilogue& epilogue) {
     int thread_idx = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int warpm_idx = warp_idx % WarpsOnM;
@@ -227,7 +236,6 @@ public:
     int warpk_idx = (warp_idx / WarpsOnM) / WarpsOnN;
     int lane_idx = thread_idx % NumThreadsPerWarp;
     Tensor tCrID = init_identity(lane_idx);
-    TileScheduler deep_scheduler{params.scheduler};
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K2,PIPE)
@@ -307,16 +315,27 @@ public:
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
 
       int coord_l = deep_scheduler.curr_group_idx;
+      if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>)
+        if (epilogue.valid_rows(coord_l, deep_scheduler.curr_group_m) <= int(m_block_idx) * BlockM)
+          continue;
       n_block_idx *= N_EXPAND;
 
-      const uint8_t* ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
+      const uint8_t* ptr_b_l;
+      const uint8_t* ptr_scale_l;
+      if constexpr (cute::is_same_v<Epilogue, DefaultEpilogue>) {
+        ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
+        ptr_scale_l = params.ptr_scale + int64_t(coord_l) * N * K / 32;
+      } else {
+        ptr_b_l = epilogue.weight(params.ptr_b, coord_l, N * K2);
+        ptr_scale_l = epilogue.scale(params.ptr_scale, coord_l, N * K / 32);
+      }
       Tensor mB_nk = make_tensor(make_gmem_ptr(ptr_b_l), make_shape(Int<N>{}, Int<K2>{}), make_stride(Int<K2>{}, _1{}));
       Tensor mB_nk_mix = make_mix_tensor_like(mB_nk);
       Tensor gB = local_tile(mB_nk_mix, TilerB{}, make_coord(n_block_idx,_));
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
-      Tensor mScale_nkl = make_tensor(make_gmem_ptr(params.ptr_scale), make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<L>{}), strideScale);
-      Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_,_,coord_l));
+      Tensor mScale_nkl = make_tensor(make_gmem_ptr(ptr_scale_l), make_shape(Int<N / 64>{}, Int<K * 2>{}, Int<1>{}), strideScale);
+      Tensor mScale_nk = make_mix_tensor_like(mScale_nkl(_,_,0));
       Tensor gScale = local_tile(mScale_nk, TilerScale{}, make_coord(n_block_idx,_));
       Tensor tSgS = gmem_thr_copy_scale.partition_S(gScale);
 
@@ -325,6 +344,8 @@ public:
       auto [tAgA, residual_m, gD] = [&]() {
         if constexpr(!Fused) {
           int M = deep_scheduler.curr_group_m;
+          if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>)
+            M = epilogue.valid_rows(coord_l, M);
           gmem_tiled_copy_A.desc_.template init<ElementA, false, BlockM, BlockK>(nullptr, M, K, strideA);
           Tensor mA_mkl = make_tensor(make_gmem_ptr(params.ptr_a + deep_scheduler.curr_offset_a()), make_shape(M, Int<K>{}), strideA); // (m,k)
           Tensor mA_mk = make_mix_tensor_like(mA_mkl); // (m,k)
@@ -529,6 +550,11 @@ public:
           if (warpk_idx > 0) return;
         }
 
+        if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>) {
+          epilogue.store(accum, thr_mma.partition_C(cD), deep_scheduler,
+                         m_block_idx, n_block_idx, residual_m);
+          return;
+        }
         Tensor tDcD = thr_mma.partition_C(cD);
         auto tDgD = thr_mma.partition_C(gD);
         // Each m16n16 accumulator has two rows per lane (v=0/1/4/5

@@ -25,6 +25,8 @@ from moe_test_utils import (
 
 CHANNELWISE_CASES = tuple(replace(c, precision="fp8_channelwise") for c in (
     MoECase("smoke_channelwise", 512, 256, 16, 2, 129, tokens=(1, 0, 33, 129, 8), worlds=(1, 2, 4, 8)),
+    MoECase("smoke_channelwise_cached_quant", 512, 512, 16, 2, 33,
+            tokens=(1, 0, 33), worlds=(1, 2, 4, 8)),
     MoECase("minimax_m3", 6144, 3072, 128, 4, 4096, tokens=MODEL_TOKENS,
             activation="swiglu_oai", clamp=7.0, worlds=(8,)),
     MoECase("qwen38_flash", 2560, 640, 512, 10, 8192, tokens=MODEL_TOKENS,

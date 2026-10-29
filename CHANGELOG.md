@@ -60,7 +60,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### MegaMoE
 
-- Adds MegaMoE support on ZW-M890P for W4A4, BF16/FP4 and FP8
+- Adds `fp8_fp4_mega_moe` for group-32 MXFP4 weights and per-row E4M3
+  activations, with SwiGLU/OAI and BF16 output. Reuses the common workspace,
+  pre-dispatch and weight transformation APIs. Fuses dispatch/GEMM1/activation
+  and GEMM2/scatter; quantizes valid intermediate rows and applies routing
+  weights in combine. Weight exponent compensation is handled internally.
+
+- Adds MegaMoE support on ZW-M890P for W4A4, W4A8, BF16/FP4 and FP8
   channelwise/blockwise, with a common symmetric-workspace factory and weight
   transformation. See the [MegaMoE calling contract](README.md#megamoe).
 - Provides a pipeline for activation, quantization, dispatch/GEMM1, GEMM2/scatter,

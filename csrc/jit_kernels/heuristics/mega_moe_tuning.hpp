@@ -7,7 +7,7 @@
 
 namespace deep_gemm::mega_moe_config {
 
-enum class Precision { W4A4, W4A16, FP8Channelwise, FP8Blockwise };
+enum class Precision { W4A4, W4A16, W4A8, FP8Channelwise, FP8Blockwise };
 using Tile = std::array<int, 6>; // BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages
 
 struct TuningWorkload {

@@ -67,12 +67,12 @@ class _MegaMoEWorkspace:
             self._activation_scales = torch.empty(width // 64, pool, dtype=torch.uint16, device="cuda").t()
         elif precision == "fp8_blockwise":
             self._activation_scales = torch.empty(width // 128, pool, dtype=torch.float32, device="cuda").t()
-        elif precision == "fp8_channelwise":
+        elif precision in ("fp8_channelwise", "w4a8"):
             self._activation_scales = torch.empty(pool, 1, dtype=torch.float32, device="cuda")
         else:
             self._activation_scales = None
         self._bf16_scratch = (torch.empty(pool, width, dtype=torch.bfloat16, device="cuda")
-                              if precision == "fp8_channelwise" else None)
+                              if precision in ("fp8_channelwise", "w4a8") else None)
         self._m_indices = (torch.empty(pool, dtype=torch.int32, device="cuda")
                            if precision == "fp8_channelwise" else None)
         groups = self.num_experts // self.num_ranks
@@ -468,7 +468,9 @@ def get_symm_buffer_for_mega_moe(
 
     MegaMoE is supported on ZW-M890P.
 
-    ``precision`` selects w4a4, w4a16, fp8_channelwise or fp8_blockwise.
+    ``precision`` selects w4a4, w4a16, w4a8, fp8_channelwise or fp8_blockwise.
+    W4A8 uses MXFP4 weights and per-row FP8 activations; block_m optionally
+    fixes its dispatch/GEMM1 tile to 16, 32, 64 or 128.
     ``intermediate_hidden`` is the activated width I for every precision;
     GEMM1 has 2I output columns. The workspace owns both stages' scratch,
     route metadata, combine storage and communication state.
@@ -496,7 +498,7 @@ def get_symm_buffer_for_mega_moe(
 
     With UltraEP, ``num_experts`` counts global physical slots, including
     replicas. Pass remapped physical routing IDs to pre-dispatch and
-    ``w1_replicas`` and ``w2_replicas`` pairs to the complete entry. Each rank's slots contain
+    ``w1_replicas`` and ``w2_replicas`` transformed weights to the complete entry. Each rank's slots contain
     masters first, then replicas; their weights use the same preprocessing.
     """
     if not is_ppu1v5_device():
@@ -523,7 +525,7 @@ def get_symm_buffer_for_mega_moe(
     except Exception:
         pass
 
-    if precision in ("fp8_channelwise", "fp8_blockwise"):
+    if precision in ("fp8_channelwise", "fp8_blockwise", "w4a8"):
         buffer = Fp8MegaMoEDispatchSymmBuffer(
             group, config, local_pool=precision == "fp8_blockwise", block_m_override=block_m)
     else:

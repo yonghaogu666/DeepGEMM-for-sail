@@ -227,6 +227,7 @@ except Exception as e:
 # MegaMoE compute APIs
 from .deep_gemm_cpp import (
     fp4_fp4_mega_moe,
+    fp8_fp4_mega_moe,
     bf16_fp4_mega_moe,
     fp8_fp8_mega_moe,
     mega_moe_pre_dispatch,

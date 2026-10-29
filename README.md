@@ -293,11 +293,11 @@ For more information, please refer to the `fp8_einsum` and `int8_einsum` functio
 
 #### MegaMoE
 
-MegaMoE supports W4A4, W4A16 and W8A8 routed MoE pipelines only on ZW-M890P.
+MegaMoE supports W4A4, W4A16, W4A8 and W8A8 routed MoE pipelines only on ZW-M890P.
 Allocate a workspace with `get_symm_buffer_for_mega_moe`, transform both expert
 weights once with `transform_weights_for_mega_moe`, then call
 `mega_moe_pre_dispatch` followed by one complete output-first entry point:
-`fp4_fp4_mega_moe`, `bf16_fp4_mega_moe` or `fp8_fp8_mega_moe`.
+`fp4_fp4_mega_moe`, `bf16_fp4_mega_moe`, `fp8_fp4_mega_moe` or `fp8_fp8_mega_moe`.
 These entries own dispatch/GEMM1, GEMM2/scatter, counter recycling and combine.
 The calling contract below covers supported layouts and workspace reuse;
 see the [precision-specific end-to-end tests](tests/README.MD#routed-moe-correctness-and-performance-tests).
@@ -313,7 +313,7 @@ its own multi-kernel pipeline.
 | Interface aspect | PPU calling convention and reason |
 | --- | --- |
 | Workspace | `get_symm_buffer_for_mega_moe` allocates a PPU workspace that owns scratch, metadata and communication state. |
-| Complete compute names | `fp4_fp4_mega_moe`, `bf16_fp4_mega_moe` and `fp8_fp8_mega_moe` identify the supported activation/input and weight precisions. |
+| Complete compute names | `fp4_fp4_mega_moe`, `bf16_fp4_mega_moe`, `fp8_fp4_mega_moe` and `fp8_fp8_mega_moe` identify the supported activation/input and weight precisions. |
 | Input preparation | Explicit `mega_moe_pre_dispatch` accepts BF16 states and performs input quantization/staging before the complete compute call. Router and shared experts stay outside the library. |
 | Scatter/combine format | Complete entries use BF16 scatter/combine. |
 | Physical replicas | Optional `w1_replicas` and `w2_replicas` accept separate physical-expert allocations. Callers supply logical-to-physical routing, with the same physical order for both GEMMs. |
@@ -324,6 +324,7 @@ its own multi-kernel pipeline.
 | --- | --- | --- | --- |
 | `fp4_fp4_mega_moe` | `w4a4` | SwiGLU, Step, SiTU | BF16 |
 | `bf16_fp4_mega_moe` | `w4a16` | SiTU only | BF16 |
+| `fp8_fp4_mega_moe` | `w4a8` | SwiGLU, SwiGLU-OAI, SiTU | BF16 |
 | `fp8_fp8_mega_moe` | `fp8_channelwise` | SwiGLU, SwiGLU-OAI | BF16 |
 | `fp8_fp8_mega_moe` | `fp8_blockwise` | SwiGLU, SwiGLU-OAI | BF16 |
 
@@ -348,6 +349,7 @@ The current kernel limits are:
 | --- | --- | --- | --- |
 | W4A4 | 32 | Determined by the selected dispatch/GEMM configuration | Selected by tuning |
 | W4A16 | 32 | 1–127 | Selected by tuning or an explicit supported tile |
+| W4A8 | 32 | 1–128 | 16, 32, 64 or 128; selected per call, or explicitly fixed |
 | FP8 channelwise | 8 | 1–128 | 128 or 256; selected per call, or explicitly fixed |
 | FP8 blockwise | 64 | 1–128 | 128 |
 
@@ -360,7 +362,7 @@ Pass quantized `(weight, scale)` pairs to `transform_weights_for_mega_moe`:
 
 | Precision | Weight storage | Raw scales |
 | --- | --- | --- |
-| W4A4/W4A16 | uint8 `[E, N, K/2]`, adjacent K nibbles, low nibble first | uint8 UE8M0 `[E, N, K/32]` |
+| W4A4/W4A16/W4A8 | uint8 `[E, N, K/2]`, adjacent K nibbles, low nibble first | uint8 UE8M0 `[E, N, K/32]` |
 | FP8 channelwise | E4M3 `[E, N, K]` | FP32 `[E, N, 1]` |
 | FP8 blockwise | E4M3 `[E, N, K]` | FP32 `[E, N/128, K/128]` |
 
@@ -368,7 +370,17 @@ The transformation does not quantize weights. It rearranges G1 into G8
 (gate/up groups of eight), or G128 for blockwise FP8, and packs scales for the
 backend. Do not pass previously transformed tensors through it again.
 Transform at model load time, outside graph capture and timing. The returned
-pairs are passed directly to the complete compute entry.
+values are passed directly to the complete compute entry.
+
+For W4A8, each transformed weight is a `(weight, packed_scales, weight_inv_scale)`
+triple. The common preprocessing shifts E8M0 exponents into the E5M2-compatible
+range [114, 140] and returns its scalar compensation. Raw exponent codes 0/255
+and spreads greater than 26 are rejected. The complete entry applies each
+stage's compensation internally, including separately transformed replica
+weights. Callers must not multiply it into activations or routing weights.
+W4A8 fuses dispatch/GEMM1/activation, quantizes the valid activated rows to FP8,
+then runs GEMM2/scatter and the common weighted combine. Routing weights are
+applied only in combine.
 
 ```python
 import torch

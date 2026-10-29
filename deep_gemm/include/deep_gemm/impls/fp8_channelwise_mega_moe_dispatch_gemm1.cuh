@@ -25,8 +25,13 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_cached(
     #pragma unroll
     for (int elem = static_cast<int>(lane_idx) * kVec;
          elem < kHidden; elem += 32 * kVec) {
-        const auto* src2 =
-            reinterpret_cast<const __ppu_bfloat162*>(src + elem);
+        // Explicit 128-bit loads keep the cached BF16 input from becoming
+        // eight separate 32-bit loads per 16-element vector.
+        const uint4 vectors[2] = {
+            *reinterpret_cast<const uint4*>(src + elem),
+            *reinterpret_cast<const uint4*>(src + elem + 8),
+        };
+        const auto* src2 = reinterpret_cast<const __ppu_bfloat162*>(vectors);
         #pragma unroll
         for (int i = 0; i < kVec / 2; ++i) {
             const __ppu_bfloat162 pair = src2[i];
@@ -129,7 +134,7 @@ template <
     uint32_t kBlockM, uint32_t kTokenBytes, uint32_t kGemm1N,
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
-    bool kSwiGLUOAI = false, bool kDynamicWork = false>
+    bool kSwiGLUOAI = false, bool kDynamicWork = false, class W4A8Backend = void>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
         const layout::SymBuffer<kNumRanks>& sym_buffer,
@@ -149,7 +154,9 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         const float swiglu_limit,
         const float swiglu_alpha,
         const uint32_t num_tokens,
-        const uint32_t num_max_tokens_per_rank) {
+        const uint32_t num_max_tokens_per_rank,
+        const float weight_inv_scale = 1.0f, const float replica_inv_scale = 1.0f,
+        const float situ_beta = 4.0f, const float situ_linear_beta = 25.0f) {
     using Cfg = mega_moe::fp8_channelwise::Gemm1MmaConfig<
         kBlockM, kBlockN, kBlockK, kWarpM, kWarpN, kStages>;
     static_assert(kNumExpertsPerRank > 0 && kNumExpertsPerRank <= 128,
@@ -487,32 +494,50 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 use_replica ? gemm1_weight_replicas : gemm1_weight;
             const auto* weight_scale_base = use_replica
                 ? gemm1_weight_scale_replicas : gemm1_weight_scale;
-            mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, kSwiGLUOAI>(
-                reinterpret_cast<const typename Cfg::ElementA*>(
-                    token_pool +
-                        static_cast<uint64_t>(pool_base) * kTokenBytes),
-                scale_pool + pool_base,
-                weight_base
-                    + (static_cast<uint64_t>(weight_expert) * kGemm1N
-                       + static_cast<uint64_t>(n_block) * kBlockN)
-                        * kTokenBytes,
-                weight_scale_base
-                    + static_cast<uint64_t>(weight_expert) * kGemm1N
-                    + static_cast<uint64_t>(n_block) * kBlockN,
-                swiglu_output
-                    + static_cast<uint64_t>(pool_base) * (kGemm1N / 2)
-                    + static_cast<uint64_t>(n_block) * (kBlockN / 2),
-                static_cast<int>(kGemm1N / 2),
-                static_cast<int>(valid_m),
-                static_cast<int>(kBlockM),
-                static_cast<int>(kBlockN),
-                static_cast<int>(kTokenBytes),
-                static_cast<int>(thread_idx),
-                reinterpret_cast<char*>(smem_buf),
-                swiglu_limit, swiglu_alpha,
-                kDynamicWork ? queue_counter : nullptr,
-                kDynamicWork ? &queue_ticket : nullptr,
-                kDynamicWork ? &prefetched_work : nullptr);
+            if constexpr (!cute::is_same_v<W4A8Backend, void>) {
+                W4A8Backend::run(
+                    token_pool + uint64_t(pool_base) * kTokenBytes, scale_pool + pool_base,
+                    reinterpret_cast<const uint8_t*>(weight_base)
+                        + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * (kTokenBytes / 2),
+                    reinterpret_cast<const uint8_t*>(weight_scale_base)
+                        + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * (kTokenBytes / 32),
+                    swiglu_output + uint64_t(pool_base) * (kGemm1N / 2) + n_block * (kBlockN / 2),
+                    kGemm1N / 2, valid_m, reinterpret_cast<char*>(smem_buf),
+                    swiglu_limit, swiglu_alpha, use_replica ? replica_inv_scale : weight_inv_scale,
+                    situ_beta, situ_linear_beta);
+                if constexpr (kDynamicWork) {
+                    queue.prime(thread_idx);
+                    prefetched_work = queue.current();
+                    __syncthreads();
+                }
+            } else {
+                mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, kSwiGLUOAI>(
+                    reinterpret_cast<const typename Cfg::ElementA*>(
+                        token_pool +
+                            static_cast<uint64_t>(pool_base) * kTokenBytes),
+                    scale_pool + pool_base,
+                    weight_base
+                        + (static_cast<uint64_t>(weight_expert) * kGemm1N
+                           + static_cast<uint64_t>(n_block) * kBlockN)
+                            * kTokenBytes,
+                    weight_scale_base
+                        + static_cast<uint64_t>(weight_expert) * kGemm1N
+                        + static_cast<uint64_t>(n_block) * kBlockN,
+                    swiglu_output
+                        + static_cast<uint64_t>(pool_base) * (kGemm1N / 2)
+                        + static_cast<uint64_t>(n_block) * (kBlockN / 2),
+                    static_cast<int>(kGemm1N / 2),
+                    static_cast<int>(valid_m),
+                    static_cast<int>(kBlockM),
+                    static_cast<int>(kBlockN),
+                    static_cast<int>(kTokenBytes),
+                    static_cast<int>(thread_idx),
+                    reinterpret_cast<char*>(smem_buf),
+                    swiglu_limit, swiglu_alpha,
+                    kDynamicWork ? queue_counter : nullptr,
+                    kDynamicWork ? &queue_ticket : nullptr,
+                    kDynamicWork ? &prefetched_work : nullptr);
+            }
         }
     }
 

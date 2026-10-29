@@ -5,6 +5,8 @@
 #include <pybind11/stl.h>
 #include "../jit_kernels/impls/mega_moe.hpp"
 #include "../jit_kernels/impls/mega_moe_scatter.hpp"
+#include "../jit_kernels/impls/mega_moe_w4a8.hpp"
+#include "../jit_kernels/heuristics/common_preprocess.hpp"
 #include "../jit_kernels/impls/mega_moe_combine.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/heuristics/mega_moe.hpp"
@@ -31,9 +33,10 @@ static void check_device() {
 static Precision parse_precision(const std::string& precision) {
     if (precision == "w4a4") return Precision::W4A4;
     if (precision == "w4a16") return Precision::W4A16;
+    if (precision == "w4a8") return Precision::W4A8;
     if (precision == "fp8_channelwise") return Precision::FP8Channelwise;
     if (precision == "fp8_blockwise") return Precision::FP8Blockwise;
-    TORCH_CHECK(false, "precision must be w4a4, w4a16, fp8_channelwise or fp8_blockwise");
+    TORCH_CHECK(false, "precision must be w4a4, w4a16, w4a8, fp8_channelwise or fp8_blockwise");
 }
 
 static TuningConfig get_mega_moe_tuning_config(int ranks, int experts, int topk, int hidden,
@@ -222,6 +225,18 @@ static std::map<std::string, int> dispatch_config(
         return dispatch_config_dict(mega_moe_config::w4a16_buffer_config(
             num_ranks, num_experts, num_topk, hidden, 2 * *intermediate_hidden, num_max_tokens_per_rank,
             token_bucket, block_m));
+    }
+    if (kind == Precision::W4A8) {
+        TORCH_CHECK(local_experts <= 128,
+                    "W4A8 MegaMoE supports at most 128 local experts, including replicas");
+        const int bm = block_m.value_or(64);
+        TORCH_CHECK(bm == 16 || bm == 32 || bm == 64 || bm == 128,
+                    "W4A8 block_m must be 16, 32, 64 or 128");
+        auto c = mega_moe_config::dispatch_config(num_ranks, num_experts, num_topk,
+                                                 num_max_tokens_per_rank, hidden, 4);
+        c.block_m = bm;
+        c.num_threads = 128;
+        return dispatch_config_dict(c, false);
     }
     const bool blockwise = kind == Precision::FP8Blockwise;
     return dispatch_config_dict(mega_moe_config::fp8_dispatch_config(
@@ -874,7 +889,8 @@ static void check_buffer_precision(const py::object& buffer, Precision precision
                         "W4A4 dispatch requires hidden divisible by 512 for scale copies");
     } else {
         TORCH_CHECK(fp8 && !bf16, "buffer does not match the selected precision");
-        const int scales = precision == Precision::FP8Channelwise ? 1 : field<int>(buffer, "hidden") / 128;
+        const bool per_row = precision == Precision::FP8Channelwise || precision == Precision::W4A8;
+        const int scales = per_row ? 1 : field<int>(buffer, "hidden") / 128;
         TORCH_CHECK(field<int>(buffer, "num_scales") == scales,
                     "buffer scale granularity does not match precision");
     }
@@ -911,7 +927,7 @@ void mega_moe_pre_dispatch(const Tensor& hidden_states, const Tensor& topk_ids,
         fp4_mega_moe_pre_dispatch(input, ids, weights, field<Tensor>(buffer, "input_token"),
                                  field<Tensor>(buffer, "input_sf"), field<Tensor>(buffer, "input_topk_idx"),
                                  field<Tensor>(buffer, "input_topk_weights"), num_tokens);
-    else if (kind == Precision::FP8Channelwise)
+    else if (kind == Precision::FP8Channelwise || kind == Precision::W4A8)
         fp8_mega_moe_pre_dispatch(input, ids, weights, field<Tensor>(buffer, "input_token").view(torch::kUInt8),
                                  field<Tensor>(buffer, "input_scale"), field<Tensor>(buffer, "input_topk_idx"),
                                  field<Tensor>(buffer, "input_topk_weights"), num_tokens);
@@ -1327,11 +1343,26 @@ void complete_mega_moe(const Tensor& out, const Pair& w1, const Pair& w2, const 
         field<Tensor>(buffer, "_barrier_done"), std::nullopt, 0, tuning, out);
 }
 
+} // namespace deep_gemm::mega_moe
+#include "mega_moe_w4a8.hpp"
+namespace deep_gemm::mega_moe {
+
 // Python bindings.
 void register_apis(py::module_& m) {
     py::class_<TuningConfig>(m, "_MegaMoETuningConfig");
-    m.def("transform_weights_for_mega_moe", &transform_weights_for_mega_moe,
+    m.def("transform_weights_for_mega_moe",
+          [](const Pair& w1, const Pair& w2, const std::string& precision) -> py::object {
+              if (precision == "w4a8")
+                  return py::cast(transform_w4a8_weights(w1, w2));
+              return py::cast(transform_weights_for_mega_moe(w1, w2, precision));
+          },
           py::arg("w1"), py::arg("w2"), py::kw_only(), py::arg("precision"));
+    m.def("fp8_fp4_mega_moe", &w4a8_mega_moe,
+          py::arg("y"), py::arg("w1"), py::arg("w2"), py::arg("buffer"), py::kw_only(),
+          py::arg("activation") = "swiglu", py::arg("activation_limit") = py::none(),
+          py::arg("activation_alpha") = py::none(), py::arg("situ_beta") = 4.0f,
+          py::arg("situ_linear_beta") = 25.0f, py::arg("w1_replicas") = py::none(),
+          py::arg("w2_replicas") = py::none());
     m.def("fp4_fp4_mega_moe", &complete_mega_moe<Precision::W4A4>,
           py::arg("y"), py::arg("w1"), py::arg("w2"), py::arg("buffer"), py::kw_only(),
           py::arg("activation") = "swiglu", py::arg("activation_limit") = py::none(),

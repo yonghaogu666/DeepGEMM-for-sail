@@ -77,7 +77,19 @@ copying a test script.
 | --- | --- |
 | `test_moe_w4a4.py` | Runnable correctness/benchmark example; DeepSeek V4 Pro / Flash, GLM5.2, Kimi K3, Qwen3.8 2.4T and MiMo V2.6 Pro; SwiGLU / STEP / SiTU; FP4 pre-dispatch → fused GEMM1/activation/quantization → GEMM2/BF16 scatter → combine; replica weights |
 | `test_moe_w4a16.py` | Small / Kimi K3 shapes, fused dispatch/G1/SiTU → GEMM2/BF16 scatter → combine; replica weights, EP8/16/32 and EP32 decode cases |
+| `test_moe_w4a8.py` | MXFP4 weights with per-row FP8 activations; SwiGLU/OAI/SiTU, Kimi K3 at EP8/16/32 including decode, clamp, replica weights, load-time scale compensation, empty ranks, route changes and graph replay |
 | `test_moe_w8a8.py` | Channelwise GLM5.2 / GLM5.3 Flash / Qwen3.8 Flash / MiniMax M3; blockwise SwiGLU smoke and MiniMax SwiGLU-OAI shape at EP8/16/32/64; complete pipelines with independent Torch references |
+
+`bench_moe_w4a8_deepep.py` compares W4A8 MegaMoE with DeepEP normal dispatch,
+two W4A8 grouped GEMMs, BF16 SwiGLU, per-row FP8 quantization and weighted
+combine. It requires DeepEP and SGLang. Both paths use the same weights and
+random routes; the primary timing is eager versus eager and includes the normal
+dispatch count synchronization. MegaMoE graph timing is reported separately.
+
+```bash
+torchrun --standalone --nproc-per-node=8 tests/bench_moe_w4a8_deepep.py \
+  --case deepseek_v4_pro --tokens 32 1024 --output /tmp/w4a8-deepep.json
+```
 
 `moe_test_utils.py` contains process-group setup, common runtime helpers and
 independent Torch references, including FP4 round-to-nearest-even quantization.
@@ -87,7 +99,7 @@ Run the shared end-to-end smoke cases on two idle ZW-M890P devices:
 
 ```bash
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s -k smoke \
-  tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py
+  tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w4a8.py tests/test_moe_w8a8.py
 ```
 
 Use `--nproc-per-node=8` for EP8. Each smoke case reuses its workspace across
@@ -103,7 +115,8 @@ and combine. Inactive routes must produce exact zeros.
 
 The normalized squared-error thresholds are 0.003 for W4A4, 0.0005 for W4A16
 and 0.001 for FP8, matching the existing FP8 grouped contiguous/masked GEMM
-tests. W4A16 also requires relative L2 below 0.005. Replay outputs are saved
+tests. W4A8 uses 0.0015, matching its existing grouped GEMM tests.
+W4A16 also requires relative L2 below 0.005. Replay outputs are saved
 before eager execution and compared bitwise with it, then checked against the
 independent reference.
 
@@ -127,7 +140,7 @@ buffer = dg.get_symm_buffer_for_mega_moe(
 )
 ```
 
-`precision` accepts `w4a4`, `w4a16`, `fp8_channelwise` and `fp8_blockwise`,
+`precision` accepts `w4a4`, `w4a16`, `w4a8`, `fp8_channelwise` and `fp8_blockwise`,
 matching the compute APIs. Every precision requires `intermediate_hidden=I`,
 the activated intermediate width; GEMM1 width 2I is derived internally. The
 workspace owns both stages' scratch, route metadata, combine and barrier state.
@@ -151,8 +164,9 @@ to every token count using this workspace. Omit either option to keep that
 stage automatic. Different M tiles are supported; GEMM1 generates the matching
 GEMM2 metadata. GEMM1 may reduce the requested stages to fit shared memory.
 W4A4 also accepts `gemm1_block_n`, `gemm1_block_k` and `config_override`, which
-cannot be combined with `gemm1_config`. W4A16 and FP8 accept
-`block_m`. Omitting these options preserves the backend defaults and allows
+cannot be combined with `gemm1_config`. W4A16, W4A8 and FP8 accept
+`block_m`. W4A8 allows 16, 32, 64 or 128, and otherwise selects its tile from
+the actual token count using the W4A8 grouped GEMM heuristics. Omitting these options preserves the backend defaults and allows
 measured tuning hints to apply. Explicit W4A16 `block_m` takes precedence over
 the tuning table. Unsupported combinations fail before collective allocation.
 For FP8 channelwise, `block_m` selects both dispatch granularity and the GEMM1
@@ -265,6 +279,7 @@ inputs/weights with model dimensions, not checkpoint-based full-model tests.
 | GLM5.3 Flash / `glm53_flash` | W8A8 FP8 channelwise | 4 | SwiGLU, limit 10 | 4096 |
 | Kimi K3 / `kimi_k3` | W4A4 (MXFP4) | 8, 16 | SiTU | 4096 |
 | Kimi K3 / `kimi_k3` | W4A16 (FP4 weights, BF16 activations) | 8, 16, 32 | SiTU | 4096 |
+| Kimi K3 / `kimi_k3` | W4A8 (FP4 weights, per-row FP8 activations) | 8, 16, 32 | SiTU | 4096 |
 | Qwen3.8 Max (2.4T) / `qwen38_2_4t` | W4A4 (MXFP4) | 8, 16 | SwiGLU | 4096 |
 | Qwen3.8 Flash / `qwen38_flash` | W8A8 FP8 channelwise | 4 | SwiGLU | 8192 |
 | MiniMax M3 / `minimax_m3` | W8A8 FP8 channelwise | 8 | SwiGLU-OAI, alpha 1.702, limit 7 | 4096 |
@@ -329,7 +344,7 @@ export NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=eth0 GLOO_SOCKET_IFNAME=eth0
 
 # Small complete pipelines, including graph replay and separate replica weights.
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-  -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py \
+  -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w4a8.py tests/test_moe_w8a8.py \
   -k smoke -q
 # Channelwise FP8 smoke supports EP1, EP2, EP4 and EP8; this example uses EP4.
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
@@ -357,7 +372,7 @@ CUDA_VISIBLE_DEVICES=0 python tests/test_moe_w4a16.py \
   --case smoke --tokens 1 0 33 8 --edge-cases --replicas --benchmark
 
 # Inspect configured cases without creating a process group.
-python -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w8a8.py \
+python -m pytest tests/test_moe_w4a4.py tests/test_moe_w4a16.py tests/test_moe_w4a8.py tests/test_moe_w8a8.py \
   --collect-only -q
 ```
 
@@ -373,11 +388,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
   tests/test_moe_w4a16.py --case kimi_k3 --tokens 1024 2048 4096 --benchmark
 ```
 
+For W4A8 SiTU, select `tests/test_moe_w4a8.py --case kimi_k3` with an
+EP8, EP16 or EP32 launch. This case uses expert width H=3584, I=3072, 896 experts
+and top-k 16. Use `--case smoke_situ` for small SiTU correctness checks.
+
 Use the communication environment appropriate to the machine topology on both
 nodes. Pytest skips model cases whose required EP does not match the launch;
 the CLI reports an error for an incompatible `--case`.
 
-For Kimi K3 decode, use four eight-device nodes with `--nnodes=4` and
+For Kimi K3 W4A16 or W4A8 decode, use four eight-device nodes with `--nnodes=4` and
 `--node-rank=0..3`, then select
 `--case kimi_k3 --tokens 4 8 16 32 64 128 --benchmark`.
 For MiniMax blockwise, use `tests/test_moe_w8a8.py --case minimax_m3_blockwise`;
@@ -449,3 +468,15 @@ check unsupported public factory/entry combinations before cooperative compute.
 `compile_kernels` compiles native kernels without launching them, then ranks
 synchronize before entering cooperative device barriers. The router and
 shared-expert branch are outside these routed MoE examples.
+
+## W4A8 MegaMoE
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m pytest -q -s tests/test_moe_w4a8.py
+torchrun --standalone --nproc-per-node=8 tests/test_moe_w4a8.py \
+  --case deepseek_v4_pro --tokens 1024 --routing random --benchmark --reference-tokens 8
+```
+
+The reference independently dequantizes the original MXFP4 weights and uses
+Torch matmuls with the same per-row FP8 quantization and BF16 projection/activation
+boundaries. Both GEMMs' scalar weight compensation stays inside the public entry.
