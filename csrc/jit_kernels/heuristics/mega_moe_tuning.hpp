@@ -50,8 +50,8 @@ struct TuningConfig {
 };
 
 // These are measured overrides, not complete kernel configurations. Empty
-// fields use the family-specific selector. Token counts match
-// exactly: no nearest-model matching or interpolation into unmeasured ranges.
+// fields use the family-specific selector. Token counts match exactly unless
+// the entry explicitly declares buckets bounded by the listed token counts.
 struct TuningCase {
     int tokens;
     Gemm1Tuning gemm1{};
@@ -65,6 +65,9 @@ struct TuningEntry {
     int ranks, experts, topk, hidden, intermediate;
     const char* activation;
     std::initializer_list<TuningCase> cases;
+    // Bucket entries are ordered by increasing inclusive upper bound. Inputs
+    // above the final bound use the family-specific selector.
+    bool token_buckets = false;
 };
 
 inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& device, int sms) {
@@ -99,7 +102,30 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
         {2048, separate_gemm1(reuse128, 1024), {}, {64, true}},
         {4096, separate_gemm1(reuse128, 1024), {}, {64, true}},
     };
+    static const Tile w4a8_g1_decode{16, 256, 128, 16, 64, 2};
+    static const Tile w4a8_g2_decode{16, 256, 128, 16, 64, 2};
+    static const Tile w4a8_g2_decode3{16, 256, 128, 16, 64, 3};
+    static const Tile w4a8_g1_small{16, 1024, 128, 16, 64, 3};
+    static const Tile w4a8_g1_medium{32, 1024, 128, 32, 64, 3};
+    static const Tile w4a8_g1_large{64, 1024, 128, 64, 64, 3};
+    static const Tile w4a8_g2_small{16, 512, 128, 16, 64, 3};
+    static const Tile w4a8_g2_medium{32, 512, 128, 32, 64, 3};
+    static const Tile w4a8_g2_large{64, 512, 128, 64, 64, 3};
     static const TuningEntry entries[] = {
+        {"kimi_k3", P::W4A8, 8, 896, 16, 3584, 3072, "situ",
+         {{4, {w4a8_g1_decode}, {w4a8_g2_decode}},
+          {8, {w4a8_g1_decode}, {w4a8_g2_decode3}},
+          {64, {w4a8_g1_decode}, {w4a8_g2_decode}},
+          {128, {w4a8_g1_medium}, {w4a8_g2_medium}},
+          {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
+        {"kimi_k3", P::W4A8, 16, 896, 16, 3584, 3072, "situ",
+         {{16, {w4a8_g1_small}, {w4a8_g2_small}},
+          {64, {w4a8_g1_medium}, {w4a8_g2_medium}},
+          {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
+        {"kimi_k3", P::W4A8, 32, 896, 16, 3584, 3072, "situ",
+         {{16, {w4a8_g1_small}, {w4a8_g2_small}},
+          {32, {w4a8_g1_medium}, {w4a8_g2_medium}},
+          {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
         {"deepseek_v4_pro", P::W4A4, 8, 384, 6, 7168, 3072, "swiglu",
          {{32, {Tile{16, 256, 128, 16, 64, 3}, {}, 3}, {Tile{16, 256, 128, 16, 64, 3}}},
           {1024, {Tile{256, 256, 128, 64, 64, 3}, {}, 4}, {{}, 1}},
@@ -159,7 +185,7 @@ inline TuningConfig select_tuning(const TuningWorkload& w, const std::string& de
             w.topk == entry.topk && w.hidden == entry.hidden && w.intermediate == entry.intermediate &&
             w.activation == entry.activation) {
             for (const auto& c : entry.cases) {
-                if (w.tokens == c.tokens) {
+                if (w.tokens == c.tokens || (entry.token_buckets && w.tokens <= c.tokens)) {
                     result.profile = entry.model;
                     result.gemm1 = c.gemm1;
                     result.gemm2 = c.gemm2;

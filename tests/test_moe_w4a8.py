@@ -24,6 +24,10 @@ CASES = (
     MoECase("smoke_cached_quant", 512, 512, 16, 2, 33, tokens=(1, 0, 33), precision="w4a8"),
     MoECase("tail", 256, 384, 16, 2, 65, tokens=(17, 65), precision="w4a8"),
     MoECase("experts128", 256, 128, 256, 2, 33, tokens=(1, 33), worlds=(2,), precision="w4a8"),
+    # More than one readiness window, with a capacity much larger than the
+    # active input. Reuse counts across empty, sparse and changing routes.
+    MoECase("workspace_reuse", 512, 256, 128, 2, 4096, tokens=(65, 0, 1, 33, 129, 8, 65),
+            worlds=(2,), precision="w4a8"),
     MoECase("deepseek_v4_pro", 7168, 3072, 384, 6, 4096, tokens=(32, 1024, 4096),
             worlds=(8,), precision="w4a8", reference_tokens=8),
     MoECase("kimi_k3", 3584, 3072, 896, 16, 4096, tokens=(4, 8, 16, 32, 64, 128, 1024, 2048, 4096),
@@ -122,6 +126,28 @@ def test_pipeline(case, moe_group):
 def test_tiles_and_activation(block_m, moe_group):
     case = replace(CASES[0], tokens=(33,), activation="swiglu_oai", clamp=2.0, routing="skewed")
     run_case(case, moe_group, block_m=block_m, edge_cases=True, verbose=False)
+
+
+@pytest.mark.parametrize("block_m", (None, 32))
+def test_dynamic_tiles(block_m, moe_group):
+    case = next(c for c in CASES if c.name == "kimi_k3")
+    case.require_world()
+    # One capacity must support changing tile/padding geometry, an explicit
+    # G1 override, empty inputs and graph replay without caller-side resets.
+    case = replace(case, tokens=(4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 0, 4), routing="random")
+    run_case(case, moe_group, block_m=block_m, edge_cases=True, verbose=False,
+             reference_tokens=8)
+
+
+@pytest.mark.parametrize("routing", ("random", "skewed"))
+def test_quantize_lookup(routing, moe_group):
+    # Change the valid-row count across both expert-search regimes, including
+    # empty experts and workspace reuse after a large batch.
+    case = replace(CASES[0], hidden=256, intermediate=128, experts=128,
+                   capacity=4096, tokens=(33, 4096, 0, 1, 33),
+                   worlds=(2,), routing=routing)
+    case.require_world()
+    run_case(case, moe_group, edge_cases=True, verbose=False)
 
 
 def test_weight_scale_shift(moe_group):

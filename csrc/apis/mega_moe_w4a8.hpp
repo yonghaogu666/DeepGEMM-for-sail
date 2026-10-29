@@ -77,14 +77,27 @@ static void w4a8_mega_moe(const Tensor& out, const W4A8Weights& w1, const W4A8We
     TORCH_CHECK(masters + (r1 ? std::get<0>(*r1).size(0) : 0) == groups,
                 "master and replica counts must match local physical experts");
 
-    // Token count selects compute geometry without resizing the symmetric pool.
-    auto g1 = w4fa8::get_best_configs(ceil_div(tokens * topk, groups), 2*i, h, groups, GemmType::MGroupedNoPad);
-    if (const auto bm = field<std::optional<int>>(buffer, "_block_m_override")) {
-        g1.block_m = *bm;
-        g1.warp_m = std::min(*bm, 64);
-    }
-    g1.n_expand = 1;
-    w4fa8::check_config(g1, 2*i, h, GemmType::MGroupedNoPad);
+    // Select each stage from the current input length, independently of capacity.
+    const auto tuning = get_mega_moe_tuning_config(world, experts, topk, h, i, tokens, "w4a8", act);
+    const int expected_m = ceil_div(tokens * topk, groups);
+    const auto select = [&](int n, int k, const std::optional<mega_moe_config::Tile>& tile,
+                            std::optional<int> block_m = std::nullopt) {
+        auto c = w4fa8::get_best_configs(expected_m, n, k, groups, GemmType::MGroupedNoPad);
+        if (block_m) {
+            // An explicit dispatch tile retains the generic N/stage geometry.
+            c.block_m = *block_m;
+            c.warp_m = std::min(*block_m, 64);
+        } else if (tile) {
+            c.block_m = (*tile)[0]; c.block_n = (*tile)[1]; c.block_k = (*tile)[2];
+            c.warp_m = (*tile)[3]; c.warp_n = (*tile)[4]; c.num_stages = (*tile)[5];
+        }
+        c.n_expand = 1;
+        w4fa8::check_config(c, n, k, GemmType::MGroupedNoPad);
+        return c;
+    };
+    const auto g1 = select(2*i, h, tuning.gemm1.tile,
+                          field<std::optional<int>>(buffer, "_block_m_override"));
+    const auto g2 = select(h, i, tuning.gemm2.tile);
     auto c = read_dispatch_config(field<py::dict>(buffer, "_cfg"));
     c.block_m = g1.block_m; c.gemm1_n = 2*i;
     c.gemm1_block_n = g1.block_n; c.gemm1_block_k = 128;
@@ -105,9 +118,7 @@ static void w4a8_mega_moe(const Tensor& out, const W4A8Weights& w1, const W4A8We
         std::get<0>(w1), std::get<1>(w1), std::get<2>(w1),
         std::get<0>(replica1), std::get<1>(replica1), std::get<2>(replica1), scratch, limit.value_or(0));
     const auto a = field<Tensor>(buffer, "_activated"), scales = field<Tensor>(buffer, "_activation_scales");
-    mega_moe_native::fp8_mega_moe_quantize_local_pool_kernel(c, pointers, rank, scratch, a, scales);
-    auto g2 = w4fa8::get_best_configs(ceil_div(tokens * topk, groups), h, i, groups, GemmType::MGroupedNoPad);
-    g2.n_expand = 1;
+    mega_moe_native::fp8_mega_moe_quantize_local_pool_kernel<true>(c, pointers, rank, scratch, a, scales);
     const auto meta = field<py::object>(buffer, "_metadata");
     const auto combine = field<Tensor>(buffer, "_combine");
     mega_moe_native::w4a8_scatter(g2, groups, a, scales,
@@ -115,10 +126,10 @@ static void w4a8_mega_moe(const Tensor& out, const W4A8Weights& w1, const W4A8We
         std::get<0>(replica2), std::get<1>(replica2), std::get<2>(replica2),
         field<Tensor>(meta, "m_rows"), field<Tensor>(meta, "valid_m_rows"), field<Tensor>(meta, "token_meta"),
         combine, field<Tensor>(buffer, "_combine_offsets"), capacity, field<OptTensor>(buffer, "_gemm2_block_info"));
-    mega_moe_aux::recycle_dispatch_counts(field<Tensor>(buffer, "_dispatch_counts"));
     mega_moe_aux::barrier_reduce_impl(combine, field<Tensor>(buffer, "_routing_weights").narrow(0, 0, tokens),
         tokens, h, topk, capacity, field<Tensor>(buffer, "_barrier_pointers"), rank, world,
-        field<Tensor>(buffer, "_barrier_done"), std::nullopt, 0, out);
+        field<Tensor>(buffer, "_barrier_done"), std::nullopt, 0, out,
+        field<Tensor>(buffer, "_dispatch_counts"));
 }
 
 } // namespace deep_gemm::mega_moe

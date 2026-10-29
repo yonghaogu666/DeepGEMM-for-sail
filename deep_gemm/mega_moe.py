@@ -469,8 +469,11 @@ def get_symm_buffer_for_mega_moe(
     MegaMoE is supported on ZW-M890P.
 
     ``precision`` selects w4a4, w4a16, w4a8, fp8_channelwise or fp8_blockwise.
-    W4A8 uses MXFP4 weights and per-row FP8 activations; block_m optionally
-    fixes its dispatch/GEMM1 tile to 16, 32, 64 or 128.
+    W4A8 uses MXFP4 weights and per-row FP8 activations. Each forward selects
+    GEMM1/GEMM2 tiles independently from the model dimensions, EP size and
+    actual input token count. Measured token buckets take precedence over the
+    generic W4A8 selector. An explicit block_m fixes dispatch/GEMM1 to 16, 32,
+    64 or 128 with generic N/stage geometry; GEMM2 remains automatic.
     ``intermediate_hidden`` is the activated width I for every precision;
     GEMM1 has 2I output columns. The workspace owns both stages' scratch,
     route metadata, combine storage and communication state.

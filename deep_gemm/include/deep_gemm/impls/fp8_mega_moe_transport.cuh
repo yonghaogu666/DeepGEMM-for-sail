@@ -156,7 +156,8 @@ struct WarpSourceRanges {
 
 template <
     uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads,
-    uint32_t kNumExperts, uint32_t kNumExpertsPerRank, uint32_t kNumTopk>
+    uint32_t kNumExperts, uint32_t kNumExpertsPerRank, uint32_t kNumTopk,
+    bool kReuseGridSync = false>
 CUTLASS_DEVICE void dispatch_handshake(
         const layout::Workspace& workspace,
         const layout::SymBuffer<kNumRanks>& sym_buffer,
@@ -206,7 +207,7 @@ CUTLASS_DEVICE void dispatch_handshake(
     });
 
     comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/0,
-                    /*kPollBackoffCycles=*/128>(
+                    /*kPollBackoffCycles=*/kReuseGridSync ? 0 : 128>(
         workspace, cta_idx, thread_idx, block_sync);
 
     if (cta_idx == 0) {
@@ -226,9 +227,11 @@ CUTLASS_DEVICE void dispatch_handshake(
     }
     __syncthreads();
 
+    // Route stores have already rendezvoused. Only CTA0 writes counts after
+    // that point, and its CTA barrier orders them before cross-rank signaling.
     comm::cross_rank_barrier<kNumRanks, kNumCTAs, kNumThreads, /*idx=*/0,
                          /*tag=*/0>(
-        workspace, sym_buffer, cta_idx, thread_idx, block_sync, true, true);
+        workspace, sym_buffer, cta_idx, thread_idx, block_sync, !kReuseGridSync, true);
 }
 
 }  // namespace deep_gemm::mega_moe::detail

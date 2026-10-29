@@ -86,7 +86,7 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_common(
 
 // Flatten valid expert rows for quantization, then map back to pool offsets.
 // Quantized rows use the pool offsets described by the GEMM2 metadata.
-template <uint32_t kEPR, uint32_t kWidth>
+template <uint32_t kEPR, uint32_t kWidth, bool kBinarySearch = false>
 CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
         const int32_t* metadata, const __ppu_bfloat16* input,
         cutlass::float_e4m3_t* output, float* scales) {
@@ -119,9 +119,28 @@ CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
             if (chunk == expert / 32) value = values[chunk];
         return __shfl_sync(0xffffffffu, value, expert % 32);
     };
+    constexpr uint32_t kSearchSteps = [] {
+        uint32_t steps = 0;
+        for (uint32_t n = kEPR; n; n >>= 1) ++steps;
+        return steps;
+    }();
+    const uint32_t warps = gridDim.x * (blockDim.x / 32);
+    // A sequential cursor visits each expert at most once per warp. Binary
+    // search is cheaper when the average expert span per row exceeds its depth.
+    const bool binary_search = kBinarySearch && total <= warps * kEPR / kSearchSteps;
     uint32_t expert = 0;
-    for (uint32_t row = warp; row < total; row += gridDim.x * (blockDim.x / 32)) {
-        while (expert < kEPR && row >= at(end, expert)) ++expert;
+    for (uint32_t row = warp; row < total; row += warps) {
+        if (binary_search) {
+            uint32_t lo = expert, hi = kEPR;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if (row >= at(end, mid)) lo = mid + 1;
+                else hi = mid;
+            }
+            expert = lo;
+        } else {
+            while (expert < kEPR && row >= at(end, expert)) ++expert;
+        }
         if (expert >= kEPR) break;
         const uint32_t pool_row = at(source, expert) + row - at(begin, expert);
         warp_quantize_bf16_row_common<kWidth>(input, output, scales, pool_row, lane);
@@ -185,10 +204,22 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         kNumTopk);
     const auto block_sync = [=]() { __syncthreads(); };
     auto* smem_expert_count = reinterpret_cast<uint32_t*>(smem_buf);
+    constexpr bool kReuseHandshake = !cute::is_same_v<W4A8Backend, void>;
+    if constexpr (kReuseHandshake) {
+        // Reset every reachable M-block counter before the handshake's grid
+        // barrier. This also covers empty ranks and changing runtime tiles.
+        if constexpr (kDynamicWork)
+            if (cta_idx == 0 && thread_idx == 0)
+                *workspace.get_gemm1_work_count_ptr() = 0;
+        for (uint32_t g = cta_idx * kNumThreads + thread_idx;
+             g < workspace.num_max_pool_tokens / kBlockM;
+             g += kNumCTAs * kNumThreads)
+            *workspace.get_l1_arrival_count_ptr(g) = 0;
+    }
 
     mega_moe::detail::dispatch_handshake<
         kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank,
-        kNumTopk>(
+        kNumTopk, kReuseHandshake>(
         workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
         cta_idx, thread_idx);
 
@@ -266,15 +297,16 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     static_assert(kBlockM * sizeof(float) + sizeof(uint32_t) <= kBlockM * kBlockK);
     auto& queue_ticket = *reinterpret_cast<uint32_t*>(smem_buf + kBlockM * sizeof(float));
     const mega_moe::WorkQueue queue{queue_counter, &queue_ticket};
-    if constexpr (kDynamicWork)
-        if (cta_idx == 0 && thread_idx == 0) *queue_counter = 0;
-    // Arrival counters are persistent workspace state. Clear the exact active
-    // prefix before producer and consumer CTAs diverge.
-    for (uint32_t g = cta_idx * kNumThreads + thread_idx;
-         g < total_m_blocks; g += kNumCTAs * kNumThreads)
-        *workspace.get_l1_arrival_count_ptr(g) = 0;
-    comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/2>(
-        workspace, cta_idx, thread_idx, block_sync);
+    if constexpr (!kReuseHandshake) {
+        if constexpr (kDynamicWork)
+            if (cta_idx == 0 && thread_idx == 0) *queue_counter = 0;
+        // Clear the active prefix before producer and consumer CTAs diverge.
+        for (uint32_t g = cta_idx * kNumThreads + thread_idx;
+             g < total_m_blocks; g += kNumCTAs * kNumThreads)
+            *workspace.get_l1_arrival_count_ptr(g) = 0;
+        comm::grid_sync<kNumCTAs, /*kGridSyncIndex=*/2>(
+            workspace, cta_idx, thread_idx, block_sync);
+    }
 
     struct BlockInfo {
         uint32_t expert;
@@ -416,11 +448,14 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         }
     }
     if (kDynamicWork || cta_idx >= kNumPullCTAs) {
+        constexpr bool kCacheReady = !cute::is_same_v<W4A8Backend, void>;
+        uint32_t ready_base = ~uint32_t{0}, ready_mask = 0;
         uint32_t prefetched_work = 0;
         if constexpr (kDynamicWork) {
             queue.prime(thread_idx);
             prefetched_work = queue.current();
-            __syncthreads(); // first claim only: every warp retires the shared word
+            if constexpr (!kCacheReady)
+                __syncthreads();
         }
         // Consumer CTAs schedule the complete grouped-GEMM work list while
         // waiting only for the M block they need, overlapping data transport
@@ -482,8 +517,31 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
 
             constexpr uint32_t kRequiredArrivals =
                 kNumPullCTAs / 3;
-            while (tix::ld_acq(
-                       workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
+            if constexpr (kCacheReady) {
+                // Readiness is monotonic within this invocation. One warp
+                // acquires a window of flags; the CTA barrier below carries
+                // those acquires to every consumer and retires ticket reads.
+                if (warp_idx == 0) {
+                    const uint32_t window = global_m_block & ~uint32_t{31};
+                    const uint32_t bit = 1u << (global_m_block & 31u);
+                    if (ready_base != window || !(ready_mask & bit)) {
+                        const uint32_t peer_block = window + lane_idx;
+                        const bool ready = peer_block < total_m_blocks &&
+                            tix::ld_acq(workspace.get_l1_arrival_count_ptr(peer_block)) >= kRequiredArrivals;
+                        ready_mask = __ballot_sync(0xffffffffu, ready);
+                        __syncwarp();
+                        ready_base = window;
+                        if (!(ready_mask & bit)) {
+                            while (tix::ld_acq(workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
+                            ready_mask |= bit;
+                        }
+                    }
+                }
+                __syncthreads();
+            } else {
+                while (tix::ld_acq(
+                           workspace.get_l1_arrival_count_ptr(global_m_block)) < kRequiredArrivals);
+            }
 
             const bool use_replica =
                 current_expert >= num_master_experts;
@@ -508,7 +566,8 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 if constexpr (kDynamicWork) {
                     queue.prime(thread_idx);
                     prefetched_work = queue.current();
-                    __syncthreads();
+                    if constexpr (!kCacheReady)
+                        __syncthreads();
                 }
             } else {
                 mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, kSwiGLUOAI>(

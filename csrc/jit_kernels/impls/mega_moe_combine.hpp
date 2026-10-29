@@ -36,7 +36,8 @@ inline void barrier_reduce_impl(const torch::Tensor& buf, const torch::Tensor& w
                                 int hidden, int topk, int capacity, const torch::Tensor& pointers,
                                 int rank, int world, const torch::Tensor& done,
                                 const std::optional<torch::Tensor>& scales, int scale_block_n,
-                                const torch::Tensor& out) {
+                                const torch::Tensor& out,
+                                const std::optional<torch::Tensor>& dispatch_counts = std::nullopt) {
     reset_done(done);
     const bool fp8 = buf.scalar_type() == torch::kFloat8_e4m3fn;
     const bool scaled = scales.has_value();
@@ -44,15 +45,17 @@ inline void barrier_reduce_impl(const torch::Tensor& buf, const torch::Tensor& w
     const int scale_tiles = scaled ? ceil_div(hidden, scale_block_n) : 0;
     constexpr int shift = 0;
     const auto body = fmt::format(
-        "barrier_reduce_kernel<{}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d);",
-        topk, fp8, scaled, threads);
+        "barrier_reduce_kernel<{}, {}, {}, {}, {}>(b, s, w, y, t, h, c, st, sn, shift, p, r, ws, d, counts, nc);",
+        topk, fp8, scaled, threads, dispatch_counts.has_value());
     run_aux("barrier_reduce",
             "const void* b, const uint64_t* s, const float* w, __ppu_bfloat16* y, int t, int h, int c, "
-            "int st, int sn, int shift, int32_t** p, int r, int ws, int32_t* d",
+            "int st, int sn, int shift, int32_t** p, int r, int ws, int32_t* d, uint64_t* counts, int nc",
             body, dim3(std::max(tokens, 1), 1), threads,
             {buf.data_ptr(), scaled ? scales->data_ptr() : nullptr, weights.data_ptr(), out.data_ptr(),
              int32_t(tokens), int32_t(hidden), int32_t(capacity), int32_t(scale_tiles), int32_t(scale_block_n),
-             int32_t(shift), pointers.data_ptr(), int32_t(rank), int32_t(world), done.data_ptr()});
+             int32_t(shift), pointers.data_ptr(), int32_t(rank), int32_t(world), done.data_ptr(),
+             dispatch_counts ? dispatch_counts->data_ptr() : nullptr,
+             int32_t(dispatch_counts ? dispatch_counts->nbytes() / sizeof(uint64_t) : 0)});
 }
 
 } // namespace deep_gemm::mega_moe_aux

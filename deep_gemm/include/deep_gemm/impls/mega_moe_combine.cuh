@@ -15,9 +15,20 @@ constexpr uint64_t kBarrierTimeoutCycles = 600000000000ULL;
 // Only block (0, 0) publishes arrival and polls the peer counters. The local
 // done flag is cleared on the launch stream before each invocation, including
 // graph replay. Empty ranks must launch this kernel too.
-__device__ __forceinline__ void combine_barrier(int32_t** flags, int rank, int world, int32_t* done) {
+template <bool kRecycleCounts>
+__device__ __forceinline__ void combine_barrier(int32_t** flags, int rank, int world, int32_t* done,
+                                               uint64_t* dispatch_counts, int num_dispatch_counts) {
     const int tid = threadIdx.x;
     if (blockIdx.x == 0 && blockIdx.y == 0) {
+        if constexpr (kRecycleCounts) {
+            // GEMM2 has completed on this stream. Clear per-call counts before
+            // publishing completion so a peer's next dispatch cannot race us.
+            // Generation counters and arrival flags are outside this slice.
+            for (int i = tid; i < num_dispatch_counts; i += blockDim.x)
+                dispatch_counts[i] = 0;
+            tix::fence_acq_rel_sys();
+            __syncthreads();
+        }
         if (tid < 32) {
             int32_t generation = 0;
             // Order completed scatter writes before publishing this rank.
@@ -97,12 +108,13 @@ __device__ __forceinline__ void load_combine_vector(
     }
 }
 
-template <int kTopk, bool kFp8, bool kScaled, int kThreads>
+template <int kTopk, bool kFp8, bool kScaled, int kThreads, bool kRecycleCounts>
 __device__ __forceinline__ void barrier_reduce_kernel(
     const void* buf, const uint64_t* scales, const float* weights, __ppu_bfloat16* output,
     int tokens, int hidden, int capacity, int scale_tiles, int scale_block_n, int fp8_exp_shift,
-    int32_t** flags, int rank, int world, int32_t* done) {
-    combine_barrier(flags, rank, world, done);
+    int32_t** flags, int rank, int world, int32_t* done,
+    uint64_t* dispatch_counts, int num_dispatch_counts) {
+    combine_barrier<kRecycleCounts>(flags, rank, world, done, dispatch_counts, num_dispatch_counts);
     const int token = blockIdx.x;
     if (token >= tokens)
         return;

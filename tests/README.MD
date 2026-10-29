@@ -165,8 +165,10 @@ stage automatic. Different M tiles are supported; GEMM1 generates the matching
 GEMM2 metadata. GEMM1 may reduce the requested stages to fit shared memory.
 W4A4 also accepts `gemm1_block_n`, `gemm1_block_k` and `config_override`, which
 cannot be combined with `gemm1_config`. W4A16, W4A8 and FP8 accept
-`block_m`. W4A8 allows 16, 32, 64 or 128, and otherwise selects its tile from
-the actual token count using the W4A8 grouped GEMM heuristics. Omitting these options preserves the backend defaults and allows
+`block_m`. W4A8 allows 16, 32, 64 or 128 and otherwise selects each stage from
+the actual token count. Matching MegaMoE token buckets override the generic
+W4A8 selector; an explicit `block_m` fixes GEMM1 with generic N/stage geometry
+while GEMM2 stays automatic. Omitting these options preserves the backend defaults and allows
 measured tuning hints to apply. Explicit W4A16 `block_m` takes precedence over
 the tuning table. Unsupported combinations fail before collective allocation.
 For FP8 channelwise, `block_m` selects both dispatch granularity and the GEMM1
@@ -475,7 +477,13 @@ shared-expert branch are outside these routed MoE examples.
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s tests/test_moe_w4a8.py
 torchrun --standalone --nproc-per-node=8 tests/test_moe_w4a8.py \
   --case deepseek_v4_pro --tokens 1024 --routing random --benchmark --reference-tokens 8
+torchrun --standalone --nproc-per-node=8 -m pytest -q -s \
+  tests/test_moe_w4a8.py -k dynamic_tiles
 ```
+
+`dynamic_tiles` reuses a capacity-4096 Kimi K3 workspace across token bucket
+boundaries, empty inputs and graph replay, with automatic tiles and an explicit
+GEMM1 M tile. The same test supports EP16 and EP32 launches.
 
 The reference independently dequantizes the original MXFP4 weights and uses
 Torch matmuls with the same per-row FP8 quantization and BF16 projection/activation

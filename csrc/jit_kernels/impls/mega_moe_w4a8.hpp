@@ -5,11 +5,12 @@
 namespace deep_gemm::mega_moe_native {
 
 struct W4A8DispatchTag {};
-inline void w4a8_dispatch(const DispatchConfig& c, const torch::Tensor& pointers, int rank, int tokens,
+inline void w4a8_dispatch(DispatchConfig c, const torch::Tensor& pointers, int rank, int tokens,
     const torch::Tensor& w, const torch::Tensor& s, float inv,
     const torch::Tensor& rw, const torch::Tensor& rs, float rinv,
     const torch::Tensor& output, float limit) {
-    launch<W4A8DispatchTag>("w4a8_mega_moe_dispatch_gemm1", R"(
+    const std::string name = "w4a8_mega_moe_dispatch_gemm1";
+    const std::string source = R"(
 #include <deep_gemm/impls/w4a8_mega_moe.cuh>
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_dispatch_gemm1.cuh>
 using namespace deep_gemm;
@@ -36,9 +37,32 @@ void PPU_KERNEL_ENTRY(layout::SymBuffer<{NUM_RANKS}> sb, int tokens,
         reinterpret_cast<const cutlass::float_e4m3_t*>(rw), reinterpret_cast<const float*>(rs),
         masters, out, limit, {SWIGLU_ALPHA}, tokens, {NMTPR}, inv, rinv, {SITU_BETA}, {SITU_LINEAR_BETA});
 }
-)", c, {native_pod_argument(symmetric_buffer(pointers, rank, c.num_ranks)), int32_t(tokens),
-        w.data_ptr(), s.data_ptr(), inv, rw.data_ptr(), rs.data_ptr(), rinv,
-        int32_t(w.size(0)), output.data_ptr(), limit}, dim3(c.num_sms), c.num_threads);
+)";
+    const int sms = get_num_sms();
+    bool sized = false;
+    for (;;) {
+        NativeKernelArgs native{rendered_source<W4A8DispatchTag>(name, source, c),
+            {dim3(c.num_sms), dim3(c.num_threads), 0},
+            {native_pod_argument(symmetric_buffer(pointers, rank, c.num_ranks)), int32_t(tokens),
+             w.data_ptr(), s.data_ptr(), inv, rw.data_ptr(), rs.data_ptr(), rinv,
+             int32_t(w.size(0)), output.data_ptr(), limit}};
+        const auto runtime = compile_native_kernel<W4A8DispatchTag>(name, native);
+        native.launch_args.smem_size = native_kernel_smem(runtime);
+        const int occupancy = native_kernel_occupancy(runtime, c.num_threads, native.launch_args.smem_size);
+        TORCH_CHECK(occupancy >= 1, "W4A8 MegaMoE G1 cannot keep a block resident");
+        const int resident_ctas = sms * std::min(8, occupancy);
+        // The grid barrier's participant count is a template argument. Recompile
+        // for the selected grid, then verify that specialization also fits.
+        if (!sized || c.num_sms > resident_ctas) {
+            sized = true;
+            if (c.num_sms != resident_ctas) {
+                c.num_sms = resident_ctas;
+                continue;
+            }
+        }
+        NativeKernelRuntime<W4A8DispatchTag>::launch(runtime, native);
+        return;
+    }
 }
 
 struct W4A8ScatterTag {};

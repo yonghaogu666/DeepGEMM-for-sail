@@ -422,6 +422,21 @@ stage's tile. Unspecified stages select their configuration using the actual
 input token count. See [the MegaMoE examples](tests/README.MD) for units,
 constraints and configuration precedence.
 
+W4A8 selects GEMM1 and GEMM2 tiles independently on each forward using the
+model dimensions, EP size and actual input token count. The measured token
+buckets in `csrc/jit_kernels/heuristics/mega_moe_tuning.hpp` override the generic
+W4A8 selector for matching workloads. Kimi K3 has buckets for EP8/16/32 through
+4096 tokens per rank; other workloads retain generic selection. Workspace
+capacity does not fix either stage's tile. An explicit `block_m` fixes GEMM1's
+M tile with generic N/stage geometry; GEMM2 continues to select its
+configuration automatically.
+GEMM1 sizes its persistent grid from the compiled kernel's resident CTA count,
+including shared-memory and register limits, and verifies that all grid-barrier
+participants can reside together. The standalone activation quantizer keeps its
+own launch geometry. It selects binary search or a sequential expert cursor
+from the actual valid-row count and expert count, keeping the cursor for large
+batches where its search cost is amortized across rows.
+
 ##### State and routing contract
 
 Allocation is collective, outside capture. The workspace owns activation and

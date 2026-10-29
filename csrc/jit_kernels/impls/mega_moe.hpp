@@ -656,7 +656,8 @@ deep_gemm::mega_moe::fp8_channelwise::dispatch_gemm1_device<
         dim3(config.num_sms), config.num_threads);
 }
 
-struct Fp8MegaMoeQuantizeLocalPoolTag {};
+template <bool kBinarySearch> struct Fp8MegaMoeQuantizeLocalPoolTag {};
+template <bool kBinarySearch = false>
 inline void fp8_mega_moe_quantize_local_pool_kernel(
     const DispatchConfig& config, const torch::Tensor& buffer_ptrs, int rank,
     const torch::Tensor& input, const torch::Tensor& output, const torch::Tensor& scales) {
@@ -664,9 +665,7 @@ inline void fp8_mega_moe_quantize_local_pool_kernel(
     // CTAs per SM retain the warp budget of the 512-thread GEMM launch.
     auto quant_config = config;
     quant_config.num_threads = 128;
-    launch<Fp8MegaMoeQuantizeLocalPoolTag>(
-        "fp8_mega_moe_quantize_local_pool",
-        R"DGMEGA(#include <deep_gemm/impls/fp8_channelwise_mega_moe_dispatch_gemm1.cuh>
+    std::string source = R"DGMEGA(#include <deep_gemm/impls/fp8_channelwise_mega_moe_dispatch_gemm1.cuh>
 using namespace deep_gemm;
 extern "C" __device__ __constant__ uint32_t ppu_native_smem_bytes = 0;
 extern "C" __global__ __launch_bounds__({NUM_THREADS}, 1)
@@ -675,9 +674,12 @@ void PPU_KERNEL_ENTRY(int64_t sb_base,
     const auto* metadata = reinterpret_cast<const int32_t*>(
         sb_base + {LAYOUT_OFF_PW} + {LAYOUT_NUM_POOL} * sizeof(float));
     mega_moe::fp8_channelwise::fp8_mega_moe_quantize_valid_pool_kernel_device<
-        {NUM_EXPERTS_PER_RANK}, {GEMM1_N} / 2>(metadata, input, output, scales);
+        {NUM_EXPERTS_PER_RANK}, {GEMM1_N} / 2, {BINARY_SEARCH}>(metadata, input, output, scales);
 }
-)DGMEGA",
+)DGMEGA";
+    replace_source_field(source, "BINARY_SEARCH", kBinarySearch ? "true" : "false");
+    launch<Fp8MegaMoeQuantizeLocalPoolTag<kBinarySearch>>(
+        "fp8_mega_moe_quantize_local_pool", std::move(source),
         quant_config,
         {int64_t(symmetric_buffer(buffer_ptrs, rank, config.num_ranks).base),
          device_pointer(input), device_pointer(output), device_pointer(scales)},
