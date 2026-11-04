@@ -65,7 +65,8 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         }
         std::pair<int, int> cache_variant() const {
             const auto c = kernel_spec();
-            return {int(c.fragment) + 2 * int(c.a_load()) + 16 * int(params.inv_scale != 1.f), int(kind)};
+            return {int(c.fragment) + 2 * int(c.a_load()) + 4 * int(c.group_activation_scales) +
+                        16 * int(params.inv_scale != 1.f), int(kind)};
         }
     };
     static const char* name() { return "m_grouped_gemm_w4fa8_mma"; }
@@ -75,7 +76,7 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         return fmt::format(
             R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -89,6 +90,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
             get_gemm_type_name(a.kind), c.n_expand, a.params.inv_scale != 1.0f ? "true" : "false",
             kernel.fragment == FragmentPolicy::FullK ? "FullK" : "RollingK32",
             kernel.a_load() == ALoadPolicy::Bulk ? "Bulk" : "Ring2",
+            kernel.group_activation_scales ? "true" : "false",
             a.launch_args.smem_size, get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -165,10 +167,11 @@ static void log_native_config(const W4A8Config& c, int m, int n, int k, int grou
 
 template <class Scheduler>
 static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind, int expected_m, int topk,
-                   int32_t* m_rows, const Arguments<Scheduler>& params) {
+                   int32_t* m_rows, const Arguments<Scheduler>& params, bool group_activation_scales) {
     using R = Runtime<Scheduler>;
     const int threads = get_num_threads(c), smem = get_smem_size(c, k);
     typename R::Args args{c, n, k, groups, kind, {dim3(c.num_sms), dim3(threads), smem}, params};
+    args.kernel_config = NativeKernelConfig{c, FragmentPolicy::FullK, group_activation_scales};
     DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&args.device));
     const auto prepared = lookup_native_kernel<R>(args, is_w4a8_capturing(), false);
     TORCH_CHECK(prepared.has_value(), "W4FA8 native plan must be warmed outside graph capture");
@@ -233,7 +236,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
             inv_scale,
             token_ids.data_ptr<int32_t>(),
             {aligned_blocks.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>()}};
-        launch(c, m, n, k, groups, kind, expected_m, d.size(0) / m, rows.data_ptr<int32_t>(), params);
+        launch(c, m, n, k, groups, kind, expected_m, d.size(0) / m, rows.data_ptr<int32_t>(), params, a_scale.size(-1) > 1);
     } else {
         auto prepared = kind == GemmType::MGroupedNoPad ? prepare_nopad_layout(rows, groups, m, c) : rows;
         auto layout = prepared.data_ptr<int32_t>();
@@ -246,7 +249,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
                                                        inv_scale,
                                                        nullptr,
                                                        TileSchedulerArguments(static_cast<uint32_t>(m), layout)};
-        launch(c, m, n, k, groups, kind, expected_m, 0, rows.data_ptr<int32_t>(), params);
+        launch(c, m, n, k, groups, kind, expected_m, 0, rows.data_ptr<int32_t>(), params, a_scale.size(-1) > 1);
     }
 }
 
@@ -297,10 +300,10 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
         return;
     }
     const auto& kernel = std::get<NativeKernelConfig>(plan);
-    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool>;
+    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool, bool>;
     static std::mutex ready_mutex;
     static std::set<ReadyKey> ready;
-    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind), pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f};
+    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind), pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f, kernel.group_activation_scales};
     const bool capturing = is_w4a8_capturing();
     if (capturing) {
         std::lock_guard<std::mutex> lock(ready_mutex);

@@ -47,6 +47,7 @@ static void register_apis(pybind11::module_& m) {
         .value("W4A16_MXFP4", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4)
         .value("W4A16_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A16_MXFP4_MMA)
         .value("W4A8_MXFP4_MMA", deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
+        .value("W4A8_MXFP4_FP8", deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_FP8)
         .value("W4A16_INT4", deep_gemm_preprocess_common::PreprocessMode::W4A16_INT4)
         .value("FP8_CHANNEL", deep_gemm_preprocess_common::PreprocessMode::FP8_CHANNEL)
         .value("FP8_BLOCK", deep_gemm_preprocess_common::PreprocessMode::FP8_BLOCK)
@@ -62,6 +63,8 @@ static void register_apis(pybind11::module_& m) {
               const py::object prepared_weight_scale = result.scale.defined() ? py::cast(result.scale) : py::none();
               if (mode == deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_MMA)
                   return py::make_tuple(prepared_weight, result.scale, result.inv_scale);
+              if (mode == deep_gemm_preprocess_common::PreprocessMode::W4A8_MXFP4_FP8)
+                  return py::make_tuple(prepared_weight, result.scale, result.fp8_scale);
               return py::make_tuple(prepared_weight, prepared_weight_scale);
           },
           py::arg("mode"), py::arg("fuse_activation"), py::arg("weight") = std::nullopt,

@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,13 +23,15 @@ enum class PreprocessMode {
     BF16,             // unquantized bf16 weight
     W4A8_MXFP4_MMA,   // E4M3 activation, FP4 MMA dequant with E8M0 scales
     W4A8_INT8,        // w4a8 int4 weight with per-channel scales
+    W4A8_MXFP4_FP8,   // prepared MXFP4 for whole-weight E4M3 expansion
 };
 
 struct PreprocessedWeights {
     torch::Tensor weight;
     torch::Tensor scale;
-    // Only used in W4A8_MXFP4_MMA: Fold into the activation row scale
+    // W4A8_MXFP4_MMA: fold into all activation scales or pass as inv_scale.
     float inv_scale = 1.0f;
+    torch::Tensor fp8_scale;  // W4A8_MXFP4_FP8: FP32 N128 x K128 restoring scales
 };
 
 inline const char* preprocess_mode_name(const PreprocessMode& mode) {
@@ -43,6 +46,7 @@ inline const char* preprocess_mode_name(const PreprocessMode& mode) {
         case PreprocessMode::INT8:            return "int8";
         case PreprocessMode::BF16:            return "bf16";
         case PreprocessMode::W4A8_INT8:       return "w4a8-int8";
+        case PreprocessMode::W4A8_MXFP4_FP8:  return "w4a8-mxfp4-fp8";
     }
     return "unknown";
 }
@@ -61,6 +65,37 @@ inline PreprocessedWeights preprocess_weights_and_scales(
     TORCH_CHECK(weight.defined() || scale_only,
                 "preprocess mode '", preprocess_mode_name(mode), "' with fuse_activation=", fuse_activation,
                 " requires weights");
+    if (mode == PreprocessMode::W4A8_MXFP4_FP8) {
+        TORCH_CHECK(!fuse_activation && weight_scale.has_value(),
+                    "W4A8_MXFP4_FP8 requires native scales and fuse_activation=False");
+        const auto& scales = *weight_scale;
+        TORCH_CHECK(weight.dim() == 3 && weight.scalar_type() == torch::kUInt8,
+                    "W4A8_MXFP4_FP8 weights must be uint8 [E,N,K/2]");
+        const int64_t e = weight.size(0), n = weight.size(1), k = weight.size(2) * 2;
+        TORCH_CHECK(e > 0 && n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0,
+                    "W4A8_MXFP4_FP8 requires E>0, N%128=0 and K%128=0");
+        TORCH_CHECK(scales.device() == weight.device() && scales.scalar_type() == torch::kUInt8 &&
+                        scales.sizes() == std::vector<int64_t>({e, n, k / 32}),
+                    "W4A8_MXFP4_FP8 requires matching uint8 E8M0 [E,N,K/32] scales");
+        TORCH_CHECK(scales.min().item<int>() > 0 && scales.max().item<int>() < 255,
+                    "W4A8_MXFP4_FP8 E8M0 exponent codes must be in [1,254]");
+        // Normalize each N128 x K128 block so its largest native scale is 64.
+        // E2M1 magnitudes are at most 6, hence all decoded E4M3 values fit in 384.
+        auto blocks = scales.to(torch::kInt).reshape({e, n / 128, 128, k / 128, 4});
+        auto maximum = at::amax(blocks, {2, 4});
+        auto indices = (blocks - maximum.unsqueeze(2).unsqueeze(4) + 19)
+                           .clamp(0, 19).to(torch::kUInt8).reshape({e, n, k / 32}).contiguous();
+        // IEEE FP32 encoding of 2^(maximum-133), including subnormal scales.
+        auto normal = at::bitwise_left_shift((maximum - 6).clamp_min(1), 23);
+        auto subnormal = at::bitwise_left_shift(at::ones_like(maximum), (maximum + 16).clamp_max(22));
+        auto restoring = at::where(maximum > 6, normal, subnormal).contiguous().view(torch::kFloat);
+
+        // Keep the same natural packed weight used by the fused MMA path.
+        // Unaligned storage-offset views need a fresh aligned allocation.
+        auto packed = weight.contiguous();
+        if (reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 != 0) packed = packed.clone();
+        return {packed, indices, 1.0f, restoring};
+    }
     if ((mode == PreprocessMode::W4A16_INT4 || mode == PreprocessMode::W4A16_MXFP4)
             && !fuse_activation) {
         const bool int4 = mode == PreprocessMode::W4A16_INT4;

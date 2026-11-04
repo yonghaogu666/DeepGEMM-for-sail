@@ -19,6 +19,7 @@
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
+#include "../jit_kernels/impls/mxfp4_decode.hpp"
 #include "../jit_kernels/impls/ppuxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
@@ -1685,7 +1686,7 @@ static void check_w4fa8_operands(const std::pair<torch::Tensor, torch::Tensor>& 
     const int m = a.size(-2), k = a.size(-1), e = b.size(0), n = b.size(1);
     TORCH_CHECK(e > 0 && n > 0 && n % 64 == 0 && k > 0 && k % 128 == 0, "W4FA8 requires N%64=0, K%128=0");
     TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn && s.scalar_type() == torch::kFloat32,
-                "W4FA8 activation must be E4M3 with FP32 per-row scales");
+                "W4FA8 activation must be E4M3 with FP32 per-row or group-128 scales");
     TORCH_CHECK(b.scalar_type() == torch::kUInt8 && bs.scalar_type() == torch::kUInt8 &&
                     out.scalar_type() == torch::kBFloat16,
                 "W4FA8 requires uint8 weights/scales and BF16 output");
@@ -1693,7 +1694,10 @@ static void check_w4fa8_operands(const std::pair<torch::Tensor, torch::Tensor>& 
                 "invalid preprocessed weight layout");
     auto scale_shape = a.sizes().vec();
     scale_shape.back() = 1;
-    TORCH_CHECK(s.sizes() == scale_shape, "activation scale shape must match rows with final dimension 1");
+    auto group_scale_shape = scale_shape;
+    group_scale_shape.back() = k / 128;
+    TORCH_CHECK(s.sizes() == scale_shape || s.sizes() == group_scale_shape,
+                "activation scale shape must match rows with final dimension 1 or K/128");
     TORCH_CHECK(out.size(-1) == n, "output N mismatch");
     if (masked) {
         TORCH_CHECK(a.size(0) == e && out.size(0) == e && out.size(1) == m, "masked shape mismatch");
@@ -1726,8 +1730,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (!m)
         return;
     const auto tile = configs ? deep_gemm::w4fa8::unpack_config(*configs)
-                              : deep_gemm::w4fa8::get_best_configs(m, n, k, 1, GemmType::MGroupedNoPad);
-    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, 1, GemmType::MGroupedNoPad);
+                              : deep_gemm::w4fa8::get_best_configs(m, n, k, 1, GemmType::MGroupedNoPad, a.second.size(-1) > 1);
+    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, 1, GemmType::MGroupedNoPad, a.second.size(-1) > 1);
     const auto rows = at::full({1}, m, a.first.options().dtype(torch::kInt32));
     deep_gemm::w4fa8::execute_plan(plan, a.first, a.second, grouped_b.first, grouped_b.second, out, rows,
                                  GemmType::MGroupedNoPad, m, inv_scale);
@@ -1754,8 +1758,8 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_nopad(const std::pair<torch::Tensor, 
     TORCH_CHECK(counts.dim() == 1 && counts.numel() == num_groups, "m_rows shape mismatch");
     const int em = ceil_div(m, num_groups);
     const auto tile = configs ? deep_gemm::w4fa8::unpack_config(*configs)
-                              : deep_gemm::w4fa8::get_best_configs(em, n, k, num_groups, GemmType::MGroupedNoPad);
-    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, num_groups, GemmType::MGroupedNoPad);
+                              : deep_gemm::w4fa8::get_best_configs(em, n, k, num_groups, GemmType::MGroupedNoPad, a.second.size(-1) > 1);
+    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, num_groups, GemmType::MGroupedNoPad, a.second.size(-1) > 1);
     deep_gemm::w4fa8::execute_plan(plan, a.first, a.second, b.first, b.second, out, counts,
                                  GemmType::MGroupedNoPad, em, inv_scale);
 }
@@ -1772,8 +1776,8 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_masked(const std::pair<torch::Tensor,
     if (!m)
         return;
     const auto tile = configs ? deep_gemm::w4fa8::unpack_config(*configs)
-                              : deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::MGroupedMasked);
-    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, num_groups, GemmType::MGroupedMasked);
+                              : deep_gemm::w4fa8::get_best_configs(expected_m, n, k, num_groups, GemmType::MGroupedMasked, a.second.size(-1) > 1);
+    const auto plan = deep_gemm::w4fa8::resolve_config(tile, m, n, k, num_groups, GemmType::MGroupedMasked, a.second.size(-1) > 1);
     deep_gemm::w4fa8::execute_plan(plan, a.first, a.second, b.first, b.second, out, rows,
                                  GemmType::MGroupedMasked, expected_m, inv_scale);
 }
@@ -1791,7 +1795,7 @@ static void m_grouped_gemm_fp8_fp4_bf16_nt_fused(const std::pair<torch::Tensor, 
     TORCH_CHECK(rows.numel() == num_groups && aligned.numel() >= 1, "fused metadata shape mismatch");
     if (!m)
         return;
-    const auto plan = deep_gemm::w4fa8::resolve_config(deep_gemm::w4fa8::unpack_config(configs), out.size(0), n, k, num_groups, GemmType::MGroupedFused);
+    const auto plan = deep_gemm::w4fa8::resolve_config(deep_gemm::w4fa8::unpack_config(configs), out.size(0), n, k, num_groups, GemmType::MGroupedFused, a.second.size(-1) > 1);
     TORCH_CHECK(tokens.dim() == 2 && tokens.size(1) == std::get<1>(configs),
                 "sorted_token_ids routing BlockM must match W4FA8 configs");
     deep_gemm::w4fa8::execute_plan(plan, a.first, a.second, b.first, b.second, out, rows,
@@ -1988,6 +1992,7 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("activation_type") = std::nullopt);
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt, py::arg("lhs"), py::arg("rhs"), py::arg("out"),
           py::arg("configs") = std::nullopt, py::arg("inv_scale") = 1.0f);
+    m.def("dequantize_mxfp4_fp8", &deep_gemm::w4fa8::dequantize_mxfp4_fp8, py::arg("rhs"), py::arg("fp8_workspace"));
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"),py::arg("inv_scale")=1.0f);

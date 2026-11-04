@@ -31,12 +31,14 @@ using deep_gemm::GemmType;
 template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM, int WarpN, int WarpK, int kNumGroups,
           int kNumStages, GemmType kGemmType, int N_EXPAND = 1, bool ApplyInvScale = false,
           deep_gemm::w4fa8::FragmentPolicy Fragment = deep_gemm::w4fa8::FragmentPolicy::FullK,
-          deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk>
+          deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk,
+          bool GroupActivationScales = false>
 class W4A8GEMM_MMA {
 public:
   static constexpr bool WideM = deep_gemm::w4fa8::uses_ring_a(WarpM);
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool Compact = Fragment == deep_gemm::w4fa8::FragmentPolicy::RollingK32;
+  static_assert(!GroupActivationScales || (!WideM && !Compact && BlockK == 128));
   static constexpr int DecodeN = WideM ? 1 : WarpN / 16;
   // A narrow ring bounds live A operands for wide M tiles.
   static constexpr int ADistance = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2 ? 1 : -1;
@@ -58,7 +60,7 @@ public:
   // A fourth slot reduces CTA residency for the default N256 tile.
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
-  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
+  static constexpr bool CacheRowScale = !GroupActivationScales && N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
   // basic
   static constexpr bool E8M0_scale = true;
   static constexpr bool scale_use_ld_matrix = true;
@@ -632,7 +634,9 @@ public:
             } else
               scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
             const float a_scale = [&]() {
-              if constexpr (WideM)
+              if constexpr (GroupActivationScales)
+                return apply_inv_scale(1.f);
+              else if constexpr (WideM)
                 return apply_inv_scale(storage.row_scales[scale_buffer][local_row]);
               else
                 return CacheRowScale ? cached_row_scale(m, row) : apply_inv_scale(params.ptr_a_scale[scale_row]);
@@ -698,6 +702,13 @@ public:
             }
             cp_async_fence();
             current_stage = (current_stage + 1) % kNumStages;
+
+            auto accum_k = make_tensor_like(accum);
+            if constexpr (GroupActivationScales) clear(accum_k);
+            auto& mma_accum = [&]() -> auto& {
+              if constexpr (GroupActivationScales) return accum_k;
+              else return accum;
+            }();
 
             if constexpr (Compact) {
               for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto ki) {
@@ -795,10 +806,38 @@ public:
 #pragma unroll
                   for (int m_block = 0; m_block < UsedM; ++m_block) {
                     cute::gemm(tiled_mma, tCrA(_, m_block, k_block), tCrB(_, n_block, k_block),
-                               accum(_, m_block, n_block));
+                               mma_accum(_, m_block, n_block));
                   }
                 }
               });
+            }
+
+            if constexpr (GroupActivationScales) {
+              Tensor row_coords = thr_mma.partition_C(cD);
+              CUTE_UNROLL
+              for (int mb = 0; mb < UsedM; ++mb) {
+                CUTE_UNROLL
+                for (int row = 0; row < 2; ++row) {
+                  const int local_row = get<0>(row_coords(2 * row, mb, 0));
+                  const int valid_row = local_row < residual_m ? local_row : 0;
+                  const int64_t scale_row = [&]() -> int64_t {
+                    if constexpr (Fused)
+                      return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + valid_row];
+                    else
+                      return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + valid_row;
+                  }();
+                  const float scale = params.ptr_a_scale[scale_row * (K / 128) + k_tile_idx];
+                  CUTE_UNROLL
+                  for (int nb = 0; nb < size<2>(accum); ++nb) {
+                    CUTE_UNROLL
+                    for (int half = 0; half < 2; ++half) {
+                      const int v = 2 * row + 4 * half;
+                      accum(v, mb, nb) += accum_k(v, mb, nb) * scale;
+                      accum(v + 1, mb, nb) += accum_k(v + 1, mb, nb) * scale;
+                    }
+                  }
+                }
+              }
             }
 
             cp_async_wait<kNumStages - 2>();

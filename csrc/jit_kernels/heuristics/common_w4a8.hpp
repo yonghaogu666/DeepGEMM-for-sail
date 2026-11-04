@@ -27,6 +27,7 @@ enum class DecodeFencePolicy { Fenced, FenceFree };
 struct NativeKernelConfig {
     W4A8Config tile;
     FragmentPolicy fragment;
+    bool group_activation_scales = false;
 
     ALoadPolicy a_load() const { return uses_ring_a(tile.warp_m) ? ALoadPolicy::Ring2 : ALoadPolicy::Bulk; }
 };
@@ -358,6 +359,10 @@ static StreamedConfig default_streamed_config(int m, int n, int k, int groups, i
 
 static void check_native_kernel(const NativeKernelConfig& spec, int n, int k, int groups, GemmType kind) {
     const auto& c = spec.tile;
+    if (spec.group_activation_scales) {
+        TORCH_CHECK(!uses_ring_a(c.warp_m) && spec.fragment == FragmentPolicy::FullK,
+                    "group128 activations require a direct FullK tile with M <= 64");
+    }
     TORCH_CHECK(c.block_m == c.warp_m, "W4FA8 native tiles require block_m == warp_m");
     TORCH_CHECK(c.block_k == c.warp_k, "W4FA8 native tiles require block_k == warp_k");
     DG_HOST_ASSERT(groups > 0 && groups <= 1024 && c.num_sms > 0 && c.num_sms <= get_num_sms());
@@ -404,7 +409,16 @@ static NativeKernelConfig resolve_native_config(const W4A8Config& c, int n, int 
     return {c, rolling ? FragmentPolicy::RollingK32 : FragmentPolicy::FullK};
 }
 
-static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, GemmType kind) {
+static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, GemmType kind,
+                                  bool group_activation_scales = false) {
+    if (group_activation_scales) {
+        int bm = 16;
+        while (bm < expected_m && bm < 64) bm *= 2;
+        const int bn = n >= 256 ? 256 : n >= 128 ? 128 : 64;
+        W4A8Config c{get_num_sms(), bm, bn, 128, bm, 64, 128, 2, 1};
+        check_config(c, n, k, kind);
+        return c;
+    }
     const int em = expected_m;
     const int m = expected_m * groups;
     const auto base = get_default_tile(em, n, k, groups, kind);
@@ -420,7 +434,13 @@ static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, Gem
 }
 
 // Public configs contain only a tile; execution details stay internal.
-static ExecutionPlan resolve_config(const W4A8Config& tile, int m, int n, int k, int groups, GemmType kind) {
+static ExecutionPlan resolve_config(const W4A8Config& tile, int m, int n, int k, int groups, GemmType kind,
+                                    bool group_activation_scales = false) {
+    if (group_activation_scales) {
+        NativeKernelConfig kernel{tile, FragmentPolicy::FullK, true};
+        check_native_kernel(kernel, n, k, groups, kind);
+        return kernel;
+    }
     if (tile.block_m == w4fa8_streamed::kBlockM) {
         TORCH_CHECK(pack_config(tile) == W4A8ConfigTuple(tile.num_sms, w4fa8_streamed::kBlockM, 256, 128, 64, 64, 128, 4, 1),
                     "unsupported W4FA8 streamed tile");
