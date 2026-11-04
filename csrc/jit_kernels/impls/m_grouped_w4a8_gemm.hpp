@@ -49,12 +49,13 @@ public:
         GemmType kind;
         LaunchArgs launch_args;
         Arguments<Scheduler> params;
+        bool group_scale;
     };
     static std::string generate_impl(const Args& a) {
         const auto& c = a.config;
         return fmt::format(R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}{}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, {}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -65,8 +66,8 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 }}
 )", a.n, a.k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k,
             a.groups, c.num_stages, get_gemm_type_name(a.kind), c.n_expand,
-            a.params.inv_scale == 1.0f ? "" : ", true",
-            get_smem_size(c, a.k), get_num_threads(c), sizeof(Arguments<Scheduler>));
+            a.params.inv_scale != 1.0f, a.group_scale,
+            get_smem_size(c, a.k, a.group_scale), get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.params));
@@ -75,10 +76,10 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 
 template<class Scheduler>
 static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind, int expected_m,
-                   int topk, int32_t* m_rows, const Arguments<Scheduler>& params) {
+                   int topk, int32_t* m_rows, const Arguments<Scheduler>& params, bool group_scale) {
     using R = Runtime<Scheduler>;
-    const int threads = get_num_threads(c), smem = get_smem_size(c, k);
-    typename R::Args args{c, n, k, groups, kind, {dim3(c.num_sms), dim3(threads), smem}, params};
+    const int threads = get_num_threads(c), smem = get_smem_size(c, k, group_scale);
+    typename R::Args args{c, n, k, groups, kind, {dim3(c.num_sms), dim3(threads), smem}, params, group_scale};
     const auto& runtime = compiler->build("m_grouped_gemm_w4fa8_mma", R::generate(args));
     construct_launch_config(runtime->kernel, current_stream(), smem, args.launch_args.grid_dim, args.launch_args.block_dim);
     int blocks = 0;
@@ -115,12 +116,14 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
     TORCH_CHECK(std::isfinite(inv_scale) && inv_scale > 0, "inv_scale must be finite and positive");
     const int groups = b.size(0), n = b.size(1), k = a.size(-1);
     const int m = kind == GemmType::MGroupedMasked ? a.size(1) : a.size(0);
+    // K=128 has one group, so both scale formats share the per-row specialization.
+    const bool group_scale = a_scale.size(-1) > 1;
     check_config(c, n, k, kind);
     if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(),
             a_scale.data_ptr<float>(), m, inv_scale, token_ids.data_ptr<int32_t>(),
             {aligned_blocks.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>()}};
-        launch(c,m,n,k,groups,kind,expected_m,d.size(0)/m,rows.data_ptr<int32_t>(),params);
+        launch(c,m,n,k,groups,kind,expected_m,d.size(0)/m,rows.data_ptr<int32_t>(),params,group_scale);
     } else {
         torch::Tensor scratch;
         auto layout = rows.data_ptr<int32_t>();
@@ -138,7 +141,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
         }
         const Arguments<TileSchedulerArguments> params{a.data_ptr(),b.data_ptr(),scale.data_ptr(),d.data_ptr(),
             a_scale.data_ptr<float>(),0,inv_scale,nullptr,TileSchedulerArguments(static_cast<uint32_t>(m),layout)};
-        launch(c,m,n,k,groups,kind,expected_m,0,rows.data_ptr<int32_t>(),params);
+        launch(c,m,n,k,groups,kind,expected_m,0,rows.data_ptr<int32_t>(),params,group_scale);
     }
 }
 } // namespace deep_gemm::w4fa8

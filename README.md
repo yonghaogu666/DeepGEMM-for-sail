@@ -15,7 +15,7 @@ The PPU-oriented fork provides the following core capabilities and optimizations
 - **PPU runtime and JIT integration**: The runtime compilation path is adapted to the PPU SDK environment. Kernel compilation, compiler selection, debug output, and cache behavior are controlled through PPU-oriented JIT environment variables such as `DG_JIT_USE_HGRTC`.
 - **Supported precision modes**: The PPU version supports INT8, FP4, FP8, and BF16 across non-grouped GEMM and grouped GEMM layouts, covering both dense GEMM and MoE grouped GEMM scenarios.
 - **Standalone activation on M890**: SiLU and SiTU with BF16, per-row/per-block FP8, MXFP4, or MXFP8 output, including masked expert batches and explicit output-mode selection.
-- **W4A8 MoE on M890**: E4M3 per-row activations and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
+- **W4A8 MoE on M890**: E4M3 activations with per-row or group-128 scales and group-32 MXFP4 weights, with FP32 accumulation and BF16 output for nopad, masked, and fused routing layouts.
 - **A8W4 INT8 MoE**: INT8 per-token activations and portable packed signed-INT4 per-channel weights, with INT32 accumulation and BF16 output for nopad and masked grouped layouts on Zhenwu 610 / 610E / 810 / 810E (PPU001).
 - **Additional nopad grouped GEMM layout**: In addition to contiguous and masked grouped GEMM layouts, this fork introduces a nopad layout. It uses an index tensor to describe per-expert token counts, avoiding mandatory M-block padding for variable-token MoE workloads and reducing unnecessary data movement.
 - **AIU-oriented alignment requirements**: The PPU version replaces the original alignment assumptions with AIU-aligned scaling factors and AIU-aligned utility tensors, matching the data movement requirements described by this fork.
@@ -129,25 +129,34 @@ First call `deep_gemm.moe_align_block_size` with the LHS/RHS inputs and `topk_id
 - `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused`: fused MoE grouped GEMM with FP8 LHS/RHS (with scales) and BF16 output; supports both per-channel and blockwise quantization.
 - `deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused`: fused MoE grouped GEMM with INT8 LHS/RHS (with per-channel scales) and BF16 output.
 - `deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused`: fused MoE grouped GEMM with FP4 (mxfp4) LHS/RHS (with scales) and BF16 output. Note that this path expects the **LHS scale (SFA) in uint16 K-major layout**, that is a plain contiguous `(num_token, ceil_div(k // 32, 2))` uint16 tensor, rather than the uint16 M-major layout produced by `preprocess_mxfp4_scales` that the masked/nopad/dense FP4 interfaces expect; the RHS scale (SFB) stays MN-major. To build it, pad the `ceil_div(k, 32)` uint8 E8M0 scales to an even count along K and then view them as uint16; passing a `preprocess_mxfp4_scales` output as SFA here will fail the contiguity assertion. When `out_scale` is provided to `m_grouped_gemm_fp4_fp4_bf16_nt_fused`, also pass `enable_act_and_quant_fusing=True` to `moe_align_block_size`, so that its auto-selected config satisfies the fused epilogue requirements.
-- `deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused`: fused routing gather with per-row E4M3 activations, group-32 MXFP4 weights, and BF16 output on M890.
+- `deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused`: fused routing gather with per-row or group-128 E4M3 activations, group-32 MXFP4 weights, and BF16 output on M890.
 - `deep_gemm.m_grouped_gemm_w4a16_fused`: fused MoE grouped GEMM with 4-bit group-quantized weights and BF16 activation (W4A16), producing BF16 output.
 
 For more information, please refer to the `moe_align_block_size` and `m_grouped_gemm_*_nt_fused` function documentation.
 
 #### W4A8 MoE GEMMs (M890)
 
-The W4A8 implementation accepts per-row E4M3 activations and group-32
+The W4A8 implementation accepts E4M3 activations with per-row or group-128 scales and group-32
 MXFP4 E2M1 weights.
 The kernel dequantizes weights to E5M2 using FP4 MMA, performs E4M3 x E5M2
 MMA, accumulates in FP32, and writes BF16. It supports these expert layouts:
 
-| API | Activation / row-scale shape | Output shape |
+| API | Activation / scale shape | Output shape |
 | :--- | :--- | :--- |
-| `m_grouped_gemm_fp8_fp4_bf16_nt_nopad` | `[M,K]` / `[M,1]`, grouped by expert | `[M,N]` |
-| `m_grouped_gemm_fp8_fp4_bf16_nt_masked` | `[E,T,K]` / `[E,T,1]` | `[E,T,N]`, valid rows only |
-| `m_grouped_gemm_fp8_fp4_bf16_nt_fused` | `[num_token,K]` / `[num_token,1]`, original token order | `[num_token*topk,N]`, grouped by expert |
+| `m_grouped_gemm_fp8_fp4_bf16_nt_nopad` | `[M,K]` / `[M,1]` or `[M,K/128]`, grouped by expert | `[M,N]` |
+| `m_grouped_gemm_fp8_fp4_bf16_nt_masked` | `[E,T,K]` / `[E,T,1]` or `[E,T,K/128]` | `[E,T,N]`, valid rows only |
+| `m_grouped_gemm_fp8_fp4_bf16_nt_fused` | `[num_token,K]` / `[num_token,1]` or `[num_token,K/128]`, original token order | `[num_token*topk,N]`, grouped by expert |
 
-Activation scales are FP32. Weights are naturally packed uint8 `[E,N,K/2]`
+Activation scales are FP32, with their shape selecting per-row or group-128
+quantization. Group-128 scales apply to consecutive blocks of 128 K elements;
+the kernel scales each K128 partial sum before accumulating the result.
+Scales must be contiguous in the layouts above. In particular, call `.contiguous()`
+on the M-major scales returned by masked `activation_and_mul_masked` with
+`QuantMode.FP8_BLOCK` before passing them to W4A8. When K is 128, both scale
+formats have one scale per row and use the same kernel.
+Group-128 kernels stage scales with activations and use N16 partial sums for M64.
+Fused GEMM can use the config returned by `moe_align_block_size` directly.
+Weights are naturally packed uint8 `[E,N,K/2]`
 (even K elements in the low nibble), with raw uint8 E8M0 scales
 `[E,N,K/32]`. `N % 64 == 0` and `K % 128 == 0` are required; arbitrary
 N/K padding is not performed. GEMM operands and metadata must be contiguous
@@ -161,6 +170,8 @@ It applies a common power-of-two shift to bring weight-scale exponents into
 spanning more than 26, are rejected. The returned inverse must be applied
 exactly once per GEMM. Either fold it into the activation row scales or pass
 it as the optional scalar `inv_scale` to any of the three W4FA8 GEMM APIs.
+For group-128 activations, folding the inverse means multiplying every group
+scale by `weight_inv_scale`; the optional GEMM scalar works with either format.
 `inv_scale` must be finite and positive; its default value of `1.0` skips
 the extra multiplication. The E4M3 codes remain unchanged:
 
@@ -194,6 +205,68 @@ an explicit config tuple is supplied. The fused config comes from
 `moe_align_block_size`. Configuration selection remains internal to the
 C++ runtime.
 Run `python tests/test_w4a8.py` for correctness coverage.
+
+For large expert batches, expand the entire weight once per call and use the
+existing blockwise FP8 GEMM. Initialize the copy layout with
+`PreprocessMode.W4A8_MXFP4_FP8`, which returns
+`(packed_uint8, scale_indices_uint8, fp8_block_scales_fp32)`. Inputs are checkpoint
+uint8 `[E,N,K/2]` weights and raw E8M0 `[E,N,K/32]` scales. This mode requires
+N/K divisible by 128 and exponent codes in `[1,254]`. It keeps the natural packed
+weight shared with the fused MMA path and normalizes each N128 x K128 block with
+a power-of-two restoring scale. Preparation does not allocate an FP8 weight tensor;
+noncontiguous or unaligned weights are copied to an aligned contiguous buffer.
+
+Allocate an E4M3 workspace `[E,N,K]` outside the timed call. Each
+`dequantize_mxfp4_fp8` invocation overwrites it using the current prepared
+weights/scales, on the current stream. The API supports CUDA Graph capture and
+also accepts dense `[N,K]` output with the expert dimension removed from its
+prepared inputs. It retains no cross-call FP8 cache. Its normalized scale indices
+are distinct from the `W4A8_MXFP4_MMA` scale layout; use the corresponding prepared
+scale tensor for each path.
+
+```python
+import torch
+
+copy_weight, copy_scale, fp8_weight_scale = dg.preprocess_weights_and_scales(
+    dg.PreprocessMode.W4A8_MXFP4_FP8, False, packed_weight, raw_weight_scale)
+fp8_weight = torch.empty((E, N, K), device=a_e4m3.device,
+                         dtype=torch.float8_e4m3fn)
+# Prepare the column-major FP32 A scales outside the GEMM call.
+fp8_a_scale = dg.get_mn_major_tma_aligned_tensor(group128_a_scale)
+
+# Prefill call: include both operations when measuring its total latency.
+dg.dequantize_mxfp4_fp8((copy_weight, copy_scale), fp8_weight)
+dg.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(
+    (a_e4m3, fp8_a_scale), (fp8_weight, fp8_weight_scale), out, m_indices, m_rows)
+```
+
+The same decoded weight pair works with the existing masked FP8 GEMM and fused
+routing API. Activations use the FP8 API's K128 scale layout; a per-row scale can
+be repeated across K128 groups before layout conversion. Weight expansion rounds
+to E4M3 and may underflow small K32 groups in blocks with a large scale spread.
+Unlike the MMA path, the returned FP32 block scales restore the weight directly;
+no scalar `weight_inv_scale` is applied. The extra workspace is `E*N*K` bytes.
+Run `python -m pytest tests/test_mxfp4_prefill.py -q -s` for conversion, grouped
+GEMM, invalid-operand and changed-weight Graph replay coverage.
+
+Choose between fused decoding and per-call FP8 expansion using the local expert
+row distribution. With `block_m == warp_m`, each active expert's weight tile is
+decoded `ceil(expert_rows / block_m)` times. Expansion processes every prepared
+expert once; compare its total `expand_time + fp8_gemm_time` with fused decoding.
+Choose the path before a call or Graph capture, using available routing metadata.
+
+MiMo EP8 measurements on ZW-M890P/SDK 2.2 (48 local experts, top-k 8) favor fused
+decoding through 1024 tokens/rank, expansion from around 1280 for GEMM1
+(N4096/K6144), and expansion from 2048 for GEMM2 (N6144/K2048). These synthetic
+balanced/random profiles guide caller-side selection; execution-path dispatch
+is not automatic. Recheck other shapes, EP sizes and routing distributions.
+
+Long-K group128 M32 kernels select an M16/M32 compute body before the K loop to
+skip unused tail rows while reusing decoded weights. The nopad heuristic uses
+M32 for MiMo EP8 GEMM1 when `ceil(local_rows / 48) == 16`; explicit configs
+override it. Smaller batches and GEMM2 retain the existing defaults because
+partial expert activation can favor M16. Balanced 16/32/64-token profiles already
+decode each active expert's weights once.
 
 For standard MXFP4 GEMM weights, use
 `preprocess_weights_and_scales(PreprocessMode.MXFP4, False, weight, weight_scale)`.

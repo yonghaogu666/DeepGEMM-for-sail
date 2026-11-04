@@ -31,14 +31,13 @@ template <int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
-          int N_EXPAND = 1, bool ApplyInvScale = false>
+          int N_EXPAND = 1, bool ApplyInvScale = false, bool GroupScale = false>
 class W4A8GEMM_MMA {
 public:
   static_assert(N_EXPAND >= 1 && N_EXPAND <= 4);
   static_assert(N_EXPAND == 1 || (kGemmType == GemmType::MGroupedNoPad && kNumStages == 2 && BlockK == WarpK));
   static_assert(N_EXPAND == 1 || ShapeN % (BlockN * N_EXPAND) == 0);
   using ElementA = cutlass::float_e4m3_t;
-  using ElementB = cutlass::float4_t; // fp4
   using ElementD = cutlass::bfloat16_t;
   using ElementAcc = float;
   using ElementScale = uint8_t; // e8m0 scale
@@ -46,23 +45,19 @@ public:
   // A fourth slot reduces CTA residency for the default N256 tile.
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
-  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
+  static constexpr bool CacheRowScale = !GroupScale && N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
+  static_assert(!GroupScale || BlockK == 128, "activation scale groups must match K128 tiles");
+  static constexpr bool StreamGroupN = GroupScale && WarpM == 64;
+  static constexpr int ScaleABytes = GroupScale ? ((BlockM * kNumStages * sizeof(float) + 127) / 128) * 128 : 0;
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   // A packed K64 slice feeds two K32 MMA steps for every M tile and grouped kind.
   static constexpr bool BatchDequant = WarpN == 64 && WarpK == 128;
-  static constexpr bool E8M0_scale = true;
-  static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
   static constexpr int K2 = K / 2;
   static constexpr int L = kNumGroups;
   static constexpr int BlockK2 = BlockK / 2;
-  static constexpr int WarpK2 = WarpK / 2;
-  static constexpr int kGroupSize = 32;
-  static constexpr int GroupsPerBlock = BlockK / kGroupSize;
-  static constexpr int GroupsPerWarp = WarpK / kGroupSize;
-  static constexpr int MmaPerGroup = kGroupSize / 16;
   using TileShape = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
   static constexpr int N_Blocks = deep_gemm::math::ceil_div(ShapeN, BlockN * N_EXPAND);
   static constexpr int scheduler_swizzle = (BlockM == 16) ? 1: 2;
@@ -143,24 +138,13 @@ public:
   struct SharedStorage {
     union {
       struct {
-        cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+        cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA> + ScaleABytes> smem_a;
         cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutB>> smem_b;
         cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScale>> smem_scale;
       }; // mainloop
       cute::array_aligned<ElementAcc, cute::cosize_v<SmemLayoutReduce>> smem_reduce; // epilogue cta reduce
     };
   };
-
-  struct NormalArguments {
-    int* block_m_info;
-  };
-  struct FusedArguments {
-    const int* expert_ids_and_cumsum;
-    const int* sorted_token_ids;
-    const int* aligned_num_m_blocks;
-    int topk;
-  };
-  using Arguments = cute::conditional_t<Fused, FusedArguments, NormalArguments>;
 
   struct Params {
     const ElementA* ptr_a;
@@ -172,11 +156,9 @@ public:
     float inv_scale;
     const int* sorted_token_ids;
     typename TileScheduler::Params scheduler;
-
-
   };
 
-  // for constexpr patial initialize
+  // Placeholder for compile-time branches without a tensor.
   struct NoTensor {};
 
   // Each column permutation gathers four consecutive K values into one lane.
@@ -198,26 +180,18 @@ public:
     return id;
   }
 
-  template<int mode=0, typename Tensor>
+  // Interleave each K warp's contiguous K32 slices in the staged A layout.
+  template<typename Tensor>
   CUTLASS_DEVICE constexpr
-  auto reshape_warpk(Tensor& t) {
-    static_assert(mode == 0 || mode == 1);
-    if constexpr(mode == 0) { // sB: (k_tiles, ..., stage), sScale: (k_tiles / MmaPerGroup, ..., stage)
-      constexpr int k = decltype(size<mode>(t))::value;
-      constexpr int ko = k / WarpsOnK;
-      auto atom_tiler = make_layout(make_shape(Int<WarpsOnK>{}, Int<ko>{}), make_stride(Int<ko>{}, _1{}));
-      auto tiler = make_shape(atom_tiler, size<1>(t));
-      return flat_divide(t, tiler)(_,_,0,0,_);
-    } else { // sA: (..., blockk, stage) where blockk = 32 * k_tiles.
-      constexpr int k = BlockK / 32;
-      constexpr int ko = k / WarpsOnK;
-      auto atom_tiler = make_layout(
-        make_shape(_32{}, make_shape(Int<WarpsOnK>{}, Int<ko>{})),
-        make_stride(_1{}, make_stride(Int<ko * 32>{}, _32{}))
-      );
-      auto tiler = make_shape(size<0>(t), atom_tiler);
-      return flat_divide(t, tiler)(_,_,0,0,_);
-    }
+  auto reshape_warpk_a(Tensor& t) {
+    constexpr int k = BlockK / 32;
+    constexpr int ko = k / WarpsOnK;
+    auto atom_tiler = make_layout(
+      make_shape(_32{}, make_shape(Int<WarpsOnK>{}, Int<ko>{})),
+      make_stride(_1{}, make_stride(Int<ko * 32>{}, _32{}))
+    );
+    auto tiler = make_shape(size<0>(t), atom_tiler);
+    return flat_divide(t, tiler)(_,_,0,0,_);
   }
 
   CUTLASS_DEVICE
@@ -266,23 +240,27 @@ public:
     Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));
     Tensor tCrB = make_tensor<typename TiledMma::FrgTypeB>(partition_shape_B(tiled_mma, take<1,3>(TileShape{})));
     Tensor accum = partition_fragment_C(tiled_mma, take<0,2>(TileShape{}));
+    // Promote a single N16 partial tile for M64 to retain weight-decode reuse
+    // without a second full M64/N64 accumulator. Smaller M warps keep N64.
+    auto group_accum = [&]() {
+      if constexpr (GroupScale) {
+        if constexpr (StreamGroupN) return make_tensor_like(accum(_, _, 0));
+        else return make_tensor_like(accum);
+      } else return NoTensor{};
+    }();
+    auto& mma_accum = [&]() -> auto& {
+      if constexpr (GroupScale) return group_accum;
+      else return accum;
+    }();
 
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
     auto [smem_thr_copy_A, tCsA] = [&]() {
-      if constexpr(Fused) {
-        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
-        auto mix_sA = make_mix_tensor_like(sA);
-        auto sA_r2s = reshape_warpk<1>(mix_sA);
-        auto tCsA = smem_thr_copy_A.partition_S(sA_r2s);
-        return cute::make_tuple(smem_thr_copy_A, tCsA);
-      } else {
-        smem_tiled_copy_A.smem_base_ = storage.smem_a.data();
-        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
-        auto mix_sA = make_mix_tensor_like(sA);
-        auto sA_r2s = reshape_warpk<1>(mix_sA);
-        auto tCsA = smem_thr_copy_A.partition_S(sA_r2s);
-        return cute::make_tuple(smem_thr_copy_A, tCsA);
-      }
+      if constexpr (!Fused) smem_tiled_copy_A.smem_base_ = storage.smem_a.data();
+      auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(warp_idx * 32);
+      auto mix_sA = make_mix_tensor_like(sA);
+      auto sA_r2s = reshape_warpk_a(mix_sA);
+      auto tCsA = smem_thr_copy_A.partition_S(sA_r2s);
+      return cute::make_tuple(smem_thr_copy_A, tCsA);
     }();
     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);
     constexpr int K_BLOCK_MAX = size<2>(tCrA_copy_view);
@@ -294,11 +272,7 @@ public:
     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(fp4_tCrB);
 
     int thread_idx_nk = (warpn_idx * WarpsOnK + warpk_idx) * NumThreadsPerWarp;
-    if constexpr(not scale_use_ld_matrix) {
-      thread_idx_nk += lane_idx;
-    } else {
-      thread_idx_nk += lane_idx * 4; // thread0-7 get the row address
-    }
+    thread_idx_nk += lane_idx * 4; // Lanes 0..7 supply matrix-load row addresses.
     SmemTiledCopyScale smem_tiled_copy_scale;
     auto smem_thr_copy_scale = smem_tiled_copy_scale.get_thread_slice(thread_idx_nk);
     Tensor tCsS = smem_thr_copy_scale.partition_S(sScale);
@@ -353,6 +327,27 @@ public:
         }
       }();
 
+      auto activation_scale_row = [&](int local_row) -> int64_t {
+        if constexpr (Fused)
+          return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
+        else
+          return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+      };
+      // Stage activation scales with A, then broadcast each row through shared
+      // memory to all N warps instead of issuing dependent global loads after MMA.
+      auto smem_a_scales = reinterpret_cast<float*>(storage.smem_a.data() + cute::cosize_v<SmemLayoutA>);
+      auto g2s_copy_a_scale = [&](int k_tile_iter, int k_pipe) {
+        if constexpr (GroupScale) {
+          for (int row = thread_idx; row < BlockM; row += MaxThreadsPerBlock) {
+            const bool valid = row < residual_m;
+            const int64_t scale_row = activation_scale_row(valid ? row : 0);
+            cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(
+                params.ptr_a_scale[scale_row * (K / 128) + k_tile_iter],
+                smem_a_scales[k_pipe * BlockM + row], valid);
+          }
+        }
+      };
+
       auto g2s_copy_A = [&](int k_tile_iter, int k_pipe) {
         if constexpr(!Fused) { // aiu copy
           if (warp_idx == 0) {
@@ -383,6 +378,7 @@ public:
             ++a_tiles_loaded;
           }
         } else g2s_copy_A(k_tile_iter, k_pipe);
+        g2s_copy_a_scale(k_tile_iter, k_pipe);
         g2s_copy_B_and_scale(k_tile_iter, k_pipe);
       };
 
@@ -392,16 +388,12 @@ public:
 
       auto s2r_copy_B_and_scale = [&](int stage_idx) {
         copy(smem_tiled_copy_B, tCsB(_,_,_,stage_idx), tCrB_copy_view(_,_,_));
-        if constexpr(not scale_use_ld_matrix) {
-          copy(smem_tiled_copy_scale, tCsS(_,_,_,stage_idx), tCrS_copy_view(_,_,_));
-        } else {
-          #pragma unroll
-          for (int fp4_k_block = 0; fp4_k_block < size<2>(tCsS); fp4_k_block++) {
-            uint32_t d;
-            uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
-            asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
-            tCrS(0,0,fp4_k_block) = d;
-          }
+        #pragma unroll
+        for (int fp4_k_block = 0; fp4_k_block < size<2>(tCsS); fp4_k_block++) {
+          uint32_t d;
+          uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
+          asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
+          tCrS(0,0,fp4_k_block) = d;
         }
       };
 
@@ -409,16 +401,10 @@ public:
       // avoid retaining both packed slices alongside the converted B fragment.
       auto s2r_copy_B_and_scale_slice = [&](int stage_idx, int fp4_k_block) {
         copy(smem_tiled_copy_B, tCsB(_,_,fp4_k_block,stage_idx), tCrB_copy_view(_,_,fp4_k_block));
-        if constexpr(not scale_use_ld_matrix) {
-          copy(smem_tiled_copy_scale, tCsS(_,_,fp4_k_block,stage_idx), tCrS_copy_view(_,_,fp4_k_block));
-        } else {
-          {
-            uint32_t d;
-            uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
-            asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
-            tCrS(0,0,fp4_k_block) = d;
-          }
-        }
+        uint32_t d;
+        uint32_t addr = cute::cast_smem_ptr_to_uint(cute::raw_pointer_cast(tCsS(_,_,fp4_k_block,stage_idx).data()));
+        asm volatile("ppu.tc02.ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];" : "=r"(d) : "r"(addr));
+        tCrS(0,0,fp4_k_block) = d;
       };
 
       auto fp4_mma_dequant = [&](int n_block, int k_block) {
@@ -503,6 +489,35 @@ public:
         if constexpr (ApplyInvScale) return scale * params.inv_scale;
         else return scale;
       };
+      auto accumulate_group = [&](int stage_idx, int n_block, auto active_m) {
+        if constexpr (GroupScale) {
+          Tensor row_coords = thr_mma.partition_C(cD);
+          CUTE_UNROLL
+          for (int m = 0; m < decltype(active_m)::value; ++m) {
+            CUTE_UNROLL
+            for (int row = 0; row < 2; ++row) {
+              const int local_row = get<0>(row_coords(2 * row, m, 0));
+              // Staged invalid-row scales are zero; only the epilogue predicates stores.
+              const float scale = smem_a_scales[stage_idx * BlockM + local_row];
+              CUTE_UNROLL
+              for (int n = 0; n < (StreamGroupN ? 1 : size<2>(accum)); ++n) {
+                const int dst_n = StreamGroupN ? n_block : n;
+                CUTE_UNROLL
+                for (int col_half = 0; col_half < 2; ++col_half) {
+                  const int v = 2 * row + 4 * col_half;
+                  if constexpr (StreamGroupN) {
+                    accum(v, m, dst_n) += group_accum(v, m) * scale;
+                    accum(v + 1, m, dst_n) += group_accum(v + 1, m) * scale;
+                  } else {
+                    accum(v, m, dst_n) += group_accum(v, m, n) * scale;
+                    accum(v + 1, m, dst_n) += group_accum(v + 1, m, n) * scale;
+                  }
+                }
+              }
+            }
+          }
+        }
+      };
       // Reuse each lane's row scales across all N_EXPAND outputs of this work item.
       auto cached_row_scale = make_tensor<float>(make_shape(size<1>(accum), Int<2>{}));
       // Borrow the last A stage until the prologue has loaded row scales into registers.
@@ -550,12 +565,11 @@ public:
           for (int row = 0; row < 2; ++row) {
             const int local_row = get<0>(tDcD(2 * row, m, 0));
             if (local_row >= residual_m) continue;
-            int64_t scale_row;
-            if constexpr (Fused)
-              scale_row = params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
-            else
-              scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
-            const float a_scale = CacheRowScale ? cached_row_scale(m, row) : apply_inv_scale(params.ptr_a_scale[scale_row]);
+            const float a_scale = [&]() {
+              if constexpr (GroupScale) return apply_inv_scale(1.0f);
+              else if constexpr (CacheRowScale) return cached_row_scale(m, row);
+              else return apply_inv_scale(params.ptr_a_scale[activation_scale_row(local_row)]);
+            }();
             CUTLASS_PRAGMA_UNROLL
             for (int n = 0; n < size<2>(accum); ++n) {
               CUTLASS_PRAGMA_UNROLL
@@ -592,89 +606,132 @@ public:
       load_cached_row_scale();
       if constexpr (CacheRowScale) __syncthreads();
 
-      #pragma unroll
-      for (int n_iter = 0; n_iter < N_EXPAND; n_iter++) {
-        clear(accum);
-        auto process_k_tile_iteration = [&](int k_tile_idx) {
-          int stage_idx = (k_tile_idx + n_iter * k_tile_count) % kNumStages;
-          int next_k_tile_idx = k_tile_idx + kNumStages - 1;
-          if constexpr(N_EXPAND > 1) {
-            if (next_k_tile_idx == k_tile_count) {
-              tBgB.data() = tBgB.data() + BlockN * K2;
-              tSgS.data() = tSgS.data() + BlockN * K / 32;
+      // Select the number of valid M16 atoms once per work item. Keeping this
+      // branch outside K lets a M32 tile reuse decoded B without per-MMA guards.
+      // Short-K/N_EXPAND paths retain their existing compact mainloop.
+      auto execute_m_tiles = [&](auto active_m) {
+        #pragma unroll
+        for (int n_iter = 0; n_iter < N_EXPAND; n_iter++) {
+          clear(accum);
+          auto process_k_tile_iteration = [&](int k_tile_idx) {
+            int stage_idx = (k_tile_idx + n_iter * k_tile_count) % kNumStages;
+            int next_k_tile_idx = k_tile_idx + kNumStages - 1;
+            if constexpr(N_EXPAND > 1) {
+              if (next_k_tile_idx == k_tile_count) {
+                tBgB.data() = tBgB.data() + BlockN * K2;
+                tSgS.data() = tSgS.data() + BlockN * K / 32;
+              }
+              if (next_k_tile_idx < k_tile_count || n_iter < N_EXPAND - 1) {
+                g2s(next_k_tile_idx % k_tile_count, current_stage);
+              }
+            } else {
+              if (next_k_tile_idx < k_tile_count) {
+                g2s(next_k_tile_idx, current_stage);
+              }
             }
-            if (next_k_tile_idx < k_tile_count || n_iter < N_EXPAND - 1) {
-              g2s(next_k_tile_idx % k_tile_count, current_stage);
+            cp_async_fence();
+            current_stage = (current_stage + 1) % kNumStages;
+
+            if constexpr (StreamGroupN) {
+              CUTE_UNROLL
+              for (int n_block = 0; n_block < 4; ++n_block) {
+                clear(group_accum);
+                if constexpr (!BatchDequant) s2r_copy_B_and_scale(stage_idx);
+                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block_ic) {
+                  constexpr int k_block = decltype(k_block_ic)::value;
+                  if constexpr (BatchDequant && k_block % 2 == 0)
+                    s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
+                  s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
+                  CUTE_UNROLL
+                  for (int half = 0; half < 2; ++half) {
+                    auto dequant_accum = fp4_accum(_, n_block);
+                    clear(dequant_accum);
+                    fp4_mma_dequant(n_block, 2 * k_block + half);
+                    quant_fp32C_to_e5m2B(n_block, k_block, half);
+                  }
+                  CUTE_UNROLL
+                  for (int m_block = 0; m_block < decltype(active_m)::value; ++m_block) {
+                    cute::gemm(tiled_mma, tCrA(_, m_block, k_block), tCrB(_, n_block, k_block), group_accum(_, m_block));
+                  }
+                });
+                accumulate_group(stage_idx, n_block, active_m);
+              }
+            } else {
+              if constexpr (GroupScale) clear(group_accum);
+              if constexpr (!BatchDequant) s2r_copy_B_and_scale(stage_idx);
+              for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block_ic) {
+                constexpr int k_block = decltype(k_block_ic)::value;
+                if constexpr (BatchDequant && k_block % 2 == 0)
+                  s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
+                s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
+
+                #pragma unroll
+                for (int n_block = 0; n_block < 4; n_block++) {
+                  CUTE_UNROLL
+                  for (int half = 0; half < 2; ++half) {
+                    auto dequant_accum = fp4_accum(_, n_block);
+                    clear(dequant_accum);
+                    fp4_mma_dequant(n_block, 2*k_block + half);
+                    quant_fp32C_to_e5m2B(n_block, k_block, half);
+                  }
+
+                  if constexpr (!BatchDequant) {
+                    #pragma unroll
+                    for (int m_block = 0; m_block < decltype(active_m)::value; m_block++) {
+                      cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), mma_accum(_,m_block,n_block));
+                    }
+                  }
+                }
+                if constexpr (BatchDequant) {
+                  // Convert the whole warp N tile before consuming it, giving the
+                  // compiler independent FP4 operations to hide conversion latency.
+                  #pragma unroll
+                  for (int n_block = 0; n_block < 4; ++n_block) {
+                    #pragma unroll
+                    for (int m_block = 0; m_block < decltype(active_m)::value; ++m_block) {
+                      cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), mma_accum(_,m_block,n_block));
+                    }
+                  }
+                }
+              });
+              if constexpr (GroupScale) accumulate_group(stage_idx, 0, active_m);
+            }
+            cp_async_wait<kNumStages - 2>();
+            __syncthreads();
+          };
+
+          if constexpr(k_tile_count <= 4) {
+            #pragma unroll
+            for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
+              process_k_tile_iteration(k_tile_idx);
+            }
+          } else if constexpr (GroupScale) {
+            // Keep one copy of the larger blockwise mainloop in the instruction cache.
+            #pragma unroll 1
+            for (int k_tile_idx = 0; k_tile_idx < k_tile_count; ++k_tile_idx) {
+              process_k_tile_iteration(k_tile_idx);
             }
           } else {
-            if (next_k_tile_idx < k_tile_count) {
-              g2s(next_k_tile_idx, current_stage);
+            process_k_tile_iteration(0);
+            #pragma unroll 1
+            for (int k_tile_idx = 1; k_tile_idx < k_tile_count; k_tile_idx++) {
+              process_k_tile_iteration(k_tile_idx);
             }
           }
-          cp_async_fence();
-          current_stage = (current_stage + 1) % kNumStages;
 
-          if constexpr (!BatchDequant) s2r_copy_B_and_scale(stage_idx);
-
-          for_each(make_int_sequence<K_BLOCK_MAX >{}, [&] (auto k_block_ic) {
-            constexpr int k_block = decltype(k_block_ic)::value;
-            if constexpr (BatchDequant && k_block % 2 == 0)
-              s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
-            s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
-
-            #pragma unroll
-            for (int n_block = 0; n_block < 4; n_block++) {
-              CUTE_UNROLL
-              for (int half = 0; half < 2; ++half) {
-                auto dequant_accum = fp4_accum(_, n_block);
-                clear(dequant_accum);
-                fp4_mma_dequant(n_block, 2*k_block + half);
-                quant_fp32C_to_e5m2B(n_block, k_block, half);
-              }
-
-              if constexpr (!BatchDequant) {
-                #pragma unroll
-                for (int m_block = 0; m_block < size<1>(accum); m_block++) {
-                  cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
-                }
-              }
-            }
-            if constexpr (BatchDequant) {
-              // Convert the whole warp N tile before consuming it, giving the
-              // compiler independent FP4 operations to hide conversion latency.
-              #pragma unroll
-              for (int n_block = 0; n_block < 4; ++n_block) {
-                #pragma unroll
-                for (int m_block = 0; m_block < size<1>(accum); ++m_block) {
-                  cute::gemm(tiled_mma, tCrA(_,m_block,k_block), tCrB(_,n_block,k_block), accum(_,m_block,n_block));
-                }
-              }
-            }
-          });
-
-          cp_async_wait<kNumStages - 2>();
-          __syncthreads();
-        };
-
-        if constexpr(k_tile_count <= 4) {
-          #pragma unroll
-          for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
-            process_k_tile_iteration(k_tile_idx);
+          if (n_iter > 0) {
+            n_block_idx++;
+            gD.data() = gD.data() + BlockN;
           }
-        } else {
-          process_k_tile_iteration(0);
-          #pragma unroll 1
-          for (int k_tile_idx = 1; k_tile_idx < k_tile_count; k_tile_idx++) {
-            process_k_tile_iteration(k_tile_idx);
-          }
+          epilogue_cta_reduce();
+          epilogue_no_tsm();
         }
-
-        if (n_iter > 0) {
-          n_block_idx++;
-          gD.data() = gD.data() + BlockN;
-        }
-        epilogue_cta_reduce();
-        epilogue_no_tsm();
+      };
+      if constexpr (GroupScale && WarpM == 32 && WarpsOnM == 1 && N_EXPAND == 1 && ShapeK > 512) {
+        if (residual_m <= 16) execute_m_tiles(Int<1>{});
+        else execute_m_tiles(Int<2>{});
+      } else {
+        execute_m_tiles(Int<size<1>(accum)>{});
       }
     }
   }

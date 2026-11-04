@@ -43,25 +43,36 @@ static void check_config(const W4A8Config& c, int n, int k, GemmType kind) {
     DG_HOST_ASSERT(get_num_threads(c) <= 1024);
 }
 
-static int get_smem_size(const W4A8Config& c, int k) {
+static int get_smem_size(const W4A8Config& c, int k, bool group_scale = false) {
     const bool resident_a = c.n_expand > 1 && c.warp_m == 64 && k <= 384;
     const int a_slots = resident_a ? std::max(c.num_stages, k / c.block_k) : c.num_stages;
     const int mainloop = c.block_m*c.block_k*a_slots +
-                        (c.block_n*c.block_k/2 + c.block_n*c.block_k/32)*c.num_stages;
+                        (c.block_n*c.block_k/2 + c.block_n*c.block_k/32)*c.num_stages +
+                        (group_scale ? ((c.block_m*c.num_stages*int(sizeof(float))+127)/128)*128 : 0);
     const int reduction = 16*64*(c.block_n/64)*(c.block_k/c.warp_k)*4;
     return std::max(mainloop, reduction);
 }
 
 // Bound M before rounding so even a large tuning hint cannot overflow.
-static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, GemmType kind) {
+static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, GemmType kind,
+                                 bool group_scale = false) {
     DG_HOST_ASSERT(expected_m >= 0 && groups > 0 && n > 0 && n % 64 == 0 && k > 0);
     DG_HOST_ASSERT(kind == GemmType::MGroupedFused || kind == GemmType::MGroupedNoPad || kind == GemmType::MGroupedMasked);
     int bm = 16;
+    // M64 blockwise kernels promote N16 partials, retaining weight-decode reuse.
     while (bm < expected_m && bm < 64) bm *= 2;
+    // MiMo EP8 GEMM1: the long-K M32 kernel specializes tails to one M16
+    // atom outside K. It avoids a second weight decode for routing tails while
+    // reducing the small-batch latency of the measured N4096/K6144 profile.
+    // Restrict the promotion to the M16 boundary. At lower mean counts,
+    // sparse active-expert sets can favor M16 even for this long-K profile.
+    if (group_scale && kind == GemmType::MGroupedNoPad && groups == 48 &&
+        n == 4096 && k == 6144 && expected_m == 16)
+        bm = 32;
     const int bn = n >= 256 ? 256 : n >= 128 ? 128 : 64;
     // M32/N256 has enough shared memory for three stages at four CTAs/SM
     // (64,512 bytes per CTA). M16 and M64 lose residency with a third stage.
-    const int stages = kind == GemmType::MGroupedMasked && bm == 32 && bn == 256 ? 3 : 2;
+    const int stages = !group_scale && kind == GemmType::MGroupedMasked && bm == 32 && bn == 256 ? 3 : 2;
     W4A8Config c{get_num_sms(),bm,bn,128,bm,64,128,stages,1};
     if (kind == GemmType::MGroupedNoPad and k <= 512 and k % c.block_k == 0 and
         c.num_stages == 2 and c.block_k == c.warp_k) {

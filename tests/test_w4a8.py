@@ -463,6 +463,192 @@ def test_masked_shifted_scale():
     print('PASS masked shifted scale and per-expert rows')
 
 
+def _group128_weight(groups, n, k):
+    packed = torch.randint(256, (groups, n, k // 2), device='cuda', dtype=torch.uint8)
+    raw = (109 + torch.arange(groups * n * (k // 32), device='cuda') % 16).byte()
+    raw = raw.reshape(groups, n, k // 32)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw)
+    assert rhs[2] == .03125
+    return rhs, decode_weight(packed, raw)
+
+
+def _group128_basis(rows, k):
+    columns = (torch.arange(rows, device='cuda') * 97 + 31) % k
+    a = torch.zeros(rows, k, device='cuda')
+    a[torch.arange(rows, device='cuda'), columns] = 1
+    exponents = (torch.arange(rows, device='cuda')[:, None] * 3 +
+                 torch.arange(k // 128, device='cuda')[None, :] * 5) % 9 - 4
+    return a.to(torch.float8_e4m3fn), torch.exp2(exponents.float()), columns
+
+
+def test_group128_nopad():
+    counts = [0, 1, 65, 197]
+    rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
+    indices = torch.repeat_interleave(torch.arange(4, device='cuda', dtype=torch.int32), rows.long())
+    m = sum(counts)
+    # K128 aliases per-row; K384/N768 spans three N_EXPAND tiles;
+    # K640 exercises the non-unrolled mainloop. N320 and N192 have N tails.
+    for k, n in ((128, 64), (256, 320), (384, 768), (640, 192)):
+        rhs, weight = _group128_weight(4, n, k)
+        aq, scales, columns = _group128_basis(m, k)
+        selected_scale = scales.gather(1, (columns // 128)[:, None])
+        expected = torch.empty(m, n, device='cuda', dtype=torch.bfloat16)
+        start = 0
+        for expert, count in enumerate(counts):
+            stop = start + count
+            expected[start:stop] = (weight[expert][:, columns[start:stop]].T * selected_scale[start:stop]).bfloat16()
+            start = stop
+        configs = [None]
+        if k == 256:
+            sms = deep_gemm.get_num_sms()
+            configs += [(sms, 32, 128, 128, 32, 64, 64, 2, 1),  # K-warp reduction
+                        (sms, 128, 256, 128, 64, 64, 128, 3, 1),  # multiple M warps
+                        (sms, 16, 64, 128, 16, 64, 128, 3, 1)]  # scale-buffer alignment
+        for config in configs:
+            out = torch.full_like(expected, float('nan'))
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                (aq, scales), rhs[:2], out, indices, rows, config, inv_scale=rhs[2])
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        if k == 256:
+            folded = torch.empty_like(out)
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                (aq, scales * rhs[2]), rhs[:2], folded, indices, rows)
+            torch.testing.assert_close(folded, expected, rtol=0, atol=0)
+
+            # Dense contributions from both K groups catch errors hidden by one-hot inputs.
+            x = torch.randn(m, k, device='cuda') * scales.repeat_interleave(128, -1)
+            x_groups = x.reshape(m, k // 128, 128)
+            amax = x_groups.abs().amax(-1).clamp_min(1e-10)
+            group_scales = amax / 448.
+            quant = (x_groups * (448. / amax)[..., None]).clamp(-448, 448)
+            quant = quant.reshape(m, k).to(torch.float8_e4m3fn)
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                (quant, group_scales), rhs[:2], out, indices, rows, inv_scale=rhs[2])
+            dequant = quant.float() * group_scales.repeat_interleave(128, -1)
+            start = 0
+            for expert, count in enumerate(counts):
+                if count:
+                    ref = (dequant[start:start+count] @ weight[expert].T).bfloat16()
+                    assert torch.isfinite(out[start:start+count]).all()
+                    assert calc_diff(out[start:start+count], ref) < .0015
+                start += count
+        print(f'PASS group128 nopad {k=} {n=}')
+
+
+def test_group128_m32_tail():
+    # Both K-warp shapes must select M16/M32 uniformly outside the K loop.
+    # A basis input checks exact row/K-scale mapping across full and tail tiles.
+    counts = [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 65]
+    groups, capacity, k, n = len(counts), 67, 640, 320
+    rhs, weight = _group128_weight(groups, n, k)
+    rows = torch.tensor(counts, device='cuda', dtype=torch.int32)
+    indices = torch.repeat_interleave(
+        torch.arange(groups, device='cuda', dtype=torch.int32), rows.long())
+    aq, scales, columns = _group128_basis(sum(counts), k)
+    expected = torch.empty(sum(counts), n, device='cuda', dtype=torch.bfloat16)
+    masked_a = torch.zeros(groups, capacity, k, device='cuda', dtype=aq.dtype)
+    masked_s = torch.zeros(groups, capacity, k // 128, device='cuda')
+    start = 0
+    for expert, count in enumerate(counts):
+        stop = start + count
+        sf = scales[start:stop].gather(1, (columns[start:stop] // 128)[:, None])
+        expected[start:stop] = (weight[expert][:, columns[start:stop]].T * sf).bfloat16()
+        masked_a[expert, :count] = aq[start:stop]
+        masked_s[expert, :count] = scales[start:stop]
+        start = stop
+    for warp_k in (64, 128):
+        config = (deep_gemm.get_num_sms(), 32, 256, 128, 32, 64, warp_k, 2, 1)
+        out = torch.full_like(expected, float('nan'))
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            (aq, scales), rhs[:2], out, indices, rows, config, inv_scale=rhs[2])
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        masked_out = torch.full((groups, capacity, n), -123., device='cuda', dtype=out.dtype)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            (masked_a, masked_s), rhs[:2], masked_out, rows, 16, config, inv_scale=rhs[2])
+        start = 0
+        for expert, count in enumerate(counts):
+            torch.testing.assert_close(masked_out[expert, :count], expected[start:start+count], rtol=0, atol=0)
+            assert (masked_out[expert, count:] == -123.).all()
+            start += count
+
+
+def test_group128_masked():
+    groups, capacity, k, n = 4, 131, 384, 320
+    rhs, weight = _group128_weight(groups, n, k)
+    aq, scales, columns = _group128_basis(groups * capacity, k)
+    selected_scale = scales.gather(1, (columns // 128)[:, None]).reshape(groups, capacity, 1)
+    aq = aq.reshape(groups, capacity, k)
+    scales = scales.reshape(groups, capacity, k // 128)
+    columns = columns.reshape(groups, capacity)
+    rows = torch.tensor([0, 1, 65, 131], device='cuda', dtype=torch.int32)
+    out = torch.full((groups, capacity, n), -123., device='cuda', dtype=torch.bfloat16)
+    for config in (None, (deep_gemm.get_num_sms(), 64, 256, 128, 64, 64, 128, 2, 1)):
+        out.fill_(-123.)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            (aq, scales), rhs[:2], out, rows, 7, config, inv_scale=rhs[2])
+        for expert, count in enumerate((0, 1, 65, 131)):
+            expected = (weight[expert][:, columns[expert, :count]].T * selected_scale[expert, :count]).bfloat16()
+            torch.testing.assert_close(out[expert, :count], expected, rtol=0, atol=0)
+            assert (out[expert, count:] == -123.).all(), 'masked padding overwritten'
+    print('PASS group128 masked expert/row/K indexing and untouched padding')
+
+
+def test_group128_fused():
+    groups, num_token, topk, n = 4, 131, 2, 320
+    routes = ((torch.arange(num_token, device='cuda')[:, None] // 3 +
+               torch.arange(topk, device='cuda')[None, :]) % groups).int()
+    order = routes.flatten().argsort(stable=True)
+    sources = torch.arange(num_token, device='cuda').repeat_interleave(topk)[order]
+    sorted_experts = routes.flatten()[order]
+    for k in (256, 640):
+        rhs, weight = _group128_weight(groups, n, k)
+        aq, scales, columns = _group128_basis(num_token, k)
+        selected_scale = scales.gather(1, (columns // 128)[:, None])
+        config, rows, experts, tokens, aligned, _, _ = deep_gemm.moe_align_block_size(aq, rhs[0], routes)
+        out = torch.full((num_token * topk, n), float('nan'), device='cuda', dtype=torch.bfloat16)
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            (aq, scales), rhs[:2], out, rows, experts, tokens, aligned, config, inv_scale=rhs[2])
+        for expert in range(groups):
+            mask = sorted_experts == expert
+            source = sources[mask]
+            expected = (weight[expert][:, columns[source]].T * selected_scale[source]).bfloat16()
+            torch.testing.assert_close(out[mask], expected, rtol=0, atol=0)
+        nopad_out = torch.empty_like(out)
+        nopad_lhs = (aq.float()[sources].to(aq.dtype), scales[sources].contiguous())
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            nopad_lhs, rhs[:2], nopad_out, sorted_experts, rows, inv_scale=rhs[2])
+        torch.testing.assert_close(out, nopad_out, rtol=0, atol=0)
+        # Also cover full-N promotion with the smaller warp tile.
+        group_config = (*config[:4], min(config[4], 32), *config[5:])
+        out.fill_(float('nan'))
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            (aq, scales), rhs[:2], out, rows, experts, tokens, aligned, group_config, inv_scale=rhs[2])
+        torch.testing.assert_close(out, nopad_out, rtol=0, atol=0)
+        print(f'PASS group128 fused routing and nopad equivalence {k=}')
+
+
+def test_group128_boundaries():
+    k, n = 256, 64
+    rhs, _ = _group128_weight(1, n, k)
+    indices = torch.zeros(1, device='cuda', dtype=torch.int32)
+    aq = torch.zeros(1, k, device='cuda', dtype=torch.float8_e4m3fn)
+    out = torch.empty(1, n, device='cuda', dtype=torch.bfloat16)
+    for bad_scale in (torch.ones(1, 3, device='cuda'),
+                      torch.ones(2, 1, device='cuda'),
+                      torch.ones(1, 2, device='cuda', dtype=torch.bfloat16),
+                      torch.ones(1, 4, device='cuda')[:, ::2]):
+        try:
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad((aq, bad_scale), rhs[:2], out, indices)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('accepted invalid group128 activation scales')
+    deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+        (aq[:0], torch.empty(0, 2, device='cuda')), rhs[:2], out[:0], indices[:0])
+    print('PASS group128 scale validation and empty input')
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -484,5 +670,10 @@ if __name__ == '__main__':
         test_basis()
         test_fused_k32_basis()
         test_masked_shifted_scale()
+        test_group128_nopad()
+        test_group128_m32_tail()
+        test_group128_masked()
+        test_group128_fused()
+        test_group128_boundaries()
     else:
         print('Skipping W4FA8: requires PPU1.5')

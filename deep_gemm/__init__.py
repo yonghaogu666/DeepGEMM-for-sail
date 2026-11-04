@@ -87,10 +87,11 @@ from .deep_gemm_cpp import (
     # deprecated alias of preprocess_weights_and_scales(MXFP4, True)
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     PreprocessMode,
-    # W4FA8 (mxfp4 weights, per-row FP8 activation)
+    # W4FA8 (mxfp4 weights, per-row or group-128 FP8 activation)
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,
     m_grouped_gemm_fp8_fp4_bf16_nt_fused,
+    dequantize_mxfp4_fp8,
     # A8W4 INT8 GEMMs / device weight preprocessing
     m_grouped_gemm_int8_int4_bf16_nt_masked,
     m_grouped_gemm_int8_int4_bf16_nt_nopad,
