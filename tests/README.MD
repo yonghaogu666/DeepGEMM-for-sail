@@ -52,6 +52,21 @@ python ./run_deep_gemm_perf.py --caselist=./deepgemm.caselist
 
 # Checkin Test
 
+## W4A8 group128 activation scales (M890)
+
+```bash
+python -m pytest -q tests/test_w4a8_group_scales.py
+python tests/run_deep_gemm.py --format='GroupedMasked,data_type:w4fa8_mma,groups:4,m:101,n:192,k:256,em:26,distribution:[0,1,33,67],quant_type:group,group_size:32,activation_group_size:128'
+```
+
+The pytest suite covers K tails, empty/nonuniform experts, native and streamed
+execution, mixed per-row/group128 calls, and graph replay with changed scales
+and routing. References use actual E4M3 operands and decoded MXFP4 weights;
+basis inputs separately check row/scale layout. `group_size:32` describes
+weights, while `activation_group_size:128` describes activation scales.
+Omitting the latter preserves per-row test generation. Dump/replay preserves
+scale mode and shape, not the original operand values or explicit tile override.
+
 ## Native JIT compile-key regression (PPU)
 
 From a source checkout with initialized submodules, PPU PyTorch and the PPU SDK:

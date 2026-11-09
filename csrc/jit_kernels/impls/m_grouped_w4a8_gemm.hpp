@@ -280,8 +280,8 @@ static bool run_compact(const NativeKernelConfig& spec, int m, int n, int k, int
     args.launch_args.grid_dim =
         dim3(c.num_sms * (fused ? prepared->active_blocks : std::min(8, prepared->active_blocks)));
     auto prof = make_profile(kind, groups, fused ? params.num_token : m, n, k, ceil_div(m, groups),
-                             fused ? m / params.num_token : 0, rows.data_ptr<int32_t>());
-    log_native_config(c, fused ? params.num_token : m, n, k, groups, *prepared);
+                             fused ? m / params.num_token : 0, rows.data_ptr<int32_t>(), spec.group_activation_scales);
+    log_native_config(c, fused ? params.num_token : m, n, k, groups, *prepared, spec.group_activation_scales);
     ProfilingInterface::Instance().instrument(true, prof);
     R::launch(prepared->runtime, args);
     ProfilingInterface::Instance().instrument(false, prof);

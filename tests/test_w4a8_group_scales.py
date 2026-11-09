@@ -4,8 +4,58 @@ import pytest
 import torch
 import deep_gemm
 
-from quantization import decode_weight
+from quantization import decode_weight, quant_activation
 from deep_gemm.testing.numeric import calc_diff
+
+
+def capture_warmed(call):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    # Execution plans must be warmed on the stream used for capture.
+    with torch.cuda.stream(stream):
+        call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        call()
+    return graph
+
+
+@pytest.mark.parametrize("k", [256, 2048])
+def test_group128_dense(k):
+    torch.manual_seed(12)
+    lhs, rhs, expected = operands((1, 129, k), 1024)
+    out = torch.empty_like(expected[0])
+    deep_gemm.fp8_fp4_gemm_nt(
+        (lhs[0][0], lhs[1][0]), (rhs[0][0], rhs[1][0]), out, inv_scale=rhs[2]
+    )
+    assert calc_diff(out, expected[0]) < 0.0015
+
+
+def test_group128_streamed_random_reference():
+    torch.manual_seed(33)
+    lhs, rhs, reference = operands((4, 300, 2048), 1024)
+    counts = [0, 1, 129, 300]
+    rows = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    a = torch.cat([lhs[0][i, :count] for i, count in enumerate(counts)])
+    scales = torch.cat([lhs[1][i, :count] for i, count in enumerate(counts)])
+    expected = torch.cat([reference[i, :count] for i, count in enumerate(counts)])
+    indices = torch.repeat_interleave(torch.arange(4, device="cuda", dtype=torch.int32), rows.long())
+    out = torch.empty_like(expected)
+    config = (deep_gemm.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1)
+    deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+        (a, scales), rhs[:2], out, indices, rows, config, inv_scale=rhs[2]
+    )
+    assert torch.isfinite(out).all()
+    assert calc_diff(out, expected) < 0.0015
+
+
+@pytest.mark.parametrize("group_size", [0, 128])
+def test_empty_activation_quantization(group_size):
+    for shape in ((0, 256), (2, 0, 256)):
+        a, scales = quant_activation(torch.empty(shape), activation_group_size=group_size)
+        assert a.shape == shape
+        assert scales.shape == (*shape[:-1], 2 if group_size else 1)
 
 
 def test_activation_group_sizes():
@@ -29,7 +79,7 @@ def operands(shape, n):
 
 
 @pytest.mark.parametrize("k", [128, 256, 384, 2048])
-@pytest.mark.parametrize("warp_k", [64, 128])
+@pytest.mark.parametrize("warp_k", [128])
 @pytest.mark.parametrize("masked", [False, True])
 def test_group128(k, warp_k, masked):
     torch.manual_seed(20261103)
@@ -76,7 +126,8 @@ def test_group128_narrow_warp(k, masked):
     counts = [0, 1, 63, 129]
     rows = torch.tensor(counts, dtype=torch.int32, device="cuda")
     sms = deep_gemm.get_num_sms()
-    narrow = (sms, 64, 256, 128, 64, 32, 128, 2, 1)
+    # K128 has one scale and intentionally shares the per-row specialization.
+    narrow = (sms, 64, 256, 128, 64, 64 if k == 128 else 32, 128, 2, 1)
     # Existing small-tile path is independently checked against FP32 above.
     reference_config = (sms, 32, 256, 128, 32, 64, 128, 2, 1)
     inverse = rhs[2] * 0.3
@@ -114,9 +165,7 @@ def test_group128_narrow_warp(k, masked):
     run(out, None)
     torch.cuda.synchronize()
     check_result()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(out, narrow)
+    graph = capture_warmed(lambda: run(out, narrow))
     scales.mul_(1.25)
     run(reference, reference_config)
     out.fill_(-123.)
@@ -195,9 +244,7 @@ def test_group128_masked_m32_graph(n, k):
     run(out)
     torch.cuda.synchronize()
     check()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(out)
+    graph = capture_warmed(lambda: run(out))
     # Exercise both M16 and M32 tail bodies with fresh device-side counts on replay.
     counts.reverse()
     rows.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
@@ -208,3 +255,104 @@ def test_group128_masked_m32_graph(n, k):
     graph.replay()
     torch.cuda.synchronize()
     check()
+
+
+@pytest.mark.parametrize("path", ["full", "narrow", "rolling", "wide", "wide_max", "streamed"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_group128_basis_replay(path, fused):
+    """Exact references catch row/channel/group permutations, independent of GEMM."""
+    torch.manual_seed(9)
+    groups, tokens, n, k = 4, 1029, 1024, 2048
+    counts = [0, 1, 257, 771]
+    raw = (109 + torch.arange(groups * n * (k // 32), device="cuda") % 16).byte()
+    raw = raw.reshape(groups, n, k // 32)
+    packed = torch.randint(256, (groups, n, k // 2), device="cuda", dtype=torch.uint8)
+    weight = decode_weight(packed, raw)
+    rhs = deep_gemm.preprocess_weights_and_scales(
+        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, packed, raw
+    )
+    columns = (torch.arange(tokens, device="cuda") * 97 + 31) % k
+    basis = torch.zeros(tokens, k, device="cuda")
+    basis[torch.arange(tokens, device="cuda"), columns] = 1
+    a = basis.to(torch.float8_e4m3fn)
+    scales = torch.exp2((torch.arange(tokens * (k // 128), device="cuda").reshape(tokens, -1) % 9 - 4).float())
+    scales[::7, ::2] = 0
+    rows = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    indices = torch.repeat_interleave(torch.arange(groups, device="cuda", dtype=torch.int32), rows.long())
+    sms = deep_gemm.get_num_sms()
+    configs = {
+        "full": (sms, 32, 256, 128, 32, 64, 128, 2, 1),
+        "narrow": (sms, 64, 256, 128, 64, 32, 128, 3, 1),
+        "rolling": (sms, 32, 128, 128, 32, 32, 128, 2, 1),
+        "wide": (sms, 80, 256, 128, 80, 32, 128, 3, 1),
+        # Match main's automatic limits: fused M176, nopad M192.
+        "wide_max": (sms, 176 if fused else 192, 256, 128, 176 if fused else 192, 32, 128, 2, 1),
+        "streamed": (sms, 256, 256, 128, 64, 64, 128, 4, 1),
+    }
+    config = configs[path]
+    out = torch.empty(tokens * (2 if fused else 1), n, device="cuda", dtype=torch.bfloat16)
+
+    def route():
+        if fused:
+            # Noncyclic routing repeats tokens across experts; expert 0 stays empty.
+            routes = torch.stack([torch.randperm(3, device="cuda")[:2] + 1 for _ in range(tokens)]).int()
+            meta = deep_gemm.moe_align_block_size(a, rhs[0], routes, config=config)
+            return routes, meta
+        return None, None
+
+    routes, meta = route()
+
+    def run(sf):
+        if fused:
+            cfg, r, experts, ids, aligned, _, _ = meta
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+                (a, sf), rhs[:2], out, r, experts, ids, aligned, cfg, inv_scale=rhs[2]
+            )
+        else:
+            deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+                (a, sf), rhs[:2], out, indices, rows, config, inv_scale=rhs[2]
+            )
+
+    def check(sf):
+        scale = sf[:, 0] if sf.size(1) == 1 else sf.gather(1, (columns // 128)[:, None])[:, 0]
+        if fused:
+            expected = torch.stack([weight[routes[:, slot].long(), :, columns] * scale[:, None] for slot in range(2)], 1)
+            actual = out[meta[5].long()].reshape(tokens, 2, n)
+        else:
+            expected = weight[indices.long(), :, columns] * scale[:, None]
+            actual = out
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=0, atol=0)
+
+    run(scales)
+    check(scales)
+    # Per-row mode may have a different supported tile set (M64/N32 is group-only).
+    if path != "narrow":
+        row_scales = scales[:, :1].contiguous()
+        run(row_scales)
+        check(row_scales)
+        run(scales)
+        check(scales)
+    graph = capture_warmed(lambda: run(scales))
+    scales.mul_(0.5)
+    if fused:
+        new_routes, new_meta = route()
+        for old, new in zip(meta[1:], new_meta[1:]):
+            old.copy_(new)
+        routes.copy_(new_routes)
+    else:
+        counts = counts[::-1]
+        rows.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
+        indices.copy_(torch.repeat_interleave(torch.arange(groups, device="cuda", dtype=torch.int32), rows.long()))
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check(scales)
+
+
+def test_group128_rejects_removed_k_split():
+    lhs, rhs, reference = operands((1, 1, 256), 64)
+    out = torch.empty_like(reference)
+    rows = torch.ones(1, device="cuda", dtype=torch.int32)
+    config = (deep_gemm.get_num_sms(), 32, 64, 128, 32, 64, 64, 2, 1)
+    with pytest.raises(RuntimeError):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(lhs, rhs[:2], out, rows, 1, config)

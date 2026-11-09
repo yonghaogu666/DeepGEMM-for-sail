@@ -39,6 +39,7 @@ struct StreamedConfig {
     EmptyExpertPolicy empty_experts;
     DecodeFencePolicy decode_fence;
     std::vector<std::pair<int, int>> group_chunks;
+    bool group_activation_scales = false;
 };
 using ExecutionPlan = std::variant<NativeKernelConfig, StreamedConfig>;
 
@@ -262,7 +263,8 @@ static bool streamed_fused_eligible(int m, int n, int k, int groups) {
     // Bound the additional activation workspace independently of weight chunks.
     constexpr int64_t activation_budget = 1024LL * 1024 * 1024;
     return supports_native_strategy() && streamed_tile_n(n, k, groups) &&
-           int64_t(m) * (k + int(sizeof(float))) <= activation_budget &&
+           // Routing has no scale tensor: reserve for either supported scale layout.
+           int64_t(m) * (k + int64_t(k / 128) * sizeof(float)) <= activation_budget &&
            int64_t(m) >= int64_t(groups) * streamed_min_rows(n, k);
 }
 
@@ -325,9 +327,10 @@ static void check_streamed_config(const StreamedConfig& c, int m, int n, int k, 
     DG_HOST_ASSERT(kind == GemmType::MGroupedNoPad || kind == GemmType::MGroupedFused);
     DG_HOST_ASSERT(groups >= 1 && groups <= 1024 && n >= 1024 && n % 64 == 0 && k >= 1024 && k % 128 == 0);
     DG_HOST_ASSERT(t.num_sms > 0 && t.num_sms <= get_num_sms());
-    DG_HOST_ASSERT(pack_config(t) == W4A8ConfigTuple(t.num_sms, w4fa8_streamed::kBlockM, 256, 128, 64, 64, 128, 4, 1));
+    DG_HOST_ASSERT(pack_config(t) == W4A8ConfigTuple(t.num_sms, c.group_activation_scales ? 128 : w4fa8_streamed::kBlockM, 256, 128,
+                                                   c.group_activation_scales ? 32 : 64, 64, 128, 4, 1));
     const auto prop = device_runtime->get_prop();
-    DG_HOST_ASSERT(prop->maxThreadsPerBlock >= 512 && prop->sharedMemPerBlockOptin >= 256 * 1024);
+    DG_HOST_ASSERT(prop->maxThreadsPerBlock >= get_num_threads(t) && prop->sharedMemPerBlockOptin >= 256 * 1024);
     DG_HOST_ASSERT(c.decode_n > 0 && c.decode_n <= n && (c.decode_n == n || c.decode_n % 256 == 0));
     DG_HOST_ASSERT(c.expert_chunk >= 1 && c.expert_chunk <= std::min(32, std::max(1, groups / 2)));
     DG_HOST_ASSERT(!c.group_chunks.empty());
@@ -336,7 +339,8 @@ static void check_streamed_config(const StreamedConfig& c, int m, int n, int k, 
     if (kind == GemmType::MGroupedFused) {
         DG_HOST_ASSERT(c.gather != GatherPolicy::None);
         DG_HOST_ASSERT(c.gather != GatherPolicy::Chunk || c.decode_n == n);
-        DG_HOST_ASSERT(int64_t(m) * (k + sizeof(float)) <= 1024LL * 1024 * 1024);
+        const int scale_columns = c.group_activation_scales ? k / 128 : 1;
+        DG_HOST_ASSERT(int64_t(m) * (k + int64_t(scale_columns) * sizeof(float)) <= 1024LL * 1024 * 1024);
     } else {
         DG_HOST_ASSERT(c.gather == GatherPolicy::None);
     }
@@ -361,17 +365,14 @@ static StreamedConfig default_streamed_config(int m, int n, int k, int groups, i
 
 static void check_native_kernel(const NativeKernelConfig& spec, int n, int k, int groups, GemmType kind) {
     const auto& c = spec.tile;
-    if (spec.group_activation_scales) {
-        TORCH_CHECK(!uses_ring_a(c.warp_m) && spec.fragment == FragmentPolicy::FullK,
-                    "group128 activations require a direct FullK tile with M <= 64");
-    }
     TORCH_CHECK(c.block_m == c.warp_m, "W4FA8 native tiles require block_m == warp_m");
     TORCH_CHECK(c.block_k == c.warp_k, "W4FA8 native tiles require block_k == warp_k");
     DG_HOST_ASSERT(groups > 0 && groups <= 1024 && c.num_sms > 0 && c.num_sms <= get_num_sms());
     if (uses_ring_a(c.warp_m)) {
         DG_HOST_ASSERT(kind != GemmType::MGroupedMasked);
         DG_HOST_ASSERT(c.block_m >= 80 && c.block_m <= 192 && c.block_m % 16 == 0);
-        DG_HOST_ASSERT(c.warp_m == c.block_m && c.block_n == 256 && c.warp_n == 32);
+        DG_HOST_ASSERT(c.warp_m == c.block_m && c.block_n == 256 &&
+                       c.warp_n == (spec.group_activation_scales ? 16 : 32));
         DG_HOST_ASSERT(c.block_k == 128 && c.warp_k == 128 && c.n_expand == 1);
         DG_HOST_ASSERT(c.num_stages >= 2 && c.num_stages <= 4 && n % 256 == 0 && k >= 512 && k % 128 == 0);
         DG_HOST_ASSERT(spec.fragment == FragmentPolicy::RollingK32);
@@ -444,11 +445,6 @@ static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, Gem
 // Public configs contain only a tile; execution details stay internal.
 static ExecutionPlan resolve_config(const W4A8Config& tile, int m, int n, int k, int groups, GemmType kind,
                                     bool group_activation_scales = false) {
-    if (group_activation_scales) {
-        NativeKernelConfig kernel{tile, FragmentPolicy::FullK, true};
-        check_native_kernel(kernel, n, k, groups, kind);
-        return kernel;
-    }
     if (tile.block_m == w4fa8_streamed::kBlockM) {
         TORCH_CHECK(pack_config(tile) == W4A8ConfigTuple(tile.num_sms, w4fa8_streamed::kBlockM, 256, 128, 64, 64, 128, 4, 1),
                     "unsupported W4FA8 streamed tile");
@@ -457,10 +453,24 @@ static ExecutionPlan resolve_config(const W4A8Config& tile, int m, int n, int k,
         auto plan = default_streamed_config(m, n, k, groups, tile.num_sms,
                                            kind == GemmType::MGroupedFused, true);
         plan.core = tile;
+        plan.group_activation_scales = group_activation_scales;
+        // Halve CTA/warp M together to fit K128 partials without doubling threads.
+        // Gather still consumes the public routing tile (kBlockM).
+        if (group_activation_scales) {
+            plan.core.block_m = 128;
+            plan.core.warp_m = 32;
+        }
         check_streamed_config(plan, m, n, k, groups, kind);
         return plan;
     }
-    return resolve_native_config(tile, n, k);
+    const bool group_full_k = group_activation_scales && tile.warp_m == 64 && tile.warp_n == 32;
+    auto kernel = group_full_k ? NativeKernelConfig{tile, FragmentPolicy::FullK}
+                               : resolve_native_config(tile, n, k);
+    kernel.group_activation_scales = group_activation_scales;
+    // Keep routing BlockM, but distribute the extra partials over more warps.
+    if (group_activation_scales && uses_ring_a(tile.warp_m)) kernel.tile.warp_n = 16;
+    check_native_kernel(kernel, n, k, groups, kind);
+    return kernel;
 }
 
 } // namespace deep_gemm::w4fa8

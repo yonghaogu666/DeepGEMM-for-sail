@@ -4,7 +4,8 @@
 namespace deep_gemm::w4fa8_streamed {
 // Convert the public padded token layout to contiguous expert rows. Both
 // activations and row scales are regenerated on every invocation/Graph replay.
-template <int K, int BlockM, int Groups> __device__ __forceinline__ void gather_body(GatherParams p, int group_start) {
+template <int K, int BlockM, int Groups, bool GroupActivationScales = false>
+__device__ __forceinline__ void gather_body(GatherParams p, int group_start) {
   constexpr int VectorsPerRow = K / 16;
   constexpr int CopyRows = 64;
   static_assert(BlockM % CopyRows == 0);
@@ -31,8 +32,10 @@ template <int K, int BlockM, int Groups> __device__ __forceinline__ void gather_
         auto dst = reinterpret_cast<uint4 *>(p.grouped_a) + int64_t(out_row + local_row) * VectorsPerRow;
         for (int column = lane; column < VectorsPerRow; column += 32)
           dst[column] = __ldg(src + column);
-        if (lane == 0)
-          p.grouped_scale[out_row + local_row] = __ldg(p.a_scale + token);
+        constexpr int ScaleColumns = GroupActivationScales ? K / 128 : 1;
+        for (int group = lane; group < ScaleColumns; group += 32)
+          p.grouped_scale[int64_t(out_row + local_row) * ScaleColumns + group] =
+              __ldg(p.a_scale + int64_t(token) * ScaleColumns + group);
       }
     }
   }
@@ -209,7 +212,7 @@ namespace deep_gemm::w4fa8_streamed {
 using namespace cute;
 // The decoder already incorporates weight scales. Keep the stock pipeline and
 // specialize its final scaling step without cloning the collective mainloop.
-template <class Base, bool ApplyInvScale> struct UnitBScaleMainloop : Base {
+template <class Base, bool ApplyInvScale, bool GroupActivationScales = false> struct UnitBScaleMainloop : Base {
   struct ScaledParams : Base::Params { float inv_scale = 1.f; };
   using Params = cute::conditional_t<ApplyInvScale, ScaledParams, typename Base::Params>;
   using Arguments = Params;
@@ -220,9 +223,37 @@ template <class Base, bool ApplyInvScale> struct UnitBScaleMainloop : Base {
   template <class Shape> CUTLASS_DEVICE UnitBScaleMainloop(Params p, Shape shape) : Base(p, shape) {
     if constexpr (ApplyInvScale) inv_scale = p.inv_scale;
   }
+  template <class Shape, class Coord>
+  CUTLASS_DEVICE auto load_init(Shape const& shape, Coord const& coord, Params const& p,
+                                int offset_m, int64_t offset_b,
+                                typename Base::ElementA const* a, typename Base::ElementB const* b) {
+    auto inputs = Base::load_init(shape, coord, p, offset_m, offset_b, a, b);
+    if constexpr (GroupActivationScales) {
+      using namespace cute;
+      const int groups = get<2>(shape) / 128;
+      auto scales = make_tensor(make_gmem_ptr(p.ptr_scale_A + int64_t(offset_m) * groups),
+                                make_shape(get<0>(shape), groups), make_stride(groups, _1{}));
+      auto tile = make_shape(size<0>(typename Base::TileShape{}), _1{});
+      auto grouped = local_tile(scales, tile, make_coord(get<0>(coord), _));
+      return make_tuple(get<0>(inputs), get<1>(inputs),
+                        make_tuple(grouped, get<2, 1>(inputs)), get<3>(inputs));
+    } else {
+      return inputs;
+    }
+  }
   template <class Src, class Dst>
   CUTLASS_DEVICE void dequant(Src& mma_acc, Dst& accum, int thread_idx, int smem_pipe_scale, char* smem_buf) {
     using namespace cute;
+    if constexpr (GroupActivationScales) {
+      cp_async_wait<Policy::Stages - 1>();
+      __syncthreads();
+      CUTE_UNROLL
+      for (int i = 0; i < size(accum); ++i) {
+        if constexpr (ApplyInvScale) accum(i) = mma_acc(i) * inv_scale;
+        else accum(i) = mma_acc(i);
+      }
+      return;
+    }
     auto& storage = *reinterpret_cast<typename Base::SharedStorage*>(smem_buf);
     auto sA = make_tensor(make_smem_ptr(storage.smem_a.data()), typename Base::SmemLayoutAInterleave{});
     auto gmem_thr = this->gmem_tiled_copy_A.get_slice(thread_idx);
@@ -260,9 +291,9 @@ template <class Base, bool ApplyInvScale> struct UnitBScaleMainloop : Base {
 namespace cutlass::gemm::collective {
 // Keep the stock mainloop construction, loading and parameter ABI. Only the
 // operand-register schedule changes; a shared stage is recycled after its last read.
-template <class Base, bool ApplyInvScale = false>
-struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloop<Base, ApplyInvScale> {
-  using Parent = deep_gemm::w4fa8_streamed::UnitBScaleMainloop<Base, ApplyInvScale>;
+template <class Base, bool ApplyInvScale = false, bool GroupActivationScales = false>
+struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloop<Base, ApplyInvScale, GroupActivationScales> {
+  using Parent = deep_gemm::w4fa8_streamed::UnitBScaleMainloop<Base, ApplyInvScale, GroupActivationScales>;
   using Params = typename Parent::Params;
   using DispatchPolicy = typename Base::DispatchPolicy;
   using TileShape = typename Base::TileShape;
@@ -365,7 +396,16 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
     }
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrA_copy_view));
     CUTE_STATIC_ASSERT_V(size<2>(tCrB) == size<2>(tCrB_copy_view));
+    auto partial = make_tensor_like(accum);
+    auto& mma_accum = [&]() -> auto& {
+      if constexpr (GroupActivationScales) return partial;
+      else return accum;
+    }();
+    int consumed_k_tiles = 0;
     auto process_kblock_iterations = [&](int k_block) {
+      if constexpr (GroupActivationScales) {
+        if (k_block == 0) clear(partial);
+      }
       copy(smem_tiled_copy_A, tCsA_p(_, _, k_block), tCrA_copy_view(_, _, Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_, _, k_block), tCrB_copy_view(_, _, Int<0>{}));
       if (k_block == K_BLOCK_MAX - 1) {
@@ -374,9 +414,11 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
         if (k_tile_count > 0) {
           copy_aiu<SplitAIU>(gmem_tiled_copy_A, tAgA(_, _, _, k_tile_iter), tAsA(_, _, _, smem_pipe_write),
                              gmem_tiled_copy_B, tBgB(_, _, _, k_tile_iter), tBsB(_, _, _, smem_pipe_write), warp_idx);
-        } else if (!scaleCopySendDone) {
-          copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_, _, _, 0), tSsSA(_, _, _, 0));
-          scaleCopySendDone = true;
+        } else if constexpr (!GroupActivationScales) {
+          if (!scaleCopySendDone) {
+            copy_if(gmem_tiled_copy_scaleA, tSpSA, tSgSA(_, _, _, 0), tSsSA(_, _, _, 0));
+            scaleCopySendDone = true;
+          }
         }
         cp_async_fence();
         --k_tile_count;
@@ -389,7 +431,24 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
       }
       cute::transform(tCrA(_, _, Int<0>{}), TransformA{});
       cute::transform(tCrB(_, _, Int<0>{}), TransformB{});
-      cute::gemm(tiled_mma, accum, tCrA(_, _, Int<0>{}), tCrB(_, _, Int<0>{}), accum);
+      cute::gemm(tiled_mma, mma_accum, tCrA(_, _, Int<0>{}), tCrB(_, _, Int<0>{}), mma_accum);
+      if constexpr (GroupActivationScales) {
+        if (k_block == K_BLOCK_MAX - 1) {
+          auto coords = thr_mma.partition_C(make_identity_tensor(take<0, 2>(TileShape{})));
+          CUTE_UNROLL
+          for (int m = 0; m < size<1>(accum); ++m) {
+            CUTE_UNROLL
+            for (int i = 0; i < size<0>(accum); ++i) {
+              const int row = get<0>(coords(i, m, 0));
+              const float scale = row < get<0>(residue_mnk) ? gSFA(row, 0, consumed_k_tiles) : 0.f;
+              CUTE_UNROLL
+              for (int n = 0; n < size<2>(accum); ++n)
+                accum(i, m, n) += partial(i, m, n) * scale;
+            }
+          }
+          ++consumed_k_tiles;
+        }
+      }
     };
     for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) { process_kblock_iterations(k_block); });
     CUTLASS_PRAGMA_NO_UNROLL
@@ -403,7 +462,7 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
 namespace deep_gemm::w4fa8_streamed {
 using namespace cute;
 template <int OutputN, int K, int TileN, int Groups, int BM = kBlockM, int BN = 256, int WM = 64, int WN = 64,
-          int Stages = 4, bool ApplyInvScale = false>
+          int Stages = 4, bool ApplyInvScale = false, bool GroupActivationScales = false>
 struct CoreTraits {
   using Arch = cutlass::arch::PPU0015;
   using A = cutlass::float_e4m3_t;
@@ -422,7 +481,7 @@ struct CoreTraits {
       cutlass::detail::TagToStrideA_t<Row>, B, cutlass::detail::TagToStrideB_t<Col>, TM, typename OA::GmemTiledCopy,
       typename OA::SmemLayoutAtom, typename OA::SmemCopyAtom, cute::identity, typename OB::GmemTiledCopy,
       typename OB::SmemLayoutAtom, typename OB::SmemCopyAtom, cute::identity>;
-  using ML = cutlass::gemm::collective::W4A8SingleRegisterMainloop<MLBase, ApplyInvScale>;
+  using ML = cutlass::gemm::collective::W4A8SingleRegisterMainloop<MLBase, ApplyInvScale, GroupActivationScales>;
   using EP = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
       cutlass::detail::TagToStrideA_t<Row>, cutlass::detail::TagToStrideA_t<Row>,
       cutlass::epilogue::thread::LinearCombination<D, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing>,

@@ -8,6 +8,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **M890 W4A8 group128 activations**: accepts contiguous FP32 activation
+  scales with trailing dimension `K/128` alongside existing per-row scales
+  in native and streamed GEMMs. Adds scale-mode specialization for JIT and
+  graph readiness, group-scale gathering for fused routing, and
+  `activation_group_size` in UT dump/replay. Weight preprocessing and
+  public GEMM signatures are unchanged.
+
 - **M890 W4FA8 dense NT GEMM**: implements `fp8_fp4_gemm_nt` and its
   `gemm_fp8_fp4_bf16_nt` alias with two-dimensional packed weights and
   scale preprocessing, BF16 output, and optional scalar `inv_scale`.

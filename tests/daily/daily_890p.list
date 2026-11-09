@@ -10,5 +10,6 @@ python ./tests/test_hyperconnection.py
 python ./tests/test_mega_mhc.py
 python ./tests/test_w4a16.py
 python ./tests/test_w4a8.py
+python -m pytest -q ./tests/test_w4a8_group_scales.py
 python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform --thread_count=32
 python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform --thread_count=32

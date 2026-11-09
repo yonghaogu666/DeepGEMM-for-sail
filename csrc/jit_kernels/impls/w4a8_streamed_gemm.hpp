@@ -45,16 +45,17 @@ class StreamedGatherRuntime final : public LaunchRuntime<StreamedGatherRuntime> 
         int k, groups;
         LaunchArgs launch_args;
         w4fa8_streamed::GatherParams params;
+        bool group_activation_scales = false;
     };
     static std::string generate_impl(const Args& a) {
         return fmt::format(R"(
 #include <deep_gemm/impls/w4a8_streamed_gemm.cuh>
 extern "C" __global__ __launch_bounds__(256)
 void w4a8_streamed_gather(deep_gemm::w4fa8_streamed::GatherParams p) {{
-    deep_gemm::w4fa8_streamed::gather_body<{}, deep_gemm::w4fa8_streamed::kBlockM, {}>(p, 0);
+    deep_gemm::w4fa8_streamed::gather_body<{}, deep_gemm::w4fa8_streamed::kBlockM, {}, {}>(p, 0);
 }}
 )",
-                           a.k, a.groups);
+                           a.k, a.groups, a.group_activation_scales ? "true" : "false");
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.params));
@@ -71,6 +72,7 @@ class StreamedDecodeRuntime final : public LaunchRuntime<StreamedDecodeRuntime> 
         bool empty_flat = false;
         bool fuse_gather = false;
         w4fa8_streamed::GatherParams gather{};
+        bool group_activation_scales = false;
     };
     static bool full_n_fast(const Args& a) {
         return a.tile_n == a.n && a.n % 512 == 0 && a.k % 128 == 0 && uint64_t(a.groups) * a.n * a.k <= UINT32_MAX;
@@ -88,7 +90,7 @@ class StreamedDecodeRuntime final : public LaunchRuntime<StreamedDecodeRuntime> 
     }
     static std::string gather_call(const Args& a) {
         return a.fuse_gather
-                   ? fmt::format("deep_gemm::w4fa8_streamed::gather_body<{}, deep_gemm::w4fa8_streamed::kBlockM, {}>(gather, params.group_start);", a.k, a.groups)
+                   ? fmt::format("deep_gemm::w4fa8_streamed::gather_body<{}, deep_gemm::w4fa8_streamed::kBlockM, {}, {}>(gather, params.group_start);", a.k, a.groups, a.group_activation_scales ? "true" : "false")
                    : "";
     }
     static std::string generate_impl(const Args& a) {
@@ -135,15 +137,18 @@ class StreamedCoreRuntime final : public LaunchRuntime<StreamedCoreRuntime> {
         StreamedCoreParams params;
         bool apply_inv_scale = false;
         float inv_scale = 1.f;
+        bool group_activation_scales = false;
+        int warp_m = 64;
+        int block_m = w4fa8_streamed::kBlockM;
     };
     static std::string generate_impl(const Args& a) {
         return fmt::format(R"(
 #include <deep_gemm/impls/w4a8_streamed_gemm.cuh>
-using Traits = deep_gemm::w4fa8_streamed::CoreTraits<{}, {}, {}, {}, deep_gemm::w4fa8_streamed::kBlockM, 256, 64, 64, 4, {}>;
+using Traits = deep_gemm::w4fa8_streamed::CoreTraits<{}, {}, {}, {}, {}, 256, {}, 64, 4, {}, {}>;
 using Kernel = typename Traits::Kernel;
 using Params = typename Kernel::Params;
-static_assert(Kernel::MaxThreadsPerBlock == 512, "streamed thread count mismatch");
-static_assert(Kernel::SharedStorageSize == 262144, "streamed shared memory mismatch");
+static_assert(Kernel::MaxThreadsPerBlock == {}, "streamed thread count mismatch");
+static_assert(Kernel::SharedStorageSize == {}, "streamed shared memory mismatch");
 static_assert(sizeof(Params) == {}, "streamed core argument size mismatch");
 static_assert(offsetof(Params, mainloop) == {}, "streamed mainloop ABI mismatch");
 static_assert(offsetof(Params, epilogue) == {}, "streamed epilogue ABI mismatch");
@@ -154,7 +159,10 @@ void fp8_grouped_deep_gemm_w4a8_streamed_core(Params params) {{
     Kernel{{}}(params, smem);
 }}
 )",
-                           a.n, a.k, a.tile_n, a.groups, a.apply_inv_scale ? "true" : "false",
+                           a.n, a.k, a.tile_n, a.groups, a.block_m, a.warp_m, a.apply_inv_scale ? "true" : "false",
+                           a.group_activation_scales ? "true" : "false",
+                           a.launch_args.block_dim.x,
+                           a.launch_args.smem_size,
                            a.apply_inv_scale ? sizeof(ScaledCoreParams) : sizeof(StreamedCoreParams),
                            a.apply_inv_scale ? offsetof(ScaledCoreParams, mainloop) : offsetof(StreamedCoreParams, mainloop),
                            a.apply_inv_scale ? offsetof(ScaledCoreParams, epilogue) : offsetof(StreamedCoreParams, epilogue),
@@ -189,11 +197,12 @@ static void log_streamed_config(const StreamedConfig& execution, int m, int n, i
     if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
         const auto& c = execution.core;
         printf("[W4FA8 streamed] group:%d problem:[%d,%d,%d] rows:%d decode_n:%d expert_chunk:%d parts:%d "
-               "schedule:%s gather:%s empty_experts:%s\n",
+               "schedule:%s gather:%s empty_experts:%s activation_group_size:%d\n",
                groups, m, n, k, grouped_rows, execution.decode_n, chunk, parts,
                execution.schedule == ChunkSchedule::Ramp ? "ramp" : "fixed",
                execution.gather == GatherPolicy::None ? "none" : execution.gather == GatherPolicy::Full ? "full" : "chunk",
-               execution.empty_experts == EmptyExpertPolicy::Nonempty ? "nonempty" : "dense");
+               execution.empty_experts == EmptyExpertPolicy::Nonempty ? "nonempty" : "dense",
+               execution.group_activation_scales ? 128 : 0);
         for (const auto& entry : prepared.kernels) {
             const auto& core = entry.second;
             int regs = 0, stack = 0;
@@ -215,7 +224,7 @@ struct StreamedAsyncContext {
     std::vector<hggcEvent_t> decoded, consumed;
     std::mutex submit_mutex;
     // Shape readiness is CPU metadata only; no decoded weights are retained.
-    using ShapeKey = std::tuple<int, int, int, int, int, int, int, bool, bool, bool, bool, int, DecodeFencePolicy>;
+    using ShapeKey = std::tuple<int, int, int, int, int, int, int, bool, bool, bool, bool, int, DecodeFencePolicy, bool>;
     std::map<ShapeKey, StreamedPreparedPlan> prepared_plans;
 
     explicit StreamedAsyncContext(int device_) : device(device_) {}
@@ -300,7 +309,8 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     TORCH_CHECK(context, "W4FA8 streamed plan must be warmed outside graph capture on this caller stream");
     const int num_sms = execution.core.num_sms, tile_n = execution.decode_n;
     const int groups = b.size(0), n = b.size(1), k = a.size(1), m = d.size(0);
-    constexpr int threads = 512, core_smem = 256 * 1024;
+    const int threads = get_num_threads(execution.core);
+    const int core_smem = (execution.core.block_m + execution.core.block_n) * 128 * execution.core.num_stages;
     const bool is_fused = fused.tokens.defined();
     check_streamed_config(execution, m, n, k, groups, is_fused ? GemmType::MGroupedFused : GemmType::MGroupedNoPad);
     const bool allow_sparse = execution.empty_experts == EmptyExpertPolicy::Nonempty;
@@ -315,13 +325,14 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     // The entire event submission is atomic with respect to other host callers
     // using this caller stream; previously queued waits retain their event record.
     std::lock_guard<std::mutex> lock(context->submit_mutex);
-    const StreamedAsyncContext::ShapeKey key{m, n, k, groups, num_sms, chunk, tile_n, ramp, allow_sparse, is_fused, inv_scale != 1.f, int(execution.gather), execution.decode_fence};
+    const StreamedAsyncContext::ShapeKey key{m, n, k, groups, num_sms, chunk, tile_n, ramp, allow_sparse, is_fused, inv_scale != 1.f, int(execution.gather), execution.decode_fence, execution.group_activation_scales};
     // A captured call may only reuse resources and kernels warmed on this caller.
     auto prepared = context->prepared_plans.find(key);
     if (capturing && (prepared == context->prepared_plans.end() || !prepared->second.warmed || context->decoded.size() < size_t(parts) ||
                       context->consumed.size() < size_t(parts)))
         return false;
     StreamedGatherRuntime::Args gather_args{k, groups, {dim3(num_sms * 4), dim3(256), 0}, {}};
+    gather_args.group_activation_scales = execution.group_activation_scales;
     if (!capturing) context->reserve_events(parts);
     if (prepared == context->prepared_plans.end()) {
         TORCH_CHECK(!capturing, "W4FA8 streamed variant must be warmed outside graph capture");
@@ -337,8 +348,12 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
             // Graph replay; empty experts never require decoded weight traffic.
             pair.decode.empty_flat = allow_sparse && local_n == n;
             pair.decode.fuse_gather = chunk_gather && is_fused;
+            pair.decode.group_activation_scales = execution.group_activation_scales;
             pair.core = {n, k, local_n, local_groups, {dim3(num_sms), dim3(threads), core_smem}, {}};
             pair.core.apply_inv_scale = inv_scale != 1.f;
+            pair.core.group_activation_scales = execution.group_activation_scales;
+            pair.core.warp_m = execution.core.warp_m;
+            pair.core.block_m = execution.core.block_m;
             pair.decoder = compiler->build(StreamedDecodeRuntime::kernel_name(pair.decode),
                                            StreamedDecodeRuntime::generate(pair.decode));
             pair.gemm =
@@ -372,6 +387,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
             prof.add_params(std::string("quant_type"), std::string("group"));
         }
         prof.add_params(std::string("group_size"), 32);
+        prof.add_params(std::string("activation_group_size"), execution.group_activation_scales ? 128 : 0);
     }
     ProfilingInterface::Instance().instrument(true, prof);
     // Decode anew on every invocation; each buffer obeys the weight budget.
@@ -386,7 +402,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     w4fa8_streamed::GatherParams gather{};
     if (is_fused) {
         core_a = at::empty({m, k}, a.options());
-        core_scale = at::empty({m, 1}, a_scale.options());
+        core_scale = at::empty({m, a_scale.size(1)}, a_scale.options());
         gather = {reinterpret_cast<const uint8_t*>(a.data_ptr()),
                   a_scale.data_ptr<float>(),
                   reinterpret_cast<uint8_t*>(core_a.data_ptr()),

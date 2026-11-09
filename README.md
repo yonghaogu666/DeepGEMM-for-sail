@@ -160,7 +160,7 @@ For more information, please refer to the `moe_align_block_size` and `m_grouped_
 
 #### W4A8 dense and MoE GEMMs (M890)
 
-The W4A8 implementation accepts per-row E4M3 activations and group-32
+The W4A8 implementation accepts per-row or K-group-128 E4M3 activations and group-32
 MXFP4 E2M1 weights.
 The kernel dequantizes weights to E5M2 using FP4 MMA, performs E4M3 x E5M2
 MMA, accumulates in FP32, and writes BF16. It supports these layouts:
@@ -172,7 +172,23 @@ MMA, accumulates in FP32, and writes BF16. It supports these layouts:
 | `m_grouped_gemm_fp8_fp4_bf16_nt_masked` | `[E,T,K]` / `[E,T,1]` | `[E,T,N]`, valid rows only |
 | `m_grouped_gemm_fp8_fp4_bf16_nt_fused` | `[num_token,K]` / `[num_token,1]`, original token order | `[num_token*topk,N]`, grouped by expert |
 
-Activation scales are FP32. Dense weights are naturally packed uint8 `[N,K/2]`
+Activation scales are contiguous FP32. The table shows per-row scales; for
+group128, replace the trailing scale dimension `1` with `K/128`. Each scale
+multiplies the corresponding consecutive 128 activation values along K.
+The scale shape selects the mode; when K is 128 the modes are equivalent.
+`get_w4a8_activation_group_sizes()` returns `[0, 128]`, where zero denotes
+per-row scaling. Native and streamed execution both accept group128; masked
+routing uses native execution. `moe_align_block_size` and the nine-element
+tile configuration keep their existing signatures.
+
+Group128 accumulates one FP32 partial product per K128 tile, applies that
+tile's activation scale, then adds it to the final FP32 accumulator. Per-row
+execution retains its final-accumulator scaling. Weight decoding and its
+group-32 MXFP4 scale format are unchanged. The optional `inv_scale` remains
+a scalar applied exactly once; if folded into activation scales, it must be
+folded into every K-group scale, not just one column.
+
+Dense weights are naturally packed uint8 `[N,K/2]`
 with raw uint8 E8M0 scales `[N,K/32]`. Grouped weights use `[E,N,K/2]`
 (even K elements in the low nibble), with raw uint8 E8M0 scales
 `[E,N,K/32]`. `N % 64 == 0` and `K % 128 == 0` are required; arbitrary
@@ -231,7 +247,7 @@ Native tile selection and streamed execution policies are handled internally
 by the C++ runtime. For explicit streamed Dense/NoPad/Fused execution, use
 `(dg.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1)`.
 Streamed execution supports one or more experts, including dense GEMM, on PPU1.5.
-Subject to device, layout and workspace limits, automatic streamed execution
+For per-row scales, subject to device, layout and workspace limits, automatic streamed execution
 requires at least 512 rows per expert on average when `K >= 2048` and
 `ceil(N / 256) * (K / 128) >= 128`, or 1024 rows otherwise.
 It also requires enough M/N tiles in an expert chunk to fill one device wave;
@@ -240,8 +256,16 @@ by 384 MiB; a single-part plan allocates one buffer, and multi-part plans use tw
 When a single expert requires N slices to fit that budget, automatic streamed
 execution requires at least 1024 rows to amortize the additional decoding launches.
 Set `show_log=1` to print the selected tile, resources and streamed execution plan.
+For group128, dense/nopad automatic selection currently retains native execution;
+streamed execution is supported through an explicit config or a streamed fused
+routing config. Support does not imply streamed is faster for every scale mode.
+To bound live partial accumulators, the resolved group128 streamed compute tile
+uses M128/warp-M32 instead of M256/warp-M64, while the public gather tile stays
+M256. Native wide tiles retain their routing BlockM and use warp-N16 for
+group128. `show_log` reports the actual resolved compute tile and resources.
+Fused routing reserves activation workspace for both supported scale layouts.
 Before graph capture, warm up the selected configuration and unit/non-unit
-`inv_scale` variant on the capture stream.
+`inv_scale` variant and activation scale mode on the capture stream.
 Run `python tests/test_w4a8.py` for correctness coverage.
 
 For standard MXFP4 GEMM weights, use

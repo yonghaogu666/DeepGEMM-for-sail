@@ -28,7 +28,7 @@ from deep_gemm.utils.math import (
     cast_back_from_fp4,
 )
 from deep_gemm.testing.numeric import calc_diff, count_bytes
-from quantization import quant_w4, quant_activation, per_channel_cast_to_packed_int4
+from quantization import quant_w4, quant_activation, decode_activation, per_channel_cast_to_packed_int4
 import numpy as np
 
 global _acc_check, _benchmark, _ref_backend
@@ -651,7 +651,15 @@ def construct_non_permute_grouped(num_groups: int, num_token: int, k: int, n: in
             return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x, y_inv_scale)
+        x_quant = quant_activation(x, y_inv_scale, kwargs.get('activation_group_size', 0))
+        if _acc_check:
+            restored = decode_activation(*x_quant, y_inv_scale)
+            start = 0
+            for expert in range(num_groups):
+                tokens, _ = torch.where(topk_ids == expert)
+                count = tokens.numel()
+                ref_out[start:start + count] = restored[tokens] @ y[expert].float().T
+                start += count
         return (x_quant[0].to('cuda'),x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), topk_ids.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -760,7 +768,15 @@ def construct_contiguous_grouped(num_groups: int, m: int, k: int, n: int, d, dis
             return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda'))
         return m, (x_fp4[0].to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x, y_inv_scale)
+        x_quant = quant_activation(x, y_inv_scale, kwargs.get('activation_group_size', 0))
+        if _acc_check:
+            restored = decode_activation(*x_quant, y_inv_scale)
+            start = 0
+            for expert, count in enumerate(group_ms):
+                end = start + ceil_div(count, alignment) * alignment
+                ref_out[start:start + count] = restored[start:start + count] @ y[expert].float().T
+                ref_out[start + count:end].zero_()
+                start = end
         return m, (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return m, x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), m_indices.to('cuda'), out.to('cuda'), ref_out.to('cuda')
@@ -903,7 +919,10 @@ def construct_grouped_masked(num_groups: int, m: int, expected_m_per_group: int,
             return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), (out_quanted.to('cuda'), out_quanted_scale.to('cuda')), (ref_out_quanted.to('cuda'), ref_out_quanted_scale.to('cuda')), signal.to('cuda'), max_m
         return (x_fp4.to('cuda'), x_fp4_scale.to('cuda')), (y_fp4.to('cuda'), y_fp4_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda').to(torch.bfloat16), signal.to('cuda'), max_m
     elif d == 'w4fa8_mma':
-        x_quant = quant_activation(x, y_inv_scale)
+        x_quant = quant_activation(x, y_inv_scale, kwargs.get('activation_group_size', 0))
+        if _acc_check:
+            restored = decode_activation(*x_quant, y_inv_scale)
+            ref_out = torch.einsum('emk,enk->emn', restored, y.float()).bfloat16()
         return (x_quant[0].to('cuda'), x_quant[1].to('cuda')), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
     elif d in ('w4a16', 'w4fa16', 'w4fa16_mma'):
         return x.to('cuda'), (y_quant.to('cuda'), y_scale.to('cuda')), masked_m.to('cuda'), out.to('cuda'), ref_out.to('cuda'), signal.to('cuda'), max_m
@@ -1709,7 +1728,7 @@ def test_m_grouped_gemm_masked(args) -> None:
             f'epilogue_type:{epilogue_type},swiglu_limit:{swiglu_limit},with_bias:{int(bool(args.get("with_bias", False)))}')
     print(f'test_m_grouped_gemm_masked->test_func: {case}')
     if use_ppu:
-        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m)
+        x, y, masked_m, out, ref_out, signal, max_m = construct_grouped_masked(num_groups, m, expected_m_per_group, k, n, d, distribution, enable_sbo_overlap=enable_sbo_overlap, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, padding_m=max_m, activation_group_size=args.get('activation_group_size', 0))
         bias = make_grouped_fp4_bias(args)
         if bias is not None and _acc_check:
             ref_out = (ref_out.float() + bias.unsqueeze(1)).to(torch.bfloat16)
@@ -1829,7 +1848,7 @@ def test_m_grouped_gemm_fused(args) -> None:
     epilogue_type = args.get("epilogue_type", "Default")
     swiglu_limit = args.get("swiglu_limit", 0.0)
     if use_ppu:
-        x, y, topk_ids, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
+        x, y, topk_ids, out, ref_out = construct_non_permute_grouped(num_groups, num_token, k, n, topk, d, quant_type, group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, activation_group_size=args.get('activation_group_size', 0))
         # Extract main tensors for moe_align (may be tuples for quantized inputs)
         x_tensor = x[0] if isinstance(x, (tuple, list)) else x
         y_tensor = y[0] if isinstance(y, (tuple, list)) else y
@@ -1893,7 +1912,7 @@ def test_m_grouped_gemm_nopad(args) -> None:
     swiglu_limit = args.get("swiglu_limit", 0.0)
     print(UT)
     if use_ppu:
-        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit)
+        m, x, y, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, m, k, n, d, distribution, 1, quant_type=quant_type, group_size=group_size, epilogue_type=epilogue_type, swiglu_limit=swiglu_limit, activation_group_size=args.get('activation_group_size', 0))
         bias = make_grouped_fp4_bias(args)
         if bias is not None and _acc_check:
             ref_out = (ref_out.float() + bias[m_indices.long()]).to(torch.bfloat16)
