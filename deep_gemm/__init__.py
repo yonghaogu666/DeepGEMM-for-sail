@@ -87,7 +87,7 @@ from ._C import (
     preprocess_mxfp4_weight_for_act_and_quant_fusing,
     PreprocessMode,
     # W4FA8 (mxfp4 weights, per-row or group-128 FP8 activation)
-    dequantize_mxfp4_fp8,
+    get_w4a8_activation_group_sizes,
     fp8_fp4_gemm_nt,
     m_grouped_gemm_fp8_fp4_bf16_nt_nopad,
     m_grouped_gemm_fp8_fp4_bf16_nt_masked,

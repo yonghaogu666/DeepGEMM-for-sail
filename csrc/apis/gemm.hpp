@@ -19,7 +19,6 @@
 #include "../jit_kernels/impls/moe_align.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a16_gemm.hpp"
 #include "../jit_kernels/impls/m_grouped_w4a8_gemm.hpp"
-#include "../jit_kernels/impls/mxfp4_decode.hpp"
 #include "../jit_kernels/impls/ppuxx_acblaslt.hpp"
 
 namespace deep_gemm::gemm {
@@ -1992,7 +1991,7 @@ Returns (block_m, ceil_div(n, block_n)); the SBO-overlap signal check consumes b
           py::arg("activation_type") = std::nullopt);
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt, py::arg("lhs"), py::arg("rhs"), py::arg("out"),
           py::arg("configs") = std::nullopt, py::arg("inv_scale") = 1.0f);
-    m.def("dequantize_mxfp4_fp8", &deep_gemm::w4fa8::dequantize_mxfp4_fp8, py::arg("rhs"), py::arg("fp8_workspace"));
+    m.def("get_w4a8_activation_group_sizes", []() { return std::vector<int>{0, 128}; });
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_nopad",&m_grouped_gemm_fp8_fp4_bf16_nt_nopad,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_indices"),py::arg("m_rows")=std::nullopt,py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_masked",&m_grouped_gemm_fp8_fp4_bf16_nt_masked,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("masked_m"),py::arg("expected_m"),py::arg("configs")=std::nullopt,py::arg("inv_scale")=1.0f);
     m.def("m_grouped_gemm_fp8_fp4_bf16_nt_fused",&m_grouped_gemm_fp8_fp4_bf16_nt_fused,py::arg("lhs"),py::arg("rhs"),py::arg("out"),py::arg("m_rows"),py::arg("expert_ids_and_cumsum"),py::arg("sorted_token_ids"),py::arg("aligned_num_m_blocks"),py::arg("configs"),py::arg("inv_scale")=1.0f);

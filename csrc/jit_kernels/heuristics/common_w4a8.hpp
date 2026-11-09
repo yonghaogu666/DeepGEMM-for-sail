@@ -57,11 +57,13 @@ static int get_num_threads(const W4A8Config& c) {
     return int(threads);
 }
 
-static void check_config(const W4A8Config& c, int n, int k, GemmType kind) {
+static void check_config(const W4A8Config& c, int n, int k, GemmType kind,
+                         bool group_activation_scales = false) {
     DG_HOST_ASSERT(c.num_sms > 0 and c.num_sms <= get_num_sms());
     DG_HOST_ASSERT(c.block_m == 16 or c.block_m == 32 or c.block_m == 64);
     DG_HOST_ASSERT(c.warp_m == 16 or c.warp_m == 32 or c.warp_m == 64);
-    DG_HOST_ASSERT(c.block_m == c.warp_m and c.warp_n == 64);
+    DG_HOST_ASSERT(c.block_m == c.warp_m &&
+                   (c.warp_n == 64 || (group_activation_scales && c.warp_n == 32)));
     DG_HOST_ASSERT(c.block_n >= 64 and c.block_n % 64 == 0);
     // PPU1.5 AIU minimum 64B swizzle requires 128 packed-FP4 K elements.
     DG_HOST_ASSERT(c.block_k == 128 and c.warp_k == c.block_k);
@@ -374,7 +376,7 @@ static void check_native_kernel(const NativeKernelConfig& spec, int n, int k, in
         DG_HOST_ASSERT(c.num_stages >= 2 && c.num_stages <= 4 && n % 256 == 0 && k >= 512 && k % 128 == 0);
         DG_HOST_ASSERT(spec.fragment == FragmentPolicy::RollingK32);
     } else if (spec.fragment == FragmentPolicy::FullK) {
-        check_config(c, n, k, kind);
+        check_config(c, n, k, kind, spec.group_activation_scales);
     } else {
         DG_HOST_ASSERT(n >= 128);
         DG_HOST_ASSERT(c.warp_n == 32);
@@ -414,9 +416,15 @@ static W4A8Config get_best_configs(int expected_m, int n, int k, int groups, Gem
     if (group_activation_scales) {
         int bm = 16;
         while (bm < expected_m && bm < 64) bm *= 2;
+        // Measured M16-boundary tuning; all other workloads use the general tile.
+        if (kind == GemmType::MGroupedMasked && groups == 48 && expected_m == 16 &&
+            ((n == 4096 && k == 6144) || (n == 6144 && k == 2048)))
+            bm = 32;
         const int bn = n >= 256 ? 256 : n >= 128 ? 128 : 64;
-        W4A8Config c{get_num_sms(), bm, bn, 128, bm, 64, 128, 2, 1};
-        check_config(c, n, k, kind);
+        const int wn = bm == 64 && bn >= 128 ? 32 : 64;
+        const int stages = wn == 32 || (kind == GemmType::MGroupedMasked && bm == 32 && bn == 256) ? 3 : 2;
+        W4A8Config c{get_num_sms(), bm, bn, 128, bm, wn, 128, stages, 1};
+        check_config(c, n, k, kind, true);
         return c;
     }
     const int em = expected_m;

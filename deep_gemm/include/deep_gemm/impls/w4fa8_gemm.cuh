@@ -576,6 +576,12 @@ public:
         }
       };
 
+      auto activation_scale_row = [&](int local_row) -> int64_t {
+        if constexpr (Fused)
+          return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
+        else
+          return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+      };
       auto apply_inv_scale = [&](float scale) {
         if constexpr (ApplyInvScale)
           return scale * params.inv_scale;
@@ -591,7 +597,7 @@ public:
           static_assert(BlockK >= sizeof(float));
           for (int row = thread_idx; row < BlockM; row += MaxThreadsPerBlock) {
             const bool valid = row < residual_m;
-            const int64_t scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + (valid ? row : 0);
+            const int64_t scale_row = activation_scale_row(valid ? row : 0);
             cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(params.ptr_a_scale[scale_row], smem_row_scale[row],
                                                               valid);
           }
@@ -628,11 +634,7 @@ public:
             const int local_row = get<0>(tDcD(2 * row, m, 0));
             if (local_row >= residual_m)
               continue;
-            int64_t scale_row;
-            if constexpr (Fused) {
-              scale_row = params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
-            } else
-              scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+            const int64_t scale_row = activation_scale_row(local_row);
             const float a_scale = [&]() {
               if constexpr (GroupActivationScales)
                 return apply_inv_scale(1.f);
@@ -703,6 +705,19 @@ public:
             cp_async_fence();
             current_stage = (current_stage + 1) % kNumStages;
 
+            auto group_scales = make_tensor<float>(make_shape(size<1>(accum), Int<2>{}));
+            if constexpr (GroupActivationScales) {
+              Tensor row_coords = thr_mma.partition_C(cD);
+              CUTE_UNROLL
+              for (int mb = 0; mb < UsedM; ++mb) {
+                CUTE_UNROLL
+                for (int row = 0; row < 2; ++row) {
+                  const int local_row = get<0>(row_coords(2 * row, mb, 0));
+                  const int64_t scale_row = activation_scale_row(local_row < residual_m ? local_row : 0);
+                  group_scales(mb, row) = __ldg(params.ptr_a_scale + scale_row * (K / 128) + k_tile_idx);
+                }
+              }
+            }
             auto accum_k = make_tensor_like(accum);
             if constexpr (GroupActivationScales) clear(accum_k);
             auto& mma_accum = [&]() -> auto& {
@@ -813,20 +828,11 @@ public:
             }
 
             if constexpr (GroupActivationScales) {
-              Tensor row_coords = thr_mma.partition_C(cD);
               CUTE_UNROLL
               for (int mb = 0; mb < UsedM; ++mb) {
                 CUTE_UNROLL
                 for (int row = 0; row < 2; ++row) {
-                  const int local_row = get<0>(row_coords(2 * row, mb, 0));
-                  const int valid_row = local_row < residual_m ? local_row : 0;
-                  const int64_t scale_row = [&]() -> int64_t {
-                    if constexpr (Fused)
-                      return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + valid_row];
-                    else
-                      return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + valid_row;
-                  }();
-                  const float scale = params.ptr_a_scale[scale_row * (K / 128) + k_tile_idx];
+                  const float scale = group_scales(mb, row);
                   CUTE_UNROLL
                   for (int nb = 0; nb < size<2>(accum); ++nb) {
                     CUTE_UNROLL
@@ -850,10 +856,12 @@ public:
               process_k_tile_iteration(k_tile_idx);
             }
           } else {
-            if constexpr (!WideM)
+            constexpr bool CompactLoop = WideM || (GroupActivationScales &&
+                kGemmType == GemmType::MGroupedNoPad && WarpM == 64 && WarpN == 32);
+            if constexpr (!CompactLoop)
               process_k_tile_iteration(0);
 #pragma unroll 1
-            for (int k_tile_idx = WideM ? 0 : 1; k_tile_idx < k_tile_count; k_tile_idx++) {
+            for (int k_tile_idx = CompactLoop ? 0 : 1; k_tile_idx < k_tile_count; k_tile_idx++) {
               process_k_tile_iteration(k_tile_idx);
             }
           }
@@ -864,7 +872,9 @@ public:
           }
           epilogue_no_tsm(active_m);
         };
-        if constexpr (WideM || (Compact && WarpM >= 64)) {
+        if constexpr (WideM || (Compact && WarpM >= 64) ||
+                      (GroupActivationScales && kGemmType == GemmType::MGroupedMasked &&
+                       WarpM == 32 && N_EXPAND == 1 && ShapeK > 512)) {
           // Mutually exclusive branches keep each tail's accumulators local.
           // Independent predicates can merge their live ranges and spill.
           dispatch_tail((residual_m + WarpsOnM - 1) / WarpsOnM, process_active_rows);
