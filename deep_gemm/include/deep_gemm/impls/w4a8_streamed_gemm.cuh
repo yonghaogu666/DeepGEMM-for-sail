@@ -236,7 +236,9 @@ template <class Base, bool ApplyInvScale, bool GroupActivationScales = false> st
       auto tile = make_shape(size<0>(typename Base::TileShape{}), _1{});
       auto grouped = local_tile(scales, tile, make_coord(get<0>(coord), _));
       return make_tuple(get<0>(inputs), get<1>(inputs),
-                        make_tuple(grouped, get<2, 1>(inputs)), get<3>(inputs));
+                        make_tuple(grouped, get<2, 1>(inputs)), get<3>(inputs),
+                        min(int(size<0>(typename Base::TileShape{})),
+                            int(get<0>(shape) - get<0>(coord) * size<0>(typename Base::TileShape{}))));
     } else {
       return inputs;
     }
@@ -297,7 +299,10 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
   using Params = typename Parent::Params;
   using DispatchPolicy = typename Base::DispatchPolicy;
   using TileShape = typename Base::TileShape;
-  using SharedStorage = typename Base::SharedStorage;
+  static constexpr int CachedScaleElements = deep_gemm::w4fa8_streamed::group_scale_pipeline_elements(
+      cute::size<0>(TileShape{}), DispatchPolicy::Stages, sizeof(typename Base::SharedStorage), GroupActivationScales);
+  using SharedStorage = deep_gemm::w4fa8_streamed::GroupScaleStorage<
+      typename Base::SharedStorage, CachedScaleElements>;
   using ElementScale = typename Base::ElementScale;
   using SmemLayoutA = typename Base::SmemLayoutA;
   using SmemLayoutB = typename Base::SmemLayoutB;
@@ -314,6 +319,50 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
   using Base::gmem_tiled_copy_scaleA;
   static constexpr bool SplitAIU = Base::SplitAIU;
   template <class Shape> CUTLASS_DEVICE W4A8SingleRegisterMainloop(Params p, Shape shape) : Parent(p, shape) {}
+
+  template <class... Ts>
+  CUTLASS_DEVICE void prologue(cute::tuple<Ts...> const& inputs,
+                               int& k_tile_iter, int& k_tile_count,
+                               int thread_idx, int smem_pipe_write,
+                               bool tile_valid, char* smem_buf) {
+    using namespace cute;
+    if constexpr (CachedScaleElements > 0) {
+      if (tile_valid) {
+        auto& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+        auto gSFA = get<2, 0>(inputs);
+        const int valid_rows = get<4>(inputs);
+        const int groups = size<2>(gSFA);
+        using Operand = cutlass::gemm::config::DefaultGemm_AIU_Operand<
+            typename Base::ArchTag, ElementScale, false,
+            decltype(size<0>(TileShape{})), _1, false, 1, false>;
+        typename Operand::GmemTiledCopy copy_op;
+        using Tiler = typename Operand::GmemTiledCopy::Tiler_MN;
+        auto strides = make_stride(groups, _1{});
+        auto view = make_tensor(make_gmem_ptr(raw_pointer_cast(gSFA.data())),
+                                make_shape(valid_rows, groups), strides);
+        auto tiles = local_tile(make_mix_tensor_like(view),
+                               make_tile(size<0>(TileShape{}), _1{}), make_coord(_0{}, _));
+        copy_op.desc_.template init<ElementScale, false, get<0>(Tiler{}), get<1>(Tiler{})>(
+            nullptr, valid_rows, groups, strides);
+        auto thr = copy_op.get_slice(thread_idx);
+        auto src = thr.partition_S(tiles);
+        auto shared = make_tensor(make_smem_ptr(storage.group_scales),
+            tile_to_shape(typename Operand::SmemLayoutAtom{},
+                make_shape(size<0>(TileShape{}), _1{}, Int<DispatchPolicy::Stages>{})));
+        auto dst = thr.partition_D(shared);
+        if (canonical_warp_idx_sync() == 2) {
+          CUTE_UNROLL
+          for (int group = 0; group < DispatchPolicy::Stages; ++group)
+            if (group < groups) copy(copy_op, src(_, _, _, group), dst(_, _, _, group));
+        }
+      }
+    }
+    // The first operand-stage fence also commits the scale prefetches.
+    // Consumers use the existing operand wait and CTA barrier.
+    Parent::prologue(inputs, k_tile_iter, k_tile_count, thread_idx,
+                     smem_pipe_write, tile_valid, smem_buf);
+  }
+
   template <class... Ts, class FrgTensorD, class FrgTensorC, class ResidueMNK>
   CUTLASS_DEVICE void operator()(FrgTensorD& accum, cute::tuple<Ts...> const& load_inputs, FrgTensorC const& src_accum,
                                  int k_tile_iter, int k_tile_count, ResidueMNK residue_mnk, int thread_idx,
@@ -355,6 +404,33 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
     for (int i = 0; i < size(tSpSA); ++i) {
       tSpSA(i) = get<0>(tSFAcSFA(i)) < get<0>(residue_mnk);
     }
+    using ScaleOperand = cutlass::gemm::config::DefaultGemm_AIU_Operand<
+        typename Base::ArchTag, ElementScale, false, decltype(size<0>(TileShape{})), _1, false, 1, false>;
+    typename ScaleOperand::GmemTiledCopy group_scale_copy;
+    using ScaleTiler = typename ScaleOperand::GmemTiledCopy::Tiler_MN;
+    const int valid_scale_rows = min(int(size<0>(TileShape{})), int(get<0>(residue_mnk)));
+    const int scale_groups = size<2>(gSFA);
+    auto scale_stride = make_stride(scale_groups, _1{});
+    auto scale_view = make_tensor(make_gmem_ptr(raw_pointer_cast(gSFA.data())),
+        make_shape(valid_scale_rows, scale_groups), scale_stride);
+    auto scale_tiles = local_tile(make_mix_tensor_like(scale_view),
+        make_tile(size<0>(TileShape{}), _1{}), make_coord(_0{}, _));
+    group_scale_copy.desc_.template init<ElementScale, false, get<0>(ScaleTiler{}), get<1>(ScaleTiler{})>(
+        nullptr, valid_scale_rows, scale_groups, scale_stride);
+    auto scale_copy_thread = group_scale_copy.get_slice(thread_idx);
+    auto scale_src = scale_copy_thread.partition_S(scale_tiles);
+    auto copy_group_scale = [&](int group) {
+      if constexpr (CachedScaleElements > 0) {
+        auto sGroup = make_tensor(make_smem_ptr(storage.group_scales),
+            tile_to_shape(typename ScaleOperand::SmemLayoutAtom{},
+                make_shape(size<0>(TileShape{}), _1{}, Int<DispatchPolicy::Stages>{})));
+        auto scale_dst = scale_copy_thread.partition_D(sGroup);
+        // As in the W8A8 collective, one warp issues the scale tile load.
+        if (warp_idx == 2)
+          copy(group_scale_copy, scale_src(_, _, _, group),
+               scale_dst(_, _, _, group % DispatchPolicy::Stages));
+      }
+    };
     bool scaleCopySendDone = false;
     if (k_tile_count > 0) {
       copy_aiu<SplitAIU>(gmem_tiled_copy_A, tAgA(_, _, _, k_tile_iter), tAsA(_, _, _, smem_pipe_write),
@@ -397,6 +473,7 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrA_copy_view));
     CUTE_STATIC_ASSERT_V(size<2>(tCrB) == size<2>(tCrB_copy_view));
     auto partial = make_tensor_like(accum);
+    auto group_scale_regs = make_tensor<ElementScale>(make_shape(size<0>(accum), size<1>(accum)));
     auto& mma_accum = [&]() -> auto& {
       if constexpr (GroupActivationScales) return partial;
       else return accum;
@@ -406,12 +483,30 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
       if constexpr (GroupActivationScales) {
         if (k_block == 0) clear(partial);
       }
+      if constexpr (CachedScaleElements > 0) {
+        if (k_block == 0) {
+          auto coords = thr_mma.partition_C(make_identity_tensor(take<0, 2>(TileShape{})));
+          CUTE_UNROLL
+          for (int m = 0; m < size<1>(accum); ++m) {
+            CUTE_UNROLL
+            for (int i = 0; i < size<0>(accum); ++i) {
+              const int row = get<0>(coords(i, m, 0));
+              // The AIU descriptor already zero-fills rows outside this tile.
+              group_scale_regs(i, m) =
+                  storage.group_scales[(consumed_k_tiles % DispatchPolicy::Stages) * size<0>(TileShape{}) + row];
+            }
+          }
+        }
+      }
       copy(smem_tiled_copy_A, tCsA_p(_, _, k_block), tCrA_copy_view(_, _, Int<0>{}));
       copy(smem_tiled_copy_B, tCsB_p(_, _, k_block), tCrB_copy_view(_, _, Int<0>{}));
       if (k_block == K_BLOCK_MAX - 1) {
         cp_async_wait<DispatchPolicy::Stages - 2>();
         __syncthreads();
         if (k_tile_count > 0) {
+          // Every warp has read the old scale into registers before the
+          // barrier above. Reuse that ring slot with the next operand stage.
+          if constexpr (CachedScaleElements > 0) copy_group_scale(k_tile_iter);
           copy_aiu<SplitAIU>(gmem_tiled_copy_A, tAgA(_, _, _, k_tile_iter), tAsA(_, _, _, smem_pipe_write),
                              gmem_tiled_copy_B, tBgB(_, _, _, k_tile_iter), tBsB(_, _, _, smem_pipe_write), warp_idx);
         } else if constexpr (!GroupActivationScales) {
@@ -440,7 +535,12 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
             CUTE_UNROLL
             for (int i = 0; i < size<0>(accum); ++i) {
               const int row = get<0>(coords(i, m, 0));
-              const float scale = row < get<0>(residue_mnk) ? gSFA(row, 0, consumed_k_tiles) : 0.f;
+              const float scale = [&]() {
+                if constexpr (CachedScaleElements > 0)
+                  return group_scale_regs(i, m);
+                else
+                  return row < get<0>(residue_mnk) ? gSFA(row, 0, consumed_k_tiles) : 0.f;
+              }();
               CUTE_UNROLL
               for (int n = 0; n < size<2>(accum); ++n)
                 accum(i, m, n) += partial(i, m, n) * scale;

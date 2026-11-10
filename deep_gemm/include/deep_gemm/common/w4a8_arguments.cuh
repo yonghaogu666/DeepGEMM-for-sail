@@ -16,6 +16,18 @@ template <class Storage> struct RowScaleStorage<Storage, 0> : Storage {};
 
 namespace deep_gemm::w4fa8_streamed {
 inline constexpr int kBlockM = 256;
+// Stage K128 scales alongside the operand pipeline, independent of total K.
+// Host launch sizing and device storage use the same capacity decision.
+constexpr int group_scale_pipeline_elements(int rows, int stages, int operand_bytes, bool grouped) {
+  const int64_t elements = int64_t(rows) * stages;
+  return grouped && operand_bytes + elements * sizeof(float) <= 256 * 1024 ? int(elements) : 0;
+}
+
+template <class Storage, int Elements> struct GroupScaleStorage : Storage {
+  alignas(128) float group_scales[Elements];
+};
+template <class Storage> struct GroupScaleStorage<Storage, 0> : Storage {};
+
 struct GroupedRowRangeArguments {
   uint32_t shape_m;
   int32_t* grouped_layout;

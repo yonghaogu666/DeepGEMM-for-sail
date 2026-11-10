@@ -21,6 +21,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **M890 streamed W4A8 group128 GEMM**: caches each CTA's activation
+  scales in a bounded shared-memory ring alongside operand prefetches.
+  Uses AIU zero-fill for partial rows without redundant per-element masks.
+  Includes the ring in launch-memory sizing and retains uncached reads
+  when it would exceed the shared-memory budget.
+  E5M2 expanded weights, accumulation order, and per-row scaling are unchanged.
+
 - **M890 W4A4 MegaMoE**: optimizes dispatch, GEMM scheduling, and
   scatter/reduce to improve computation and communication overlap.
   - Renames `mma_type="fp4xfp4"` to `"mxf4xmxf4"` and

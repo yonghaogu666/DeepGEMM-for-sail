@@ -310,7 +310,10 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
     const int num_sms = execution.core.num_sms, tile_n = execution.decode_n;
     const int groups = b.size(0), n = b.size(1), k = a.size(1), m = d.size(0);
     const int threads = get_num_threads(execution.core);
-    const int core_smem = (execution.core.block_m + execution.core.block_n) * 128 * execution.core.num_stages;
+    const int operand_smem = (execution.core.block_m + execution.core.block_n) * 128 * execution.core.num_stages;
+    const int core_smem = operand_smem + sizeof(float) * w4fa8_streamed::group_scale_pipeline_elements(
+        execution.core.block_m, execution.core.num_stages, operand_smem,
+        execution.group_activation_scales);
     const bool is_fused = fused.tokens.defined();
     check_streamed_config(execution, m, n, k, groups, is_fused ? GemmType::MGroupedFused : GemmType::MGroupedNoPad);
     const bool allow_sparse = execution.empty_experts == EmptyExpertPolicy::Nonempty;

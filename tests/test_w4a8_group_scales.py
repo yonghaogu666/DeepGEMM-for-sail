@@ -32,9 +32,12 @@ def test_group128_dense(k):
     assert calc_diff(out, expected[0]) < 0.0015
 
 
-def test_group128_streamed_random_reference():
+@pytest.mark.parametrize("k", [1024, 1152, 1280, 1408, 2048, 6144, 16384, 16512])
+def test_group128_streamed_random_reference(k):
+    # Exercise each four-stage ring tail, repeated wraps, both projection K
+    # sizes, and large K without allocating scales for the entire reduction.
     torch.manual_seed(33)
-    lhs, rhs, reference = operands((4, 300, 2048), 1024)
+    lhs, rhs, reference = operands((4, 300, k), 1024)
     counts = [0, 1, 129, 300]
     rows = torch.tensor(counts, device="cuda", dtype=torch.int32)
     a = torch.cat([lhs[0][i, :count] for i, count in enumerate(counts)])
@@ -42,12 +45,26 @@ def test_group128_streamed_random_reference():
     expected = torch.cat([reference[i, :count] for i, count in enumerate(counts)])
     indices = torch.repeat_interleave(torch.arange(4, device="cuda", dtype=torch.int32), rows.long())
     out = torch.empty_like(expected)
-    config = (deep_gemm.get_num_sms(), 256, 256, 128, 64, 64, 128, 4, 1)
-    deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
-        (a, scales), rhs[:2], out, indices, rows, config, inv_scale=rhs[2]
-    )
+    # A small persistent grid forces CTA storage reuse across output tiles.
+    config = (min(4, deep_gemm.get_num_sms()), 256, 256, 128, 64, 64, 128, 4, 1)
+
+    def run():
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            (a, scales), rhs[:2], out, indices, rows, config, inv_scale=rhs[2]
+        )
+
+    run()
     assert torch.isfinite(out).all()
     assert calc_diff(out, expected) < 0.0015
+    graph = capture_warmed(run)
+    for _ in range(3):
+        scales.mul_(0.5)
+        expected.mul_(0.5)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        assert calc_diff(out, expected) < 0.0015
 
 
 @pytest.mark.parametrize("group_size", [0, 128])
