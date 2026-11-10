@@ -201,13 +201,16 @@ def _reference_activation(projection, case):
 
 
 def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_raw,
-                        num_tokens, checked, *, quantization_aware=True, projection_dtype=torch.float32):
+                        num_tokens, checked, *, quantization_aware=True, projection_dtype=None):
     """Independent MoE with MXFP4 weights and optional activation quantization.
 
     The FP32 diagnostic retains the supplied MXFP4 weights: it measures activation
     quantization/rounding error, not accuracy against an unquantized model.
     """
     c = case
+    if projection_dtype is None:
+        # SiTU matches grouped GEMM -> BF16 -> standalone activation semantics.
+        projection_dtype = torch.bfloat16 if quantization_aware and c.activation == "situ" else torch.float32
     rank_idx, num_ranks = dist.get_rank(), dist.get_world_size()
     num_experts_per_rank = case.experts // num_ranks
     if quantization_aware:

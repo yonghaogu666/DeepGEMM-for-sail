@@ -373,7 +373,7 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                     activation_alpha=case.activation_alpha, **replica_options)
                 return y
 
-            def reference(checked, *, projection_dtype=torch.float32):
+            def reference(checked, *, projection_dtype=None):
                 return _reference_mega_moe(case, source, ids, weights, w1_raw, w2_raw,
                                           tokens, checked, projection_dtype=projection_dtype)
 

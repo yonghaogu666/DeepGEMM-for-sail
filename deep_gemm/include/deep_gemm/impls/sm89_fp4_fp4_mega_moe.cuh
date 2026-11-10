@@ -28,6 +28,21 @@
 namespace deep_gemm {
 using namespace cute;
 
+template <bool ApplyClamp, bool kHasLinearBeta, bool FastMath>
+struct MegaMoESiTUActivationOp
+    : GatedActivationOp<GatedActivation::SiTU, ApplyClamp, kHasLinearBeta, FastMath> {
+    using Base = GatedActivationOp<GatedActivation::SiTU, ApplyClamp, kHasLinearBeta, FastMath>;
+    using typename Base::Params;
+
+    template <typename T>
+    CUTLASS_DEVICE static T apply(T gate, T up, const Params& params) {
+        // Match grouped GEMM's BF16 output consumed by standalone SiTU.
+        gate = T(cutlass::bfloat16_t(gate));
+        up = T(cutlass::bfloat16_t(up));
+        return Base::apply(gate, up, params);
+    }
+};
+
 template <int N, int K, int BM, int BN, int BK, int WM, int WN,
           int Groups, int Stages, int Ranks, MegaMoEPhaseKind Stage,
           int CopyBlocks = 0, int KTilesPerFlag = 0,
@@ -82,7 +97,9 @@ struct MegaMoEMxfp4Kernel {
             ElementD, 2, float, float, cutlass::epilogue::thread::ScaleType::Nothing,
             cutlass::FloatRoundStyle::round_to_nearest, float>,
         cutlass::gemm::EpilogueDefault, N % BN == 0, ApplyClamp, kEpilogue,
-        GatedActivationOp<Activation, ApplyClamp, kHasLinearBeta, FastMath>>;
+        std::conditional_t<Activation == GatedActivation::SiTU,
+            MegaMoESiTUActivationOp<ApplyClamp, kHasLinearBeta, FastMath>,
+            GatedActivationOp<Activation, ApplyClamp, kHasLinearBeta, FastMath>>>;
     using ScatterEpilogue = epilogue::Fp4ScatterEpilogue<
         StrideCD, StrideCD, Layout<Shape<Int<(BM / WM) * 16>, Int<BN>>, cute::Stride<Int<BN>, _1>>,
         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, float>, float, ElementD,
