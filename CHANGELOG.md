@@ -21,6 +21,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **Paged MQA metadata**: validate that explicit `next_n` matches `context_lens`.
+  For M890 grouped FP8 H32/D128 with 64-token pages, matching shape metadata is
+  recommended for scheduling performance; compatibility schedules remain accepted.
+
 - **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
   FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
   even except for N=1 without an explicit configuration; that path requires

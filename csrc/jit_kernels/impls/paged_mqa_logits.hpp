@@ -130,6 +130,7 @@ public:
         std::string scale_mode;
         int smem_size, num_threads;
         std::string kernel_name;
+        bool pipeline_epilogue = false;
     };
 
     struct Args {
@@ -140,6 +141,8 @@ public:
 
     static std::string generate_impl(const Args& args) {
         const auto& info = args.launch_info;
+        const auto epilogue_suffix = info.kernel_class == "PPUPagedMqaLogits"
+            ? fmt::format(", {}", info.pipeline_epilogue) : "";
         return fmt::format(
             R"(
 #include <{}>
@@ -165,7 +168,7 @@ constexpr uint32_t kScaleMode = {};
 using AttnKernel = cutlass::gemm::kernel::{}<
   ElementQK, ElementAcc, ElementLogits, ElementWeights,
   kNextN, kNumHeads, kHeadDim, PAGE_KV, SPLIT_KV, BLOCK_KV, WARP_KV,
-  kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode
+  kNumQStages, kNumKVStages, SPLIT_MBLOCK, kScaleMode{}
 >;
 
 // The host computes these instead of reading them off the kernel type, so pin them down here
@@ -185,7 +188,7 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.next_n, info.num_heads, info.head_dim, info.page_kv, info.split_kv, info.block_kv, info.warp_kv,
-            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class,
+            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class, epilogue_suffix,
             info.smem_size, info.num_threads, info.kernel_name);
     }
 
@@ -204,7 +207,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
                                     const std::string& element_weights, const std::string& dtype_tag, int next_n,
                                     int num_heads, int head_dim, int page_kv, int block_kv, int smem_size, int num_threads,
                                     int num_blocks, const std::string& kernel_name, bool is_avg,
-                                    const ArgumentsT& kernel_params) {
+                                    const ArgumentsT& kernel_params, bool pipeline_epilogue = false) {
     using Runtime = PagedMqaLogitsRuntime<ArgumentsT>;
     const bool is_fp4 = dtype_tag == "fp4";
     const dim3 block(num_threads, 1, 1);
@@ -213,7 +216,8 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
     const auto& args = typename Runtime::Args{
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         next_n, num_heads, head_dim, page_kv, tile.split_kv, block_kv, tile.warp_kv,
-                        tile.stage_q, tile.stage_k, split_mblock, scale_mode, smem_size, num_threads, kernel_name},
+                        tile.stage_q, tile.stage_k, split_mblock, scale_mode, smem_size, num_threads, kernel_name,
+                        pipeline_epilogue},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -277,7 +281,7 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     int split_kv = kPagedMqaBlockKV * 4;
     if (metadata_extra.has_value()) {
         const auto& [extra_next_n, num_heads, head_dim, element_size] = *metadata_extra;
-        next_n = extra_next_n;
+        TORCH_CHECK(extra_next_n == next_n, "metadata_extra next_n must match context_lens");
         const auto& tile =
             deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
         split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
@@ -402,6 +406,13 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                        static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
                                        block_table_ptr, schedule_meta_ptr});
     } else {
+        // Keep the measured M890 VERIFY tile and enough KV work to amortize
+        // the pending partials. Short contexts use the immediate epilogue.
+        const bool pipeline_epilogue = not is_avg and qk_dtype == torch::kFloat8_e4m3fn
+            and logits_dtype == torch::kFloat32 and next_n == 5 and num_heads == 32
+            and head_dim == 128 and page_kv == 64 and max_context_len >= 32768
+            and tile.split_kv == 64 and tile.warp_kv == 32
+            and tile.stage_q == 2 and tile.stage_k == 3 and get_ppu_arch() == AC_PPU0015;
         launch_paged_mqa_logits(
             "deep_gemm/impls/ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", false, scale_mode, tile, element_qk, element_acc, element_logits,
             element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV, smem_size, num_threads, num_blocks,
@@ -412,7 +423,7 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                     static_cast<uint64_t>(aligned_max_context_len),
                                     static_cast<uint64_t>(kv_cache_stride_bytes),
                                     static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
-                                    block_table_ptr, schedule_meta_ptr});
+                                    block_table_ptr, schedule_meta_ptr}, pipeline_epilogue);
     }
 
     // NOTES: the kernel writes into the padded buffer, the caller only sees the valid window

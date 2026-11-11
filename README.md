@@ -403,6 +403,15 @@ Paged logits require external masking of positions outside each context;
 `clean_logits=True` is unsupported. `fp8_paged_mqa_logits` now defaults to
 `clean_logits=False`, matching this requirement.
 
+For grouped FP8 verification on M890 (H32, D128, page size 64, `2 <= next_n <= 5`),
+pass Q as `[batch, next_n, 32, 128]` and one block-table row per request. This
+lets the kernel reuse each K tile across a request's queries. Provide
+`context_lens[batch, next_n]` with the longest length last in each request.
+To balance KV work across CTAs, build the schedule with
+`metadata_extra=(next_n, 32, 128, 1)` and the same configured CU count.
+Omitting `metadata_extra` uses compatibility scheduling and remains supported.
+The result has `batch * next_n` rows in request order.
+
 For more information, please refer to the corresponding `*_mqa_logits` and `*_paged_mqa_logits` function documentation.
 
 #### Sparse MQA logits (Zhenwu M890)

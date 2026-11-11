@@ -4,7 +4,7 @@
 # W4A16 INT4 and MXFP4 VALU paths are covered on both 810E and 890P.
 # W4A16 MXFP4 MMA and W4FA8 (MXFP4 weights / per-row FP8 activation) are covered on 890P.
 # MQA coverage focuses on FP8/FP4, plus one BF16 and one INT8 smoke case.
-# Eight paged MQA cases total, including avg, sparse, and the INT8 smoke case.
+# Paged MQA includes grouped verification, AVG, sparse, and INT8 smoke coverage.
 # Sections are split per UT type; append new cases under the matching section.
 
 # ============ DenseGemm ============
@@ -290,6 +290,12 @@ PagedMqaLogits,data_type:bf16,batch_size:4,next_n:1,num_heads:32,head_dim:128,di
 # --- PagedMqaLogits / fp8 ---
 PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32,logits_dtype:fp32
 PagedMqaLogits,data_type:fp8,batch_size:64,next_n:2,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:128,logits_dtype:fp32
+# VERIFY: five query rows share each request's page table; include page tails.
+PagedMqaLogits,data_type:fp8,batch_size:4,next_n:5,num_heads:32,head_dim:128,distribution:[257,128,65,193],page_kv:64,max_context_len:320,logits_dtype:fp32
+# Pipelined VERIFY epilogue: multiple tiles, request switches, empty contexts and tails.
+PagedMqaLogits,data_type:fp8,batch_size:4,next_n:5,num_heads:32,head_dim:128,distribution:[32769,65,0,8193],page_kv:64,max_context_len:32769,logits_dtype:fp32
+# Immediate epilogue just below the long-context dispatch boundary.
+PagedMqaLogits,data_type:fp8,batch_size:1,next_n:5,num_heads:32,head_dim:128,distribution:[32767],page_kv:64,max_context_len:32767,logits_dtype:fp32
 
 # --- PagedMqaLogits / fp4 ---
 PagedMqaLogits,data_type:fp4,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1],page_kv:64,logits_dtype:bf16

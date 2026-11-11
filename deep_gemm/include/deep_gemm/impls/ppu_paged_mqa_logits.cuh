@@ -14,7 +14,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           bool SPLIT_MBLOCK = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
+          uint32_t kScaleMode = deep_gemm::kScaleModeWeights,
+          bool PipelineEpilogue = false>
 class PPUPagedMqaLogits {
 public:
     static_assert(PAGE_KV == 32 || PAGE_KV == 64 || PAGE_KV == 128, "Invalid KV page size");
@@ -71,6 +72,9 @@ public:
   static constexpr int MinBlocksPerMultiprocessor = 1;
   static constexpr bool WarpInterleaving = (MaxThreadsPerBlock == 512);
   static_assert(!(WarpInterleaving && kNumQStages == 1), "warp-interleave does not support stage_q = 1");
+  static_assert(!PipelineEpilogue || (cute::is_same_v<ElementLogits, float>
+      && kScaleMode == deep_gemm::kScaleModeWeights && WARP_Q == 1 && !WarpInterleaving),
+      "Pipelined epilogue requires weighted FP32 logits without warp interleaving");
 
   // Match each page32 transfer's swizzle; BF16 keeps its split-K layout.
   static constexpr int kKVSmemRows = sizeof(ElementQK) == 2 ? BLOCK_M : (PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV);
@@ -433,6 +437,8 @@ public:
 
     static constexpr uint32_t kMmaIterM = MmaIterM{};
     float scale_kv_array[kMmaIterM * 2];
+    float pending_partial[kMmaIterM * 2];
+    uint32_t pending_q = 0, pending_kv = 0;
 
     auto load_kv_scale_s2r = [&]() {
         float * smem_kv_scales = sSFA(_,_,smem_pipe_read_kv).data().get();
@@ -553,6 +559,32 @@ public:
             }
         }
     };
+    // Keep the weighted lane-local sums and scales until the next tile's
+    // first MMA, where the independent shuffle/store can be interleaved.
+    auto prepare_partial = [&]() {
+        if constexpr (PipelineEpilogue) {
+            #pragma unroll
+            for (int m = 0; m < kMmaIterM; ++m) {
+                deep_gemm::float_epilogue_reduce_weights(
+                    accum, m, weights, pending_partial[2 * m], pending_partial[2 * m + 1]);
+            }
+        }
+    };
+    auto finish_partial = [&]() {
+        if constexpr (PipelineEpilogue) {
+            const auto base = (pending_q * kNextN + warp_q_idx) * params.logits_stride
+                + pending_kv * BLOCK_KV + warp_offset;
+            #pragma unroll
+            for (int m = 0; m < kMmaIterM; ++m) {
+                float v_0 = pending_partial[2 * m];
+                float v_1 = pending_partial[2 * m + 1];
+                deep_gemm::shfl_xor_reduce_2(v_0, v_1);
+                params.logits[base + m * InstM + v_0_offset] = v_0 * scale_kv_array[2 * m];
+                params.logits[base + m * InstM + v_1_offset] = v_1 * scale_kv_array[2 * m + 1];
+            }
+        }
+    };
+
     // load qk
     for (int i = 0; i < kNumKVStages - 1; i++) {
         load_next_qk_g2s(i == 0);
@@ -611,12 +643,22 @@ public:
         for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
             copy(smem_tiled_copy_A, tCsA(_,_,k_block,smem_pipe_read_kv), tCrA_copy_view(_,_,k_block));
             cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrB(_,_,k_block), accum);
+            if constexpr (PipelineEpilogue && !first && decltype(k_block)::value == 0)
+                finish_partial();
         });
 
         deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
 
         load_kv_scale_s2r();
-        epilogue(q_idx, actual_kv);
+        if constexpr (PipelineEpilogue) {
+            // The partial already contains the current weights, so loading
+            // a new request's Q/weights before finish_partial is safe.
+            prepare_partial();
+            pending_q = q_idx;
+            pending_kv = actual_kv;
+        } else {
+            epilogue(q_idx, actual_kv);
+        }
 
         cp_async_wait<kNumKVStages - 2>();
         if constexpr (!WarpInterleaving) {
@@ -630,11 +672,16 @@ public:
         clear(accum);
     };
 
-    if (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+    const bool has_work = !scheduler.is_last_task(q_idx, kv_idx_base);
+    if (has_work) {
         mainloop(cute::true_type{});
     }
     while (!scheduler.is_last_task(q_idx, kv_idx_base)) {
         mainloop(cute::false_type{});
+    }
+    if constexpr (PipelineEpilogue) {
+        if (has_work)
+            finish_partial();
     }
 
     deep_gemm::warp_interleave_end<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
