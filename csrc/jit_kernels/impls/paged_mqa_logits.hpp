@@ -38,6 +38,7 @@ public:
 
     struct LaunchInfo {
         int split_kv, num_sms;
+        bool use_max_context_len;
         std::string kernel_name;
     };
 
@@ -63,11 +64,12 @@ __global__ void {}(
   const uint32_t* __restrict__ context_lens,
   uint32_t* __restrict__ schedule_metadata
 ) {{
-  smxx_paged_mqa_logits_metadata_device<SPLIT_KV, kNumSMs>(batch_size, next_n, context_lens, schedule_metadata);
+  smxx_paged_mqa_logits_metadata_device<SPLIT_KV, kNumSMs, {}>(batch_size, next_n, context_lens, schedule_metadata);
 }}
 }}
 )",
-            args.launch_info.split_kv, args.launch_info.num_sms, args.launch_info.kernel_name);
+            args.launch_info.split_kv, args.launch_info.num_sms, args.launch_info.kernel_name,
+            args.launch_info.use_max_context_len);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -122,7 +124,7 @@ struct PagedMqaLogitsArguments {
     uint32_t batch_size;
     uint64_t logits_stride;
     uint64_t kv_cache_stride_bytes;
-    uint32_t block_table_stride;
+    uint64_t block_table_stride;
     const uint32_t* context_lens;
     void* logits;
     const uint32_t* block_table;
@@ -140,7 +142,7 @@ struct PagedMqaLogitsFP4Arguments {
     uint32_t batch_size;
     uint64_t logits_stride;
     uint64_t kv_cache_stride_bytes;
-    uint32_t block_table_stride;
+    uint64_t block_table_stride;
     const uint32_t* context_lens;
     void* logits;
     const uint32_t* block_table;
@@ -163,6 +165,7 @@ public:
         int smem_size, num_threads;
         std::string kernel_name;
         std::string grouped_template_args;
+        bool direct_k_scale = false;
     };
 
     struct Args {
@@ -218,7 +221,8 @@ __global__ void {}(
 )",
             info.include_header, info.element_qk, info.element_acc, info.element_logits, info.element_weights,
             info.next_n, info.num_heads, info.head_dim, info.page_kv, info.split_kv, info.block_kv, info.warp_kv,
-            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class, info.grouped_template_args,
+            info.num_q_stages, info.num_kv_stages, info.split_mblock, info.scale_mode, info.kernel_class,
+            info.kernel_class == "PPUPagedMqaLogits" ? fmt::format(", {}", info.direct_k_scale) : info.grouped_template_args,
             info.smem_size, info.num_threads, info.kernel_name);
     }
 
@@ -280,19 +284,22 @@ static HgtxRangeGuard show_fp4_varlen_ut(DgProfParam& params) {
     return HgtxRangeGuard(message);
 }
 
-// Dispatch helper. Unlike the non-paged kernel the grid is not derived from occupancy: it is
-// `num_blocks`, which the caller took from the `schedule_meta` table built earlier.
+// Dispatch helper. The resolved plan supplies the tile and active metadata-worker prefix;
+// occupancy is queried only for diagnostics.
 template <typename ArgumentsT>
 static void launch_paged_mqa_logits(const std::string& include_header, const std::string& kernel_class,
                                     bool split_mblock, const std::string& scale_mode,
-                                    const deep_gemm_mqa_common::PagedTile& tile, const std::string& element_qk,
+                                    const deep_gemm_mqa_common::PagedLaunchPlan& plan, const std::string& element_qk,
                                     const std::string& element_acc, const std::string& element_logits,
                                     const std::string& element_weights, const std::string& dtype_tag, int next_n,
                                     int num_heads, int head_dim, int page_kv, int block_kv, int smem_size, int num_threads,
-                                    int num_blocks, const std::string& kernel_name, bool is_avg,
-                                    const ArgumentsT& kernel_params, bool grouped = false, int max_context_len = 0) {
+                                    const std::string& kernel_name, bool is_avg,
+                                    const ArgumentsT& kernel_params) {
     using Runtime = PagedMqaLogitsRuntime<ArgumentsT>;
     const bool is_fp4 = dtype_tag == "fp4";
+    const auto& tile = plan.tile;
+    const int num_blocks = plan.num_blocks;
+    const bool grouped = plan.grouped;
     const dim3 block(num_threads, 1, 1);
     const dim3 grid(num_blocks, 1, 1);
 
@@ -300,7 +307,7 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
         .launch_info = {include_header, kernel_class, element_qk, element_acc, element_logits, element_weights,
                         next_n, num_heads, head_dim, page_kv, tile.split_kv, block_kv, tile.warp_kv,
                         tile.stage_q, tile.stage_k, split_mblock, scale_mode, smem_size, num_threads, kernel_name,
-                        grouped ? fmt::format(", {}", tile.tb_per_cu) : ""},
+                        grouped ? fmt::format(", {}", tile.tb_per_cu) : "", tile.direct_k_scale},
         .launch_args = {grid, block, smem_size},
         .kernel_params = kernel_params,
     };
@@ -320,17 +327,27 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
         printf("[paged_mqa_logits%s:]\n", is_fp4 ? "_fp4" : "");
         printf("kNumHeads:%d, kHeadDim:%d%s, kNextN:%d, PAGE_KV:%d, SPLIT_KV:%d\n", num_heads, head_dim,
                is_fp4 ? "(packed)" : "", next_n, page_kv, tile.split_kv);
+        const int block_n = plan.mma.query_tiles * plan.mma.num_heads;
         printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", block_kv,
-               next_n * num_heads, tile.warp_kv, num_heads, tile.stage_q, tile.stage_k);
-        printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
-               num_blocks, num_threads);
+               block_n, tile.warp_kv, plan.mma.num_heads, tile.stage_q, tile.stage_k);
+        if (num_heads == 8) {
+            printf("H8 query pairing: 2 queries per N16 tile, independent query lengths\n");
+            printf("H8 KV path: %s, K scale load: %s\n", tile.stage_k == 1 ? "single tile" : "pipeline",
+                   tile.direct_k_scale ? "global" : "shared");
+        }
+        printf("num_sms:%d, max_blocks_per_cu:%d, threadblock_count:%d, num_threads:%d, scheduled_blocks_per_cu:%d\n",
+               num_sms, blocks_per_cu, num_blocks, num_threads, tile.tb_per_cu);
         printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
         printf("weights_bf16:%s\n", element_weights == "__ppu_bfloat16" ? "true" : "false");
         if (grouped)
             printf("schedule:request_grouped, block_q:%d\n", next_n);
-        if (num_sms * blocks_per_cu != num_blocks) {
-            printf("Warning: num_blocks(%d) should equal to num_sms(%d) * max_blocks_per_cu(%d) = %d\n", num_blocks,
-                   num_sms, blocks_per_cu, num_sms * blocks_per_cu);
+        // The resolved plan may intentionally schedule fewer blocks than the
+        // kernel's maximum residency (H8 uses one cap across all S=1-6 tiles).
+        if (num_heads == 8 && num_blocks < num_sms * tile.tb_per_cu) {
+            printf("H8 capacity limit: launched %d of %d metadata workers\n", num_blocks, num_sms * tile.tb_per_cu);
+        } else if (num_sms * tile.tb_per_cu != num_blocks) {
+            printf("Warning: num_blocks(%d) differs from metadata plan: num_sms(%d) * scheduled_blocks_per_cu(%d) = %d\n",
+                   num_blocks, num_sms, tile.tb_per_cu, num_sms * tile.tb_per_cu);
         }
     }
 
@@ -341,13 +358,13 @@ static void launch_paged_mqa_logits(const std::string& include_header, const std
             is_fp4 ? head_dim * 2 : head_dim,
             reinterpret_cast<int*>(const_cast<uint32_t*>(kernel_params.context_lens)), current_stream(), is_avg);
         dg_prof_params.add_params("page_kv", page_kv);
+        dg_prof_params.add_params("max_context_len", plan.max_context_len);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")
             dg_prof_params.add_params("weights_dtype", std::string("bf16"));
         if constexpr (std::is_same_v<ArgumentsT, PagedMqaLogitsFP4Arguments>) {
             if (grouped) {
-                dg_prof_params.add_params("max_context_len", max_context_len);
                 dg_prof_params.add_params("is_varlen", true);
                 add_fp4_varlen_dump_params(dg_prof_params, kernel_params.grouped_meta,
                                            kernel_params.context_lens, kernel_params.batch_size);
@@ -371,21 +388,18 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     const bool is_fp4 = get_ppu_arch() == AC_PPU0015 and qk_dtype == torch::kInt8;
     const int head_dim = is_fp4 ? logical_head_dim / 2 : logical_head_dim;
     const int element_size = static_cast<int>(c10::elementSize(qk_dtype));
-    const auto tile = is_fp4 and num_heads != 4 and indices.has_value()
-        ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
-        : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim, element_size);
-    const int split_kv = tile.split_kv, tb_per_cu = tile.tb_per_cu;
-
-    const int num_blocks = num_sms * tb_per_cu;
-    if (is_fp4 and num_heads != 4 and indices.has_value()) {
-        const int rows = num_blocks + 1 + batch_size;
+    const auto config = deep_gemm_mqa_common::get_paged_mqa_logits_metadata_config(
+        next_n, page_kv, num_heads, head_dim, element_size, batch_size, num_sms,
+        is_fp4 and num_heads != 4 and indices.has_value());
+    if (config.grouped) {
+        const int rows = config.num_workers + 1 + batch_size;
         // Keep the prefix workspace alive with its opaque metadata owner.
         // A temporary tensor can alias the logits allocation in Graph replay.
         auto storage = torch::empty({rows * 4 + batch_size * 2}, context_lens.options());
         auto metadata = storage.slice(0, 0, rows * 4).view({rows, 4});
         const auto& args = FP4VarlenMetadataRuntime::Args{
-            .launch_args = {dim3(1, 1, 1), dim3(256, 1, 1), 0},
-            .block_q = deep_gemm_mqa_common::FP4PagedVarlenConfig::kQueryHeadRows / num_heads, .split_kv = split_kv, .workers = num_blocks,
+            .launch_args = {dim3(1, 1, 1), dim3(config.num_threads, 1, 1), config.smem_size},
+            .block_q = config.block_q, .split_kv = config.split_kv, .workers = config.num_workers,
             .singleton_cost_multiplier = deep_gemm_mqa_common::FP4PagedVarlenConfig::kSingletonCostMultiplier,
             .nq = static_cast<uint32_t>(batch_size),
             .lengths = reinterpret_cast<const uint32_t*>(context_lens.data_ptr()),
@@ -399,15 +413,13 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
         return metadata;
     }
     auto schedule_metadata = torch::empty(
-        {num_blocks + 1, 2}, torch::TensorOptions().dtype(context_lens.scalar_type()).device(context_lens.device()));
+        {config.num_workers + 1, 2}, torch::TensorOptions().dtype(context_lens.scalar_type()).device(context_lens.device()));
 
     const std::string kernel_name = "attention_paged_mqa_logits_metadata";
-    const int num_threads = std::min(batch_size, 1024);
-    const int smem_size = batch_size * 4;
     // kNumSMs is the total block count, rather than the number of physical CUs.
     const auto& args = PagedMqaLogitsMetadataRuntime::Args{
-        .launch_info = {split_kv, num_blocks, kernel_name},
-        .launch_args = {dim3(1, 1, 1), dim3(num_threads, 1, 1), smem_size},
+        .launch_info = {config.split_kv, config.num_workers, config.use_max_context_len, kernel_name},
+        .launch_args = {dim3(1, 1, 1), dim3(config.num_threads, 1, 1), config.smem_size},
         .kernel_args = {static_cast<uint32_t>(batch_size), static_cast<uint32_t>(next_n),
                         reinterpret_cast<const uint32_t*>(context_lens.data_ptr()),
                         reinterpret_cast<uint32_t*>(schedule_metadata.data_ptr())},
@@ -447,9 +459,10 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                    .view(is_fp4 ? torch::kInt32 : torch::kFloat32);
 
     const bool grouped = is_fp4 and not is_avg and schedule_meta.size(1) == 4;
-    const auto tile = grouped ? deep_gemm_mqa_common::get_fp4_varlen_tile(num_heads)
-        : deep_gemm_mqa_common::get_paged_mqa_logits_tile(next_n, page_kv, num_heads, head_dim,
-                                                          static_cast<int>(q.element_size()));
+    const auto plan = deep_gemm_mqa_common::get_paged_mqa_logits_launch_plan(
+        next_n, page_kv, num_heads, head_dim, static_cast<int>(q.element_size()),
+        batch_size, max_context_len, schedule_meta_size - 1, grouped);
+    const auto& tile = plan.tile;
     if (is_fp4)
         TORCH_CHECK((schedule_meta_size - (grouped ? batch_size : 0)) ==
                      get_num_sms() * tile.tb_per_cu + 1,
@@ -465,14 +478,6 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
                                torch::TensorOptions().dtype(logits_dtype).device(q.device()));
 
     const void* weights_ptr = is_avg ? nullptr : weights.data_ptr();
-    // The kernel pads 4 heads to 16 per warp N tile (BLOCK_N = ceil(next_n/4)*16), so the
-    // host-side smem/thread computations use the same padded geometry.
-    int tile_next_n = next_n, tile_num_heads = num_heads;
-    if (grouped) tile_next_n = deep_gemm_mqa_common::FP4PagedVarlenConfig::kQueryHeadRows / num_heads;
-    if (num_heads == 4) {
-        tile_num_heads = 16;
-        tile_next_n = (next_n + 3) / 4;
-    }
     const std::string scale_mode = is_avg ? "deep_gemm::kScaleModeUnity" : "deep_gemm::kScaleModeWeights";
 
     const bool weights_bf16 = logits_dtype == torch::kBFloat16 and weights.scalar_type() == torch::kBFloat16;
@@ -490,15 +495,10 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
         element_qk = "int8_t", element_acc = "int32_t", dtype_tag = "int8";
     }
 
-    // The grouped implementation caches only Q stage 0 scales; JIT asserts
-    // this host storage accounting against the instantiated kernel type.
     const int smem_size = deep_gemm_mqa_common::get_paged_smem_config(
-        tile, tile_next_n, tile_num_heads, head_dim, static_cast<int>(q.element_size()),
-        static_cast<int>(weights.element_size()), is_fp4)
-        - (grouped ? tile_next_n * tile_num_heads *
-            (tile.stage_q - 1) * 4 : 0);
-    const int num_threads = deep_gemm_mqa_common::get_paged_num_threads(tile, tile_next_n);
-    const int num_blocks = schedule_meta_size - (grouped ? batch_size : 0) - 1;
+        plan, head_dim, static_cast<int>(q.element_size()),
+        static_cast<int>(weights.element_size()), is_fp4);
+    const int num_threads = deep_gemm_mqa_common::get_paged_num_threads(plan);
     const auto& kernel_name = "attention_paged_mqa_logits_" + dtype_tag + (is_avg ? "_avg" : "");
 
     const auto* context_lens_ptr = reinterpret_cast<const uint32_t*>(context_lens.data_ptr());
@@ -509,33 +509,33 @@ static torch::Tensor paged_mqa_logits(const torch::Tensor& q, const torch::Tenso
         auto args = PagedMqaLogitsFP4Arguments{q.data_ptr(), reinterpret_cast<const uint32_t*>(q_sf->data_ptr()),
             k.data_ptr(), reinterpret_cast<const uint32_t*>(k_scales.data_ptr()), weights_ptr,
             static_cast<uint32_t>(batch_size), static_cast<uint64_t>(aligned_max_context_len),
-            static_cast<uint64_t>(kv_cache_stride_bytes), static_cast<uint32_t>(block_table_stride),
+            static_cast<uint64_t>(kv_cache_stride_bytes), static_cast<uint64_t>(block_table_stride),
             context_lens_ptr, logits.data_ptr(), block_table_ptr, schedule_meta_ptr,
-            grouped ? schedule_meta_ptr + (num_blocks + 1) * 4 : nullptr};
+            grouped ? schedule_meta_ptr + (plan.num_blocks + 1) * 4 : nullptr};
         if (grouped) {
             launch_paged_mqa_logits("deep_gemm/impls/fp4_paged_mqa_logits.cuh",
-                "PPUGroupedPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
-                element_qk, element_acc, element_logits, element_weights, dtype_tag, tile_next_n,
+                "PPUGroupedPagedMqaLogitsFP4", tile.split_mblock, scale_mode, plan,
+                element_qk, element_acc, element_logits, element_weights, dtype_tag, plan.kernel_next_n,
                 num_heads, head_dim, page_kv, deep_gemm_mqa_common::FP4PagedVarlenConfig::kBlockKV,
-                smem_size, num_threads, num_blocks,
-                kernel_name + "_grouped", false, args, true, max_context_len);
+                smem_size, num_threads,
+                kernel_name + "_grouped", false, args);
         } else {
             launch_paged_mqa_logits(
-                "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, scale_mode, tile,
+                "deep_gemm/impls/fp4_paged_mqa_logits.cuh", "PPUPagedMqaLogitsFP4", tile.split_mblock, scale_mode, plan,
                 element_qk, element_acc, element_logits, element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV,
-                smem_size, num_threads, num_blocks, kernel_name, is_avg, args);
+                smem_size, num_threads, kernel_name, is_avg, args);
         }
     } else {
         launch_paged_mqa_logits(
-            "deep_gemm/impls/ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", false, scale_mode, tile, element_qk, element_acc, element_logits,
-            element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV, smem_size, num_threads, num_blocks,
+            "deep_gemm/impls/ppu_paged_mqa_logits.cuh", "PPUPagedMqaLogits", false, scale_mode, plan, element_qk, element_acc, element_logits,
+            element_weights, dtype_tag, next_n, num_heads, head_dim, page_kv, kPagedMqaBlockKV, smem_size, num_threads,
             kernel_name, is_avg,
             PagedMqaLogitsArguments{q.data_ptr(), k.data_ptr(),
                                     k_scales.defined() ? k_scales.data_ptr<float>() : nullptr, weights_ptr,
                                     static_cast<uint32_t>(batch_size),
                                     static_cast<uint64_t>(aligned_max_context_len),
                                     static_cast<uint64_t>(kv_cache_stride_bytes),
-                                    static_cast<uint32_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
+                                    static_cast<uint64_t>(block_table_stride), context_lens_ptr, logits.data_ptr(),
                                     block_table_ptr, schedule_meta_ptr});
     }
 

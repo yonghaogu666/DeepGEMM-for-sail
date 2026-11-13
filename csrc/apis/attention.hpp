@@ -130,8 +130,11 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
     // Avg variant: an empty weights tensor selects it;
     // the optional q_scale rides in the kernel's weights slot
     const bool is_avg = weights.numel() == 0;
-    TORCH_CHECK(is_avg ? num_heads == 4 : (num_heads == 32 or num_heads == 64),
-                is_avg ? "AVG indexer requires num_heads=4" : "DSA indexer requires num_heads=32 or 64");
+    const bool is_h8_fp8 = not is_fp4 and q.scalar_type() == torch::kFloat8_e4m3fn
+                          and num_heads == 8;
+    TORCH_CHECK(is_avg ? num_heads == 4 : (is_h8_fp8 or num_heads == 32 or num_heads == 64),
+                is_avg ? "AVG indexer requires num_heads=4"
+                       : "DSA indexer requires num_heads=32/64, or FP8 num_heads=8");
     if (is_avg) {
         TORCH_CHECK(is_fp4 or q.scalar_type() == torch::kFloat8_e4m3fn,
                     "avg variant supports fp8 or packed fp4 only");
@@ -213,7 +216,8 @@ static torch::Tensor mqa_logits_common(const torch::Tensor& q, const torch::Tens
 //   block_table:    int32 [batch_size, max_block_len]
 //   schedule_meta:  opaque int32 metadata from `get_paged_mqa_logits_metadata`;
 //                   legacy uses two columns, request-grouped FP4 DSA uses four.
-//   max_context_len: maximum context length
+//   max_context_len: output capacity; caller guarantees every context_lens entry
+//                    is in [0, max_context_len]
 //   clean_logits:   whether to mask out-of-range logits with -inf (unsupported here, see below)
 //   logits_dtype:   output logits dtype, float32 or bfloat16
 //   q_sf:           UE8M0 scale for Q (FP4 only), int32 [batch, next_n, num_heads].
@@ -227,10 +231,14 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     const bool is_fp4 = q_sf.has_value();
     check_indexer_arch(q.scalar_type(), is_fp4);
     const bool is_avg = weights.numel() == 0;
+    TORCH_CHECK(max_context_len >= 0, "max_context_len must be nonnegative");
     const auto qk_dtype = q.scalar_type();
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
-    TORCH_CHECK(is_avg ? num_heads == 4 : (num_heads == 32 or num_heads == 64),
-                is_avg ? "AVG indexer requires num_heads=4" : "DSA indexer requires num_heads=32 or 64");
+    const bool is_h8_fp8 = not is_fp4 and qk_dtype == torch::kFloat8_e4m3fn
+                          and num_heads == 8;
+    TORCH_CHECK(is_avg ? num_heads == 4 : (is_h8_fp8 or num_heads == 32 or num_heads == 64),
+                is_avg ? "AVG indexer requires num_heads=4"
+                       : "DSA indexer requires num_heads=32/64, or FP8 num_heads=8");
     check_indexer_head_dim(head_dim, is_fp4);
     const auto& [num_kv_blocks, page_kv, num_heads_kv, kv_last_dim] = get_shape<4>(fused_kv_cache);
     check_paged_mqa_page_size(page_kv);
@@ -243,8 +251,8 @@ static torch::Tensor paged_mqa_logits_common(const torch::Tensor& q, const torch
     DG_HOST_ASSERT(num_heads_kv == 1);
     const bool grouped = is_fp4 and not is_avg and meta_info_size == 4;
     DG_HOST_ASSERT(grouped or ((schedule_meta_size - 1) % get_num_sms() == 0 and meta_info_size == 2));
-    TORCH_CHECK(is_avg ? (1 <= next_n and next_n <= 6) : next_n == 1,
-                "weighted paged indexer requires next_n == 1; AVG supports next_n in [1, 6]");
+    TORCH_CHECK((is_avg or is_h8_fp8) ? (1 <= next_n and next_n <= 6) : next_n == 1,
+                "weighted H32/H64 paged indexer requires next_n == 1; AVG and FP8 H8 support next_n in [1, 6]");
     TORCH_CHECK(context_lens.is_contiguous(), "context_lens must be contiguous");
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt32);
     DG_HOST_ASSERT(block_table.stride(1) == 1);
@@ -424,10 +432,12 @@ torch::Tensor get_paged_mqa_logits_metadata(
     TORCH_CHECK(num_sms > 0, "num_sms must be positive");
     const auto& [n, h, d, qk_dtype] = *metadata_extra;
     TORCH_CHECK(n == context_lens.size(1), "metadata_extra next_n must match context_lens");
-    TORCH_CHECK(h == 4 or h == 32 or h == 64,
-                "metadata_extra num_heads must be 4 (AVG) or 32/64 (DSA)");
-    TORCH_CHECK(h == 4 or n == 1, "weighted metadata requires next_n == 1");
+    TORCH_CHECK(h == 4 or h == 8 or h == 32 or h == 64,
+                "metadata_extra num_heads must be 4 (AVG), 8 (FP8), or 32/64 (DSA)");
+    TORCH_CHECK(h == 4 or h == 8 or n == 1, "weighted H32/H64 metadata requires next_n == 1");
     const auto arch = get_ppu_arch();
+    TORCH_CHECK(h != 8 or (arch == AC_PPU0015 and qk_dtype == torch::kFloat8_e4m3fn),
+                "H8 metadata requires FP8 E4M3 and M890");
     TORCH_CHECK(h != 4 or arch == AC_PPU0015, "AVG metadata requires M890 and num_heads=4");
     TORCH_CHECK((arch == AC_PPU0010 and qk_dtype == torch::kInt8) or
                 (arch == AC_PPU0015 and (qk_dtype == torch::kInt8 or qk_dtype == torch::kFloat8_e4m3fn)),

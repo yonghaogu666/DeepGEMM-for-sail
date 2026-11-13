@@ -33,6 +33,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   Callers provide the maximum context in each request run's last query.
   Metadata generated without indices retains independent per-query scheduling.
 
+- **M890 FP8 H8 indexer**: adds native H8 with D64/D128 to
+  `fp8_mqa_logits` and `fp8_paged_mqa_logits`, avoiding H64 padding.
+  Retains FP32 weighted-ReLU logits; paged H8 supports `next_n=1–6`
+  with independent per-query lengths. Optimizes logits scheduling and
+  paged metadata generation. See the [indexer API guide](docs/api/indexer.md).
+
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
   weights with BF16 output. Callers select fused decoding or per-call
@@ -116,8 +122,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   FP32; INT8 infers BF16 or FP32 logits from weights dtype and no longer
   accepts `logits_dtype`. New weighted MXFP4 APIs fix weights/logits to BF16,
   omit `clean_logits` / `logits_dtype`, and require compressed non-paged
-  output. Weighted paged APIs require `next_n=1`; legacy FP8/INT8 reject
-  non-None request indices, while MXFP4 requires them.
+  output. Weighted paged APIs require `next_n=1`, except M890 FP8 H8
+  supports `next_n=1–6`; legacy FP8/INT8 reject non-None request indices,
+  while MXFP4 requires them.
 - **AVG indexer API**: removes `clean_logits`, makes non-paged
   `max_seqlen_k` mandatory and positive, and defaults all AVG logits to BF16
   with optional FP32 output. Paged AVG retains `next_n=1–6` and places
@@ -129,7 +136,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   MXFP4 callers now pass logical D128 instead of packed D64.
 - **Indexer shape contracts**: rejects unsupported dimensions and head counts
   before dispatch. FP8/INT8 require logical D64/D128; MXFP4 requires D128.
-  DSA requires H32/H64, AVG H4, and sparse H32. Adds D64 check-in coverage.
+  DSA requires H32/H64 (also H8 for M890 FP8), AVG H4, and sparse H32.
+  Adds D64 check-in coverage.
 - **Indexer metadata and output layout**: provides a compatibility
   `get_mqa_logits_metadata` stub returning None; dense MXFP4 ignores
   `schedule_meta`. Sparse logits expose only logical candidate columns,
@@ -148,6 +156,10 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   APIs and the nine-element config format remain unchanged.
 
 ### Fixed
+
+- **Indexer correctness**: fixes empty-window scheduling, page32 pipeline
+  loads and large-tensor address calculations. Validates output capacity
+  and bounds generated replay contexts by that capacity.
 
 - **Paged indexer metadata synchronization**: moves the existing scan barriers
   after shared-memory writes in both the main and tail prefix scans, preventing

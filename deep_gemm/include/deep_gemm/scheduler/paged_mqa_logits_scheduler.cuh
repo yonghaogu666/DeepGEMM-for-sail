@@ -5,17 +5,31 @@
 
 namespace deep_gemm {
 
+// H8 accepts independent, unordered lengths for all queries of a request.
+// Existing AVG / weighted H32/H64 metadata retains its last-token contract.
+template <bool kUseMaxContextLen = false>
+__device__ __forceinline__ uint32_t paged_mqa_context_len(
+        const uint32_t* context_lens, uint32_t request, uint32_t next_n) {
+    const auto* row = context_lens + request * next_n;
+    uint32_t length = __ldg(row + next_n - 1);
+    if constexpr (kUseMaxContextLen) {
+        for (uint32_t token = 0; token + 1 < next_n; ++token)
+            length = max(length, __ldg(row + token));
+    }
+    return length;
+}
+
 // The C++ JIT emits its own `extern "C" __global__` entry that forwards here.
-template <uint32_t SPLIT_KV, uint32_t kNumSMs>
+template <uint32_t SPLIT_KV, uint32_t kNumSMs, bool kUseMaxContextLen = false>
 __device__ __forceinline__
 void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint32_t next_n,
                                           const uint32_t* context_lens, uint32_t* schedule_metadata) {
     extern __shared__ uint32_t prefix_sum[];
     const uint32_t tid = threadIdx.x;
 
-    // load context lens (2D indexing: take last token's context_len per request)
+    // Load each request's KV extent using the same policy as the scheduler.
     for (uint32_t k = tid; k < batch_size; k += blockDim.x) {
-        prefix_sum[k] = math::ceil_div(__ldg(context_lens + k * next_n + next_n - 1), SPLIT_KV);
+        prefix_sum[k] = math::ceil_div(paged_mqa_context_len<kUseMaxContextLen>(context_lens, k, next_n), SPLIT_KV);
     }
     __syncthreads();
 
@@ -88,7 +102,7 @@ void smxx_paged_mqa_logits_metadata_device(const uint32_t batch_size, const uint
 }
 
 
-template <uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups, uint32_t kNextN>
+template <uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups, uint32_t kNextN, bool kUseMaxContextLen = false>
 struct PagedMQALogitsScheduler {
     uint32_t batch_size;
     const uint32_t* context_lens;
@@ -107,8 +121,8 @@ struct PagedMQALogitsScheduler {
         current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumMathWarpGroups;
         end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpGroups;
 
-        uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-        current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+        current_num_kv = current_q_idx < batch_size ? math::ceil_div(
+            paged_mqa_context_len<kUseMaxContextLen>(this->context_lens, current_q_idx, kNextN), BLOCK_KV) : 0;
     }
 
     __device__ __forceinline__ bool fetch_next_task(uint32_t &q_idx, uint32_t &kv_idx, uint32_t &num_kv) {
@@ -121,13 +135,37 @@ struct PagedMQALogitsScheduler {
 
         current_kv_idx += kNumMathWarpGroups;
         if (current_kv_idx >= current_num_kv) {
-            ++ current_q_idx;
+            current_q_idx = next_q_idx(current_q_idx);
             current_kv_idx = 0;
-            uint32_t idx = current_q_idx * kNextN + kNextN - 1;
-            current_num_kv = current_q_idx < batch_size ? math::ceil_div(__ldg(this->context_lens + idx), BLOCK_KV) : 0;
+            current_num_kv = current_q_idx < batch_size ? math::ceil_div(
+                paged_mqa_context_len<kUseMaxContextLen>(this->context_lens, current_q_idx, kNextN), BLOCK_KV) : 0;
         }
 
         return true;
+    }
+
+    __device__ __forceinline__ uint32_t next_q_idx(uint32_t q_idx) const {
+        ++q_idx;
+        if constexpr (kUseMaxContextLen) {
+            // H8 metadata assigns no KV tasks to empty requests. Keep the
+            // scheduler and Q lookahead on the same next nonempty request.
+            if (__builtin_expect(q_idx < end_q_idx &&
+                    paged_mqa_context_len<kUseMaxContextLen>(context_lens, q_idx, kNextN) == 0, false)) {
+                // All lanes enter together. Scan long empty runs a warp at a
+                // time; the usual adjacent nonempty request stays scalar.
+                const uint32_t lane = threadIdx.x % 32;
+                while (q_idx < end_q_idx) {
+                    const uint32_t candidate = q_idx + lane;
+                    const bool live = candidate < end_q_idx &&
+                        paged_mqa_context_len<kUseMaxContextLen>(context_lens, candidate, kNextN) != 0;
+                    const uint32_t mask = __ballot_sync(0xffffffffu, live);
+                    if (mask != 0)
+                        return q_idx + __ffs(mask) - 1;
+                    q_idx = min(q_idx + 32, end_q_idx);
+                }
+            }
+        }
+        return q_idx;
     }
 
     __device__ __forceinline__ bool exist_q_idx(const uint32_t& q_idx) const {

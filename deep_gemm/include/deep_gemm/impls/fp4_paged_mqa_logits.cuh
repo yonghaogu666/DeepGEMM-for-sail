@@ -33,7 +33,7 @@ struct FP4PagedArguments {
     const uint32_t batch_size;
     const uint64_t logits_stride;
     const uint64_t kv_cache_stride_bytes;
-    const uint32_t block_table_stride;
+    const uint64_t block_table_stride;
     const uint32_t* context_lens;
     ElementLogits* logits;
     const uint32_t* block_table;

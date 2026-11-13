@@ -15,6 +15,12 @@
 using namespace deep_gemm;
 namespace deep_gemm_mqa_common {
 
+enum class MqaLogitsSchedule {
+    PersistentQ,
+    OutputTiles,
+    QKVTiles,
+};
+
 // Tile / stage selection for the non-paged MQA logits kernel
 struct MqaLogitsConfig {
     int block_q, block_qh, block_kv;
@@ -25,6 +31,9 @@ struct MqaLogitsConfig {
     int m_block_group = 0;
     bool q_owner_epilogue = false;
     bool balance_output_tiles = false;
+    // QKVTiles uses one for the Q/K grid; larger values flatten tasks over workers.
+    int kv_partitions = 1;
+    MqaLogitsSchedule schedule = MqaLogitsSchedule::PersistentQ;
 };
 
 // Logits row stride must be 1024-byte aligned
@@ -62,6 +71,29 @@ static int get_num_threads(const MqaLogitsConfig& config) {
     return (config.block_qh / config.warp_qh) * (config.block_kv / config.warp_kv) * 32;
 }
 
+static std::pair<unsigned, unsigned> get_mqa_logits_grid(
+        const MqaLogitsConfig& config, uint64_t seq_len_q, uint64_t seq_len_k, uint64_t capacity) {
+    DG_HOST_ASSERT(capacity > 0);
+    if (config.schedule == MqaLogitsSchedule::PersistentQ)
+        return {static_cast<unsigned>(capacity), 1};
+    const uint64_t q_blocks = ceil_div(seq_len_q, static_cast<uint64_t>(config.block_q));
+    if (config.schedule == MqaLogitsSchedule::OutputTiles) {
+        const uint64_t tasks = q_blocks * (config.balance_output_tiles ? 2 : 1);
+        // Preserve a valid launch for the existing empty-Q AVG path.
+        return {static_cast<unsigned>(std::min(capacity, std::max(uint64_t{1}, tasks))), 1};
+    }
+    if (config.kv_partitions > 1) {
+        const uint64_t tasks = q_blocks * config.kv_partitions;
+        return {static_cast<unsigned>(std::min(capacity, tasks)), 1};
+    }
+    const uint64_t q_workers = std::min(capacity, std::max(uint64_t{1}, q_blocks));
+    const uint64_t key_tiles = ceil_div(seq_len_k, static_cast<uint64_t>(config.block_kv));
+    // Fill unused Q-axis residency with independent output-column partitions.
+    // Per-query GPU bounds still determine the actual work in each partition.
+    const uint64_t kv_splits = std::min(std::max(uint64_t{1}, key_tiles), ceil_div(capacity, q_workers));
+    return {static_cast<unsigned>(q_workers), static_cast<unsigned>(kv_splits)};
+}
+
 // ============================ Paged =============================
 
 // Pipeline stages, KV splitting, warp shape and occupancy selected for paged MQA.
@@ -69,6 +101,33 @@ struct PagedTile {
     int stage_q, stage_k, split_kv, warp_kv;
     bool split_mblock;
     int tb_per_cu;
+    bool direct_k_scale = false;
+};
+
+struct PagedMmaGeometry {
+    int query_tiles, num_heads;
+};
+
+static PagedMmaGeometry get_paged_mma_geometry(int next_n, int num_heads) {
+    // Match the device's N16 packing for H4/H8, including an odd query tail.
+    const int mma_heads = std::max(16, num_heads);
+    return {ceil_div(next_n, mma_heads / num_heads), mma_heads};
+}
+
+struct PagedLaunchPlan {
+    PagedTile tile;
+    int num_blocks;
+    PagedMmaGeometry mma;
+    int max_context_len;
+    int kernel_next_n;
+    bool grouped = false;
+};
+
+struct PagedMetadataConfig {
+    int split_kv, num_workers, num_threads, smem_size;
+    bool use_max_context_len;
+    bool grouped = false;
+    int block_q = 1;
 };
 
 // Fixed M890 FP4 DSA grouped plan, resolved on the host and passed to JIT kernels.
@@ -106,47 +165,59 @@ static PagedTile get_fp4_varlen_tile(int num_heads) {
 // Dynamic shared memory of the paged kernel, mirroring `PPUPagedMqaLogits::SharedStorage`.
 // NOTES: the M extent is `split_kv` (all math warp groups), not `block_kv` -- verified against
 // `SharedStorageSize`, and the generated code carries a `static_assert` to keep it honest.
-static int get_paged_smem_config(const PagedTile& tile, int next_n, int num_heads, int head_dim,
+static int get_paged_smem_config(const PagedLaunchPlan& plan, int head_dim,
                                  int qk_element_size, int weights_element_size, bool is_fp4) {
+    const auto& tile = plan.tile;
     const int block_m = tile.split_kv;
-    const int block_n = next_n * num_heads;
+    const int block_n = plan.mma.query_tiles * plan.mma.num_heads;
     const int smem_q = block_n * head_dim * tile.stage_q * qk_element_size;
     const int smem_k = block_m * head_dim * tile.stage_k * qk_element_size;
     const int smem_k_scale = block_m * tile.stage_k * 4;
-    const int smem_q_scale = is_fp4 ? block_n * tile.stage_q * 4 : 0;
+    // Grouped FP4 caches only Q stage 0 scales.
+    const int smem_q_scale = is_fp4 ? block_n * (plan.grouped ? 1 : tile.stage_q) * 4 : 0;
     const int smem_weight = block_n * tile.stage_q * weights_element_size;
     return smem_q + smem_k + smem_k_scale + smem_q_scale + smem_weight;
 }
 
 // Mirrors `MaxThreadsPerBlock = kNumMathWarpGroups * size(TiledMma{})`
-static int get_paged_num_threads(const PagedTile& tile, int next_n) {
-    return next_n * (tile.split_kv / tile.warp_kv) * 32;
+static int get_paged_num_threads(const PagedLaunchPlan& plan) {
+    return plan.mma.query_tiles * (plan.tile.split_kv / plan.tile.warp_kv) * 32;
 }
 
 // Paged tile lookup with resource-based search for unlisted shapes.
 // NOTES: `weights_size` / `logits_size` are hardcoded to 4 upstream even when the tensors are
 // BF16; preserve that accounting for the existing weighted paths.
-static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_heads, int head_dim, int datasize) {
+static PagedTile get_paged_mqa_logits_tile(const PagedMmaGeometry& mma, int page_kv,
+                                          int num_heads, int head_dim, int datasize) {
     DG_HOST_ASSERT(page_kv == 32 or (page_kv > 0 and page_kv % 64 == 0));
+    if (num_heads == 8) {
+        // Pack two H8 queries per N16 warp tile, including an odd-query tail.
+        // A single 64-key group halves K shared storage and uses 64/128/192
+        // threads for S=1-2/3-4/5-6. Eight workers per CU keep one general
+        // plan without oversubscribing the larger query tiles.
+        // Three query-pair tiles amortize direct scale loads; the smaller
+        // query groups retain the AIU/shared-scale path.
+        return {1, 3, 64, 32, false, 8, mma.query_tiles >= 3 && page_kv >= 64};
+    }
     const bool is_fp4 = datasize == 1 and head_dim == 64;
     constexpr int weights_size = 4, logits_size = 4;
 
     const auto& calc_smem = [&](int split_kv, int stage_q, int stage_k) {
         const int block_m = split_kv;
-        const int block_n = next_n * num_heads;
+        const int block_n = mma.query_tiles * mma.num_heads;
         return block_n * head_dim * stage_q * datasize + block_m * head_dim * stage_k * datasize +
                block_m * stage_k * 4 + (is_fp4 ? block_n * stage_q * 4 : 0) + block_n * stage_q * weights_size;
     };
     const auto& calc_vreg = [&](int warp_kv) {
         const int k_block_max = head_dim * datasize / 32;
-        const int mma_n = num_heads / 16;
+        const int mma_n = mma.num_heads / 16;
         const int mma_m = warp_kv / 16;
         const int orig_vreg = 18 + 4 * mma_n * logits_size / 4 + 8 * mma_m * mma_n + 4 * mma_m * k_block_max +
                                4 * mma_n * k_block_max + (is_fp4 ? 2 : 0);
         return ceil_div(orig_vreg, 8) * 8;
     };
     const auto& calc_num_threads = [&](int split_kv, int warp_kv) {
-        return next_n * (split_kv / warp_kv) * 32;
+        return mma.query_tiles * (split_kv / warp_kv) * 32;
     };
     const auto& calc_tb_per_sm = [&](int num_threads, int vreg, int smem) {
         // max 8 warp slots per warp engine (64 warps / 8 WEs)
@@ -212,14 +283,58 @@ static PagedTile get_paged_mqa_logits_tile(int next_n, int page_kv, int num_head
         {{1, 1, 16, 128}, {1, 3, 128, 32, false, 4}},
         {{1, 2, 16, 128}, {1, 3, 128, 32, false, 4}},
     };
-    if (num_heads == 4) {
-        num_heads = 16;
-        next_n = (next_n + 3) / 4;
-    }
-    const auto& it = tile_map.find({datasize, next_n, num_heads, head_dim});
+    const auto& it = tile_map.find({datasize, mma.query_tiles, mma.num_heads, head_dim});
     if (it != tile_map.end())
         return it->second;
     return search_tile();
+}
+
+static PagedMetadataConfig get_paged_mqa_logits_metadata_config(
+        int next_n, int page_kv, int num_heads, int head_dim, int datasize, int batch_size, int num_sms,
+        bool grouped = false) {
+    const auto mma = get_paged_mma_geometry(next_n, num_heads);
+    const auto tile = grouped ? get_fp4_varlen_tile(num_heads)
+                             : get_paged_mqa_logits_tile(mma, page_kv, num_heads, head_dim, datasize);
+    if (grouped)
+        return {tile.split_kv, num_sms * tile.tb_per_cu, 256, 0, false, true,
+                static_cast<int>(FP4PagedVarlenConfig::kQueryHeadRows / num_heads)};
+    PagedMetadataConfig config{tile.split_kv, num_sms * tile.tb_per_cu,
+                               std::min(batch_size, 1024), batch_size * 4, false};
+    if (num_heads == 8) {
+        // Scan B requests and emit worker_count+1 boundaries. Small batches
+        // must not serialize the boundary searches in just a few threads.
+        config.num_threads = align(std::min(1024, std::max(batch_size, config.num_workers + 1)), 32);
+        config.use_max_context_len = true;
+    }
+    return config;
+}
+
+static PagedLaunchPlan get_paged_mqa_logits_launch_plan(
+        int next_n, int page_kv, int num_heads, int head_dim, int datasize,
+        int batch_size, int max_context_len, int metadata_workers, bool grouped = false) {
+    const int kernel_next_n = grouped ? FP4PagedVarlenConfig::kQueryHeadRows / num_heads : next_n;
+    const auto mma = get_paged_mma_geometry(kernel_next_n, num_heads);
+    const auto tile = grouped ? get_fp4_varlen_tile(num_heads)
+                             : get_paged_mqa_logits_tile(mma, page_kv, num_heads, head_dim, datasize);
+    // Grouped metadata appends one descriptor row per public query row.
+    PagedLaunchPlan plan{tile, metadata_workers - (grouped ? batch_size : 0), mma,
+                         max_context_len, kernel_next_n, grouped};
+    if (num_heads != 8 || batch_size <= 0 || max_context_len <= 0)
+        return plan;
+    // The caller guarantees 0 <= every query length <= max_context_len.
+    // This bounds T KV tasks without reading GPU lengths. Metadata assigns
+    // at most ceil(T / metadata_workers) tasks to each worker, and inactive
+    // workers form a suffix when T < metadata_workers.
+    const int64_t max_tasks = static_cast<int64_t>(batch_size) *
+        ceil_div(static_cast<int64_t>(max_context_len), static_cast<int64_t>(tile.split_kv));
+    plan.num_blocks = static_cast<int>(std::min<int64_t>(metadata_workers, max_tasks));
+    if (max_tasks <= metadata_workers) {
+        // Every active worker has exactly one KV tile; no ring or lookahead is
+        // needed. Keep the same metadata split and worker capacity.
+        plan.tile.stage_k = 1;
+        plan.tile.direct_k_scale = false;
+    }
+    return plan;
 }
 
 // Resident Q capacity before optional KV balancing. The resident-CTA count is
@@ -378,6 +493,41 @@ static MqaLogitsConfig get_fp4_avg_configs(int seq_len_q, int seq_len_k,
                                                     num_sms, is_compressed, config);
     configure_fp4_avg_lane_and_kv_balance(config, seq_len_q, seq_len_k, logits_dtype, num_sms,
                                   is_compressed, scale_mode);
+    config.schedule = MqaLogitsSchedule::OutputTiles;
+    return config;
+}
+
+// H8 uses compact query tails and a separate long-window output schedule.
+static MqaLogitsConfig get_h8_mqa_logits_config(int seq_len_q, int seq_len_k,
+                                              int num_sms, int max_seqlen_k) {
+    // Compact query tails while retaining two H8 queries per N16 warp.
+    // Once there are enough Q rows, widen reuse of K; the 512-thread
+    // tile uses the existing warp-interleaved pipeline.
+    // A large KV pool with few queries per output window suggests short
+    // independent ranges. A narrower Q tile limits their union. This is
+    // only a cost heuristic; GPU starts/ends always define valid work.
+    const bool narrow_q = max_seqlen_k > 0 && seq_len_k > max_seqlen_k &&
+        static_cast<int64_t>(seq_len_q) * max_seqlen_k < 6LL * seq_len_k;
+    const bool wide_q = !narrow_q && seq_len_q >= 8 * num_sms;
+    int block_q = 8;
+    if (seq_len_q <= 2) block_q = 2;
+    else if (seq_len_q <= 4 || narrow_q) block_q = 4;
+    else if (wide_q) block_q = 16;
+    MqaLogitsConfig config{block_q, block_q * 8, wide_q ? 128 : 64, 16, wide_q ? 64 : 32, 1, 3};
+    config.schedule = MqaLogitsSchedule::QKVTiles;
+    // Shorter independent Q/K tasks reduce the persistent workers' final
+    // wave imbalance. Retain long K runs for short windows, where Q loads
+    // and pipeline fill/drain would dominate. This is only a cost hint:
+    // every partition is derived from the current GPU starts/ends.
+    const int span = max_seqlen_k > 0 ? std::min(seq_len_k, max_seqlen_k) : seq_len_k;
+    if (wide_q && span >= 16384) {
+        // A two-stage ring keeps one KV tile ahead and simplifies indexing.
+        config.num_kv_stages = 2;
+        config.kv_partitions = std::min(16, std::max(4, span / 4096));
+        // M32/N32 reuses each K fragment across two H8 query pairs.
+        config.warp_kv = 32;
+        config.warp_qh = 32;
+    }
     return config;
 }
 
@@ -386,7 +536,7 @@ static MqaLogitsConfig get_fp4_avg_configs(int seq_len_q, int seq_len_k,
 static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_q, int seq_len_k,
                                        int num_heads, torch::ScalarType logits_dtype,
                                        bool is_fp4, int num_sms, bool is_compressed,
-                                       QScaleMode scale_mode) {
+                                       QScaleMode scale_mode, int max_seqlen_k) {
     DG_HOST_ASSERT(num_sms > 0);
     const bool is_avg = num_heads == 4;
     if (is_avg) {
@@ -395,6 +545,9 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
                                        is_compressed, scale_mode);
         return get_fp8_avg_configs(logits_dtype);
     }
+
+    if (num_heads == 8)
+        return get_h8_mqa_logits_config(seq_len_q, seq_len_k, num_sms, max_seqlen_k);
 
     MqaLogitsConfig config{};
     config.m_block_group = logits_dtype == torch::kBFloat16 ? 1 : 0;

@@ -94,6 +94,11 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
   expanded as base+j. Check-in covers ragged tails, shared page mappings,
   nonmonotonic contexts, both head counts and multi-cluster KV reuse. Cases
   without varlen fields retain the legacy independent-query metadata path.
+- FP8 H8 check-in covers D64/D128 with compressed non-paged output and paged
+  S=1/3. Daily attention tests extend coverage to S=1–6, page32/64/128,
+  empty/unordered lengths, pipeline boundaries and graph replay.
+  Multi-GiB address stress tests run only with
+  `DG_TEST_LARGE_ADDRESSES=1 python tests/test_attention.py`.
 - `with_bias:1`: FP4 Dense/GroupedNoPad/GroupedMasked Default epilogues; bias and fused activation epilogues are tested separately.
 
 The added representatives also preserve INT8 contiguous, masked overlap/signal checks, FP8 channel contiguous/fused, BF16 paged attention, FP4 dense, and 890P BF16 dense M=2/grouped small-M GEMV. Existing colleague-authored cases are retained. FP4 masked overlap is currently unimplemented (the device template only specializes overlap=false); it is excluded rather than treated as a supported positive case.

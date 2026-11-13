@@ -27,16 +27,20 @@ load_schedule(uint32_t block_q_idx, uint32_t q_iter_idx, uint32_t q_iter_offset,
     #pragma unroll
     for (uint32_t i = 0; i < BLOCK_Q; ++i) {
         const auto& q_idx = min(block_q_idx * BLOCK_Q + i, static_cast<uint32_t>(seq_len_q) - 1);
+        const uint32_t row_start = min(__ldg(cu_seq_len_k_start + q_idx), seq_len_k);
+        const uint32_t row_end = min(__ldg(cu_seq_len_k_end + q_idx), seq_len_k);
         if constexpr (kIsCompressedLogits) {
-            seq_k_start[i] = static_cast<uint32_t>(min(__ldg(cu_seq_len_k_start + q_idx), seq_len_k));
-            seq_k_end[i]   = static_cast<uint32_t>(min(__ldg(cu_seq_len_k_end + q_idx), seq_len_k));
-            start = min(start, seq_k_start[i]);
-            end   = max(end,   seq_k_end[i]);
-        } else {
-            start = min(start, static_cast<uint32_t>(min(__ldg(cu_seq_len_k_start + q_idx), seq_len_k)));
-            end = max(end, static_cast<uint32_t>(min(__ldg(cu_seq_len_k_end + q_idx), seq_len_k)));
+            seq_k_start[i] = row_start;
+            seq_k_end[i] = row_end;
+        }
+        // Empty rows must not expand the union or cause an unaligned empty
+        // range to issue a K/scale transfer after rounding its start down.
+        if (row_start < row_end) {
+            start = min(start, row_start);
+            end = max(end, row_end);
         }
     }
+    if (start == cute::numeric_limits<uint32_t>::max()) start = end = 0;
     start = start / 4 * 4;
     return {(q_iter_idx + q_iter_offset) % kNumQStages,
             ((q_iter_idx + q_iter_offset) / kNumQStages) & 1,
@@ -231,6 +235,57 @@ void float_epilogue_reduce_weights(const AccTensor& accum, int m,
         v_1 += transform(7, n);
 #endif
     }
+}
+
+// M890 H8: one N16 MMA tile contains two independent query tokens.
+// Lane L owns heads {2*(L%4), 2*(L%4)+1} of both tokens. C registers
+// [0,1]/[2,3] are token 0's low/high KV rows, [4,5]/[6,7] token 1's.
+// Keep both sums separate while merging the four lanes of each quad.
+template <typename AccTensor>
+__forceinline__ __device__
+void float_epilogue_reduce_weights_h8(const AccTensor& accum, int m,
+                                      const float* weights, float (&lo)[2], float (&hi)[2]) {
+    #pragma unroll
+    for (int token = 0; token < 2; ++token) {
+        const int j = token * 4;
+        lo[token] = fmaxf(accum(j, m, 0), 0) * weights[token * 2]
+                  + fmaxf(accum(j + 1, m, 0), 0) * weights[token * 2 + 1];
+        hi[token] = fmaxf(accum(j + 2, m, 0), 0) * weights[token * 2]
+                  + fmaxf(accum(j + 3, m, 0), 0) * weights[token * 2 + 1];
+        shfl_xor_reduce_2(lo[token], hi[token]);
+    }
+}
+
+// Distribute H8 outputs over all four lanes: parity owns the KV row half,
+// bit 1 owns the query. Preserve the adjacent-head pair sums, then gather
+// the other head half. The large tile scatters the row half first, needing
+// three shuffles. Small tiles retain the five-shuffle form: its shorter
+// register lifetime allows more resident CTAs on M890.
+template <bool kReduceScatter, typename AccTensor>
+__forceinline__ __device__
+float float_epilogue_reduce_weights_h8_output(const AccTensor& accum, int m,
+                                             const float* weights, uint32_t lane_idx, int n = 0) {
+    float partial[2];
+    #pragma unroll
+    for (int token = 0; token < 2; ++token) {
+        const int j = token * 4;
+        float lo = fmaxf(accum(j, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 1, m, n), 0) * weights[token * 2 + 1];
+        float hi = fmaxf(accum(j + 2, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 3, m, n), 0) * weights[token * 2 + 1];
+        if constexpr (kReduceScatter) {
+            const float own_half = lane_idx & 1 ? hi : lo;
+            const float other_half = lane_idx & 1 ? lo : hi;
+            partial[token] = own_half + __shfl_xor_sync(0xffffffffu, other_half, 1);
+        } else {
+            lo += __shfl_xor_sync(0xffffffffu, lo, 1);
+            hi += __shfl_xor_sync(0xffffffffu, hi, 1);
+            partial[token] = lane_idx & 1 ? hi : lo;
+        }
+    }
+    const float own = lane_idx & 2 ? partial[1] : partial[0];
+    const float other = lane_idx & 2 ? partial[0] : partial[1];
+    return own + __shfl_xor_sync(0xffffffffu, other, 2);
 }
 
 // Avg (unweighted) epilogue reduce: plain ReLU sum over heads, same j->v_0/v_1

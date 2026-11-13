@@ -428,13 +428,16 @@ standalone correctness suite.
 #### DSA and AVG indexer logits
 
 Non-paged and paged DSA indexers support legacy INT8/FP8 and MXFP4 inputs.
-Legacy FP8 uses FP32 weights/logits;
-INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
-`fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
-weights/logits. Weighted paged calls require `next_n=1` and support page
-size 32 or any positive multiple of 64 on M890, including 256/512/1024.
-The same page-size rule applies to M890 AVG. 810E rejects page32 due to
-an actlize TSM addressing issue; use a positive multiple of 64.
+On M890, FP8 supports H=8/32/64 and D=64/128 with FP32 weights/logits;
+H8 runs without H64 padding. INT8 accepts BF16 or FP32 weights and returns
+the same logits dtype. The `fp8_fp4_*mqa_logits` weighted entry points support
+MXFP4 only, with BF16 weights/logits.
+
+Weighted paged calls require `next_n=1`, except M890 FP8 H8 supports
+`next_n=1–6` with independent per-query lengths. DSA and AVG paged calls
+support page size 32 or any positive multiple of 64 on M890, including
+256/512/1024. 810E rejects page32 due to an actlize TSM addressing issue;
+use a positive multiple of 64.
 
 On M890, passing request `indices` to MXFP4 DSA metadata generation enables
 grouped scheduling for fixed MTP and ragged query counts. Consecutive equal

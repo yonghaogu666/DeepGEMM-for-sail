@@ -11,7 +11,7 @@ The weighted MXFP4 entry points do not silently quantize FP8 inputs.
 
 | Family | Weights | Logits | Paged next_n |
 | --- | --- | --- | --- |
-| Legacy FP8 | FP32 | FP32 | 1 |
+| Legacy FP8 | FP32 | FP32 | 1; H8: 1–6 |
 | Legacy INT8 (810E only) | FP32 or BF16 | Same dtype as weights | 1 |
 | MXFP4 weighted | BF16 | BF16 | 1 |
 | Sparse INT8 / MXFP4 | BF16 | Fixed BF16 | 1 (flatten multiple Q per request) |
@@ -39,12 +39,12 @@ packed tensor dimension of 64. All other head dimensions are unsupported and rej
 | API | Format / device | Logical head_dim | num_heads |
 | --- | --- | --- | --- |
 | `get_mqa_logits_metadata` | Compatibility stub | Not inspected | Ignored |
-| `fp8_mqa_logits` | FP8 / M890 | 64, 128 | 32, 64 |
+| `fp8_mqa_logits` | FP8 / M890 | 64, 128 | 8, 32, 64 |
 | `int8_mqa_logits` | INT8 / 810E only | 64, 128 | 32, 64 |
 | `fp8_fp4_mqa_logits` | MXFP4 / M890 | 128 | 32, 64 |
-| `get_paged_mqa_logits_metadata` | FP8 / M890; INT8 / 810E | 64, 128 | DSA: 32, 64; AVG: 4 (FP8 only) |
+| `get_paged_mqa_logits_metadata` | FP8 / M890; INT8 / 810E | 64, 128 | DSA: 32, 64; FP8: 8; AVG: 4 (FP8 only) |
 | `get_paged_mqa_logits_metadata` | MXFP4 / M890 | 128 | DSA: 32, 64; AVG: 4 |
-| `fp8_paged_mqa_logits` | FP8 / M890 | 64, 128 | 32, 64 |
+| `fp8_paged_mqa_logits` | FP8 / M890 | 64, 128 | 8, 32, 64 |
 | `int8_paged_mqa_logits` | INT8 / 810E only | 64, 128 | 32, 64 |
 | `fp8_fp4_paged_mqa_logits` | MXFP4 / M890 | 128 | 32, 64 |
 | `get_sparse_mqa_logits_metadata` | INT8 / 810E; MXFP4 / M890 | Fixed 128; no D argument | Fixed 32; no H argument |
@@ -59,10 +59,9 @@ packed tensor dimension of 64. All other head dimensions are unsupported and rej
 | `fp8_paged_mqa_avg_logits` | FP8 / M890 | 64, 128 | 4 |
 | `fp8_fp4_paged_mqa_avg_logits` | MXFP4 / M890 | 128 | 4 |
 
-Host checks enforce the table's head-count limits: DSA accepts only H32/H64,
-AVG only H4, and sparse only H32. All other head counts are rejected before
-kernel dispatch. Explicit paged metadata accepts H32/H64 for DSA and H4 for
-AVG on M890; H4 is rejected on 810E, which has no AVG indexer support.
+Host checks and explicit paged metadata enforce the table's limits.
+H8 is available only for weighted FP8 on M890, with native eight-head
+inputs and no H64 padding. 810E has no AVG indexer support.
 The dense metadata stub performs no validation. Sparse metadata has no D/H
 arguments and targets its fixed-layout compute APIs.
 
@@ -89,16 +88,22 @@ def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max
 Legacy `max_seqlen_k=0` returns `[Q,K]` with global K columns; positive values
 return `[Q,max_seqlen_k]` with columns relative to each query's start. MXFP4
 requires a positive maximum. MXFP4 Q is `(int8[Q,H,64], int32[Q,H])`, KV is
-`(int8[K,64], int32[K])`, for logical D128. Ordinary FP8 Q is a tensor and
-KV is `(e4m3[K,D], float32[K])`. INT8 uses actual INT8 arithmetic, unlike the
+`(int8[K,64], int32[K])`, for logical D128. Ordinary FP8 Q is `e4m3[Q,H,D]`
+and KV is `(e4m3[K,D], float32[K])`. INT8 uses actual INT8 arithmetic, unlike the
 packed MXFP4 storage container.
 
 Weights have shape `[Q,H]`, unit column stride and 16-byte aligned row stride.
 Padded row views are accepted and packed before the existing PPU kernel.
+Weighted entries require nonempty weights; callers with zero Q rows should
+return an empty logits tensor before entering DeepGEMM.
 Current dense MXFP4 supports H32/H64 and logical D128. INT8 Q is
 `int8[Q,H,D]`, KV is `(int8[K,D], float32[K])`; fold per-query/head Q
 quantization scales into weights before calling the INT8 API. Return row stride is 1024-byte aligned;
 logical shape does not include allocation padding.
+
+FP8 uses signed FP32 weights, including Q quantization scales, and FP32
+accumulation for weighted-ReLU logits. H8 empty or reversed windows select
+no keys; graph replay reads the current inputs and bounds.
 
 `get_mqa_logits_metadata(ks,ke,num_kv_tokens,num_heads)` is a compatibility
 stub returning `None`. It performs no metadata generation or argument
@@ -107,24 +112,25 @@ uses the explicitly supplied `cu_seq_len_k_start` / `cu_seq_len_k_end`.
 
 ## Paged DSA indexer
 
-Q values have shape `[Q,1,H,D_storage]`, context lengths are contiguous
-int32 `[Q,1]`, and block tables have one int32 row per query with unit column
-stride. On M890, both weighted and AVG paged MQA support page size 32 or
-any positive multiple of 64 (for example 192, 256, 512 or 1024). On 810E,
-weighted paged MQA supports positive multiples of 64. There is no fixed
-128-token page-size cap. The
-compute tile remains 64 rows, so larger pages do not increase tile resources;
-the alignment ensures each tile load stays within one physical page.
-810E page32 is rejected by metadata generation and compute due to an
-actlize TSM cross-cube addressing issue. Logits have logical shape
-`[Q,max_context_len]`. INT8 and legacy FP8 take Q values directly; MXFP4
-takes `(packed_values, int32_scales[Q,1,H])`.
+Weighted paged Q has shape `[B,S,H,D_storage]`, context lengths are contiguous
+int32 `[B,S]`, weights are `[B*S,H]`, and block tables are int32 `[B,max_pages]`
+with unit column stride. M890 FP8 H8 supports S=1–6; other weighted calls
+require S=1. Logits have shape `[B*S,max_context_len]`, flattened in
+batch/token order. INT8 and FP8 take Q directly; MXFP4 takes
+`(packed_values, int32_scales[B,1,H])`.
 
-For every paged DSA call, `max_context_len` must be at least the largest
-value in `context_lens`. It is output capacity, not a clipping limit:
-scheduling follows the actual context lengths, and insufficient capacity
-can cause out-of-bounds writes. The same requirement applies to paged AVG.
-Use a host-known upper bound to avoid a device reduction and synchronization.
+On M890, DSA and AVG support page size 32 or any positive multiple of 64,
+including 256/512/1024. 810E requires a positive multiple of 64; page32 is
+rejected due to an actlize TSM addressing issue. Quantized caches are byte
+views `[pages,P,1,value_bytes+4]`: each page contains all P K rows followed
+by all P four-byte scales, with optional page-stride padding. Do not
+interleave K and scales. For FP8/INT8, `value_bytes=D`; for MXFP4 it is D/2.
+
+All paged DSA/AVG calls require `0 <= context_lens[b,s] <= max_context_len`.
+This is output capacity, not a clipping limit; insufficient capacity can
+cause out-of-bounds writes. Zero capacity requires all lengths to be zero.
+The host does not read GPU lengths to check this condition; supply a
+host-known upper bound to avoid a device reduction and synchronization.
 
 ```python
 def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None, metadata_extra=None) -> torch.Tensor: ...
@@ -133,18 +139,27 @@ def int8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, sched
 def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices=None) -> torch.Tensor: ...
 ```
 
-`get_paged_mqa_logits_metadata(context_lens,block_kv,num_sms,indices=None,
-metadata_extra=None)` requires an explicit `metadata_extra` tuple on both
-PPU0010 (810E) and PPU0015 (M890), for DSA and AVG. Omitting it or passing
-None raises an error, including when `indices` is supplied. The Python
-signature retains the None default for argument ordering only; there is no
-compatibility fallback or automatic shape inference. Pass the same current
-SM count to metadata generation and execution.
+`get_paged_mqa_logits_metadata` requires an explicit
+`metadata_extra=(S,H,D,qk_dtype)` for DSA and AVG on both devices.
+The `None` default is retained for argument ordering and is rejected.
 
-New paged weighted MXFP4 requires `indices`; legacy FP8 and INT8 reject non-None
-indices. Each query still has its own context-length and block-table row.
-Pass the same request grouping to metadata generation and computation, as
-shown below. Metadata is opaque; do not construct or modify its internal format.
+Metadata must match the current lengths, query geometry, page size and
+configured CU count. Regenerate it when those inputs change, including
+inside graph capture. FP8 H8 schedules the maximum length within each
+request, so query lengths may be unordered. Entirely empty H8 requests
+skip page-table, K and scale reads.
+
+```python
+meta = deep_gemm.get_paged_mqa_logits_metadata(
+    lengths, page_size, deep_gemm.get_num_sms(),
+    metadata_extra=(S, 8, D, torch.float8_e4m3fn))
+logits = deep_gemm.fp8_paged_mqa_logits(
+    q, cache, weights, lengths, block_table, meta, max_context_len)
+```
+
+Weighted paged MXFP4 requires `indices`; FP8 and INT8 reject non-None
+indices. Pass the same request grouping to metadata generation and compute.
+Metadata is opaque; do not construct or modify its internal format.
 
 On M890, metadata generated with MXFP4 DSA indices schedules consecutive
 request runs together. The implementation uses a fixed capacity of 128
@@ -164,8 +179,8 @@ distinct IDs. An ID is a grouping label, not an index into `block_table`.
 
 Flatten query tokens in request order, keeping each request's rows consecutive.
 Apply the same row order to packed Q, Q scales, weights, context lengths, block
-tables and indices. The public weighted API always uses `next_n=1`, even for
-MTP: Q is `(int8[Q,1,H,64], int32[Q,1,H])`, weights are BF16 `[Q,H]`, and
+tables and indices. The public weighted MXFP4 API always uses `next_n=1`, even
+for MTP: Q is `(int8[Q,1,H,64], int32[Q,1,H])`, weights are BF16 `[Q,H]`, and
 context lengths are int32 `[Q,1]`. Do not put the MTP count in Q's second
 dimension or in `metadata_extra[0]`.
 
@@ -533,30 +548,14 @@ only the latter. All non-paged AVG inputs require compressed output
 optional (FP32 scalar or `[Q]`); paged AVG has no extra q_scale. AVG does not
 support request indices. All AVG variants omit the `clean_logits` parameter.
 
-Paged Q is `[B,N,H,Dstorage]`, N=1–6 for AVG and N=1 for weighted calls.
-Context lengths are `[B,N]`. Build AVG metadata with the actual N, logical
-head dimension and dtype: `metadata_extra=(N,4,128,torch.int8)` for MXFP4 D128 on
-M890, `(N,4,D,torch.float8_e4m3fn)` for FP8. D is always logical.
-For each row, the last context length must be the row maximum:
-`context_lens[b,N-1] == max(context_lens[b,:])`. The scheduler uses that
-last entry to determine the KV range for all N query tokens. Increasing
-prefix lengths satisfy this condition; an ordering such as `[257,1]` does
-not and can leave valid logits unwritten. Also ensure
-`max_context_len >= max(context_lens)` across all rows and tokens.
-Callers must keep the hint consistent with Q. The implementation checks N
-and selected scheduling constraints, but does not detect every incorrect
-H/D/dtype hint; a successful call does not prove the hint is correct. Multiple speculative tokens remain
-supported for AVG; weighted callers flatten them into query rows.
-
-Paged quantized caches are byte views `[pages,P,1,value_bytes+4]`: each page
-contains all P data rows followed by all P four-byte scales, with optional
-page-stride padding. This is not an interleaved data+scale row layout.
-
-AVG integration must omit `clean_logits` and supply a positive
-`max_seqlen_k` for non-paged calls. For paged calls, keep N within 1–6
-in both metadata generation and execution, including shape probing and
-graph preparation. Callers must use a separate supported execution path
-for requests outside this range.
+Paged AVG Q is `[B,N,4,Dstorage]`, with N=1–6 and context lengths `[B,N]`.
+Build metadata with `(N,4,128,torch.int8)` for MXFP4 D128 on M890, or
+`(N,4,D,torch.float8_e4m3fn)` for FP8, using logical D.
+Each request's last length must be its maximum:
+`context_lens[b,N-1] == max(context_lens[b,:])`. Increasing lengths satisfy
+this requirement; `[257,1]` does not and can leave valid logits unwritten.
+The paged output-capacity, cache-layout and metadata-lifetime requirements
+are shared with the paged DSA section above.
 
 ## Recommended PPU integration for high performance
 
@@ -590,7 +589,7 @@ all formats, including MXFP4. Do not pass packed D // 2.** Metadata generation
 and execution must use matching query configurations, page sizes and SM counts.
 The tuple can be constructed from runtime configuration before Q exists:
 
-- `N`: future Q's next-token count; fixed to 1 for DSA, and 1–6 for AVG.
+- `N`: future Q's query count; 1–6 for AVG or M890 FP8 H8, otherwise 1.
 - `H`: the actual head count for DSA, and 4 for AVG.
 - `D`: logical head dimension; MXFP4 D128 uses 128, even though its packed
   Q tensor has last dimension 64.
@@ -607,7 +606,8 @@ Passing `torch.int8` to metadata on M890 does not enable INT8 computation.
 | Device / workload | qk_dtype | metadata_extra for logical D128 | Internal storage D |
 | --- | --- | --- | --- |
 | 810E INT8 DSA | `torch.int8` | `(1,H,128,torch.int8)` | 128 |
-| M890 legacy FP8 DSA | `torch.float8_e4m3fn` | `(1,H,128,torch.float8_e4m3fn)` | 128 |
+| M890 FP8 H8 DSA | `torch.float8_e4m3fn` | `(N,8,128,torch.float8_e4m3fn)` | 128 |
+| M890 FP8 H32/H64 DSA | `torch.float8_e4m3fn` | `(1,H,128,torch.float8_e4m3fn)` | 128 |
 | M890 MXFP4 DSA | `torch.int8` | `(1,H,128,torch.int8)` | 64 |
 | M890 FP8 AVG | `torch.float8_e4m3fn` | `(N,4,128,torch.float8_e4m3fn)` | 128 |
 | M890 MXFP4 AVG | `torch.int8` | `(N,4,128,torch.int8)` | 64 |
@@ -702,7 +702,18 @@ currently returns None and provides no scheduling speedup. Paged metadata
 must still be generated correctly for the current contexts and scheduling
 configuration.
 
-## Grouped paged DSA dump and replay
+## Dump and replay
+
+Set `PPU_LIB_SHOW_PARAMS=1` outside graph capture to dump cases for
+`tests/run_deep_gemm.py --format`. Length summaries synchronize the device.
+FP8 dumps record H/D and compressed-output mode; paged dumps also record
+page size and `max_context_len`. Replay generates fresh inputs and does
+not restore non-paged starts/ends or exact compressed capacity. FP8 paged
+dumps retain the last-query length summary per request, so they do not
+reproduce unordered per-query lengths. Large-batch generated lengths stay
+within the recorded output capacity.
+
+### Grouped paged DSA dump and replay
 
 Outside CUDA Graph capture, `PPU_LIB_SHOW_PARAMS=1` emits a replayable
 `PagedMqaLogits` case using the public `next_n=1` and flattened query count.
