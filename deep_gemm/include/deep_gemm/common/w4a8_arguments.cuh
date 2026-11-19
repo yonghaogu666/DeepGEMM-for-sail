@@ -12,6 +12,11 @@ template <class Storage, int Rows> struct RowScaleStorage : Storage {
   alignas(128) float row_scales[2][Rows];
 };
 template <class Storage> struct RowScaleStorage<Storage, 0> : Storage {};
+
+template <class Storage, int Elements> struct GroupScaleStorage : Storage {
+  alignas(128) float group_scales[Elements];
+};
+template <class Storage> struct GroupScaleStorage<Storage, 0> : Storage {};
 } // namespace deep_gemm::w4fa8
 
 namespace deep_gemm::w4fa8_streamed {
@@ -22,11 +27,6 @@ constexpr int group_scale_pipeline_elements(int rows, int stages, int operand_by
   const int64_t elements = int64_t(rows) * stages;
   return grouped && operand_bytes + elements * sizeof(float) <= 256 * 1024 ? int(elements) : 0;
 }
-
-template <class Storage, int Elements> struct GroupScaleStorage : Storage {
-  alignas(128) float group_scales[Elements];
-};
-template <class Storage> struct GroupScaleStorage<Storage, 0> : Storage {};
 
 struct GroupedRowRangeArguments {
   uint32_t shape_m;
@@ -48,7 +48,7 @@ struct DecodeParams {
   const uint8_t* scales;
   uint8_t* output;
   int n_begin;
-  const int32_t* all_rows;
+  const int32_t* all_rows;  // Null for dense weight-only decode without row metadata.
   int group_start;
 };
 } // namespace deep_gemm::w4fa8_streamed

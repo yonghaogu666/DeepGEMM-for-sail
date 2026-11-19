@@ -78,17 +78,21 @@ static void check_config(const W4A8Config& c, int n, int k, GemmType kind,
     DG_HOST_ASSERT(get_num_threads(c) <= 1024);
 }
 
-static int get_smem_size(const W4A8Config& c, int k) {
+static int get_smem_size(const W4A8Config& c, int k, bool cache_group_scales = false, bool predecoded = false) {
     const int threads = get_num_threads(c);
     const int copy_rows = threads / std::min(threads, std::min(c.block_k, 128) / 16);
     const int a_rows = uses_ring_a(c.warp_m) ? ceil_div(c.block_m, copy_rows) * copy_rows : c.block_m;
     const bool resident_a = c.n_expand > 1 && c.warp_m == 64 && k <= 384;
     const int a_slots = resident_a ? std::max(c.num_stages, k / c.block_k) : c.num_stages;
+    const int b_bytes_per_row = predecoded ? c.block_k : c.block_k / 2 + c.block_k / 32;
     const int64_t mainloop = int64_t(a_rows) * c.block_k * a_slots +
-                            int64_t(c.block_n) * (c.block_k / 2 + c.block_k / 32) * c.num_stages;
+                            int64_t(c.block_n) * b_bytes_per_row * c.num_stages;
     int64_t bytes = mainloop;
     if (uses_ring_a(c.warp_m))
         bytes = ceil_div(bytes, int64_t(128)) * 128 + ceil_div(int64_t(2 * c.block_m * sizeof(float)), int64_t(128)) * 128;
+    if (cache_group_scales)
+        bytes = ceil_div(bytes, int64_t(128)) * 128 +
+                ceil_div(int64_t(c.num_stages * c.block_m * sizeof(float)), int64_t(128)) * 128;
     DG_HOST_ASSERT(bytes <= INT32_MAX);
     return int(bytes);
 }

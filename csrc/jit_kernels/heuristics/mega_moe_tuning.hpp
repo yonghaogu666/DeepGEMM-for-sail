@@ -8,7 +8,7 @@
 
 namespace deep_gemm::mega {
 
-enum class Precision { W4A16, W4A8, FP8Channelwise, FP8Blockwise };
+enum class Precision { W4A16, W4A8, FP8Channelwise, FP8Blockwise, W4A8Group128 };
 using Tile = std::array<int, 6>; // BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages
 
 struct TuningWorkload {
@@ -34,11 +34,15 @@ struct CombineTuning {
     bool push = false, preload_routes = false;
 };
 
+enum class W4A8InputSchedule { Wait, OverlapWeights, OverlapWeightsUnrollK };
+
 struct Gemm1Tuning {
     std::optional<Tile> tile{};
     std::optional<int> block_m{};
     std::optional<int> pull_ctas{};
     BlockwiseGemm1Tuning blockwise{};
+    bool fused_group_quantization = false;
+    W4A8InputSchedule input_schedule = W4A8InputSchedule::Wait;
 };
 
 struct Gemm2Tuning {
@@ -60,6 +64,8 @@ struct TuningConfig {
     Gemm2Tuning gemm2;
     BufferTuning buffer;
     CombineTuning combine{};
+    bool cache_group_scales = false;
+    bool predecode_weights = false;
 };
 
 // These are measured overrides, not complete kernel configurations. Empty
@@ -71,6 +77,8 @@ struct TuningCase {
     Gemm2Tuning gemm2{};
     BufferTuning buffer{};
     bool preload_routes = false;
+    bool cache_group_scales = false;
+    bool predecode_weights = false;
 };
 
 struct TuningEntry {
@@ -104,12 +112,12 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
     };
     static const Tile w4a8_g1_decode{16, 256, 128, 16, 64, 2};
     static const Tile w4a8_g2_decode{16, 256, 128, 16, 64, 2};
-    static const Tile w4a8_g2_decode3{16, 256, 128, 16, 64, 3};
+    static const Tile w4a8_m16n256s3{16, 256, 128, 16, 64, 3};
     static const Tile w4a8_g1_small{16, 1024, 128, 16, 64, 3};
     static const Tile w4a8_g1_medium{32, 1024, 128, 32, 64, 3};
     static const Tile w4a8_g1_large{64, 1024, 128, 64, 64, 3};
     static const Tile w4a8_g2_small{16, 512, 128, 16, 64, 3};
-    static const Tile w4a8_g2_medium{32, 512, 128, 32, 64, 3};
+    static const Tile w4a8_m32n512s3{32, 512, 128, 32, 64, 3};
     static const Tile w4a8_g2_large{64, 512, 128, 64, 64, 3};
     static const Tile w4a8_native160{160, 256, 128, 160, 32, 3};
     // MiMo V3 measurements use 39 CUs and separate decode/prefill workspaces.
@@ -133,6 +141,23 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
         .scratch_rows = 16, .warp_schedule = true};
     static constexpr BlockwiseGemm1Tuning paired_compact_experts{
         .work = Gemm1WorkSchedule::DynamicSingleTile, .block_n = 128, .quant_lanes = 32};
+    static const Tile w4a8_m32n256s3{32, 256, 128, 32, 64, 3};
+    static const Gemm1Tuning group128_wide_g1{.tile = w4a8_m32n512s3, .pull_ctas = 18};
+    static const Gemm1Tuning group128_fused_g1{.tile = w4a8_m32n256s3, .pull_ctas = 18,
+                                               .fused_group_quantization = true};
+    static const Gemm1Tuning group128_fused_pull18{.pull_ctas = 18, .fused_group_quantization = true};
+    static const TuningCase group128_long_k_decode16{
+        .tokens = 16, .gemm1 = {.tile = w4a8_m16n256s3, .pull_ctas = 24},
+        .gemm2 = {w4a8_m32n256s3}, .preload_routes = true};
+    const auto group128_prefill = [](int tokens, bool predecode_weights) {
+        const Tile tile = predecode_weights ? Tile{128, 256, 128, 32, 64, 3} : Tile{64, 256, 128, 64, 32, 4};
+        return TuningCase{.tokens = tokens, .gemm1 = {.tile = tile, .fused_group_quantization = !predecode_weights},
+                          .gemm2 = {tile}, .cache_group_scales = true,
+                          .predecode_weights = predecode_weights};
+    };
+    static const std::initializer_list<TuningCase> mimo_group128_prefill = {
+        group128_prefill(1024, false), group128_prefill(2048, true),
+        group128_prefill(4096, true), group128_prefill(8192, true)};
     static const TuningEntry entries[] = {
         {"mimo_v3_decode", P::FP8Blockwise, 8, 384, 8, 2048, 5120, "situ",
          {{16, decode_g1(32, 16, paired_compact_experts), scatter(bm32n256s3, warp_schedule)},
@@ -164,7 +189,7 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
          false, 8192, 39},
         {"kimi_k3", P::W4A8, 8, 896, 16, 3584, 3072, "situ",
          {{4, {w4a8_g1_decode}, {w4a8_g2_decode}},
-          {8, {w4a8_g1_decode}, {w4a8_g2_decode3}},
+          {8, {w4a8_g1_decode}, {w4a8_m16n256s3}},
           {64, {w4a8_g1_decode}, {w4a8_g2_decode}},
           {128, {Tile{32, 512, 128, 32, 64, 3}}, {Tile{32, 256, 128, 32, 64, 3}}},
           {1024},
@@ -173,7 +198,7 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
          {{32, {w4a8_g1_decode}, {w4a8_g2_decode}}}},
         {"kimi_k3", P::W4A8, 16, 896, 16, 3584, 3072, "situ",
          {{16, {w4a8_g1_small}, {w4a8_g2_small}},
-          {64, {w4a8_g1_medium}, {w4a8_g2_medium}},
+          {64, {w4a8_g1_medium}, {w4a8_m32n512s3}},
           {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
         {"kimi_k3", P::W4A8, 32, 896, 16, 3584, 3072, "situ",
          {{8, {Tile{16, 512, 128, 16, 64, 2}, {}, 12}, {w4a8_g2_decode}},
@@ -182,6 +207,31 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
           {64, {w4a8_g1_large, {}, 12}, {Tile{64, 256, 128, 64, 64, 2}}},
           {128, {Tile{64, 512, 128, 64, 64, 2}, {}, 12}, {w4a8_g2_large}},
           {4096, {w4a8_g1_large}, {w4a8_g2_large}}}, true},
+        {"mimo_v26_pro_group128", P::W4A8Group128, 8, 384, 8, 6144, 2048, "swiglu",
+         {{32, {{}, {}, 24}},
+          {96, group128_wide_g1, {w4a8_m32n256s3}}, {128, group128_wide_g1, {w4a8_m32n256s3}}}},
+        {"mimo_v26_pro_group128", P::W4A8Group128, 8, 384, 8, 6144, 2048, "swiglu", mimo_group128_prefill},
+        {"mimo_v26_pro_group128", P::W4A8Group128, 16, 384, 8, 6144, 2048, "swiglu",
+         {group128_long_k_decode16,
+          {64, group128_wide_g1, {w4a8_m32n256s3}}, {128, {.pull_ctas = 18}}}, false, 0, 39},
+        {"mimo_v26_pro_group128", P::W4A8Group128, 32, 384, 8, 6144, 2048, "swiglu",
+         {{16, {.tile = w4a8_m16n256s3, .pull_ctas = 24, .input_schedule = W4A8InputSchedule::OverlapWeightsUnrollK},
+           {w4a8_m32n256s3}, {}, true},
+          {32, {.tile = w4a8_m32n512s3, .pull_ctas = 42, .input_schedule = W4A8InputSchedule::OverlapWeights},
+           {w4a8_m32n256s3}, {}, true}, {64, {.pull_ctas = 24}},
+          {128, group128_wide_g1, {w4a8_m32n256s3}}}, false, 0, 39},
+        {"mimo_v3_group128", P::W4A8Group128, 8, 384, 8, 2048, 5120, "situ",
+         {{16, {w4a8_m16n256s3}}, {32, {w4a8_m16n256s3}}, {64, {w4a8_m16n256s3}},
+          {128, group128_fused_g1, {w4a8_m32n256s3}}}, false, 0, 39},
+        {"mimo_v3_group128", P::W4A8Group128, 8, 384, 8, 2048, 5120, "situ", mimo_group128_prefill, false, 0, 39},
+        {"mimo_v3_group128", P::W4A8Group128, 16, 384, 8, 2048, 5120, "situ",
+         {{16, {w4a8_m16n256s3}}, {32, {w4a8_m16n256s3}, {small16}},
+          {64, group128_fused_g1, {w4a8_m32n256s3}}, {128, group128_fused_pull18}}, false, 0, 39},
+        {"mimo_v3_group128", P::W4A8Group128, 32, 384, 8, 2048, 5120, "situ",
+         {{16, {w4a8_m16n256s3}},
+          {32, group128_fused_g1, {w4a8_m32n256s3}},
+          {64, group128_fused_pull18},
+          {128, {.tile = w4a8_m32n256s3, .fused_group_quantization = true}}}, false, 0, 39},
 
         {"kimi_k3",
          P::W4A16,
@@ -307,6 +357,8 @@ inline TuningConfig select_tuning(const TuningWorkload& w) {
                 result.gemm2 = c.gemm2;
                 result.buffer = c.buffer;
                 result.combine.preload_routes = c.preload_routes;
+                result.cache_group_scales = c.cache_group_scales;
+                result.predecode_weights = c.predecode_weights;
                 break;
             }
         }

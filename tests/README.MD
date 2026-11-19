@@ -137,6 +137,18 @@ all token counts are per rank. CLI options can select other counts within capaci
 | `deepseek_v4_pro_w4a8` | W4A8 | 8 | 32, 1024, 2048, 4096 |
 | `kimi_k3_w4a8` | W4A8 | 8, 16, 32 | 32, 64, 128, 1024, 2048, 4096 |
 
+The `w4a8_group128` tests cover K128 input and intermediate scales with
+independent replica weight scales, sparse expert tails, empty ranks and changed
+routes under Graph replay. The workspace test alternates two layer shapes
+using one symmetric allocation. The model cases run decode at EP8/16/32 and
+prefill at EP8. They exercise both weight banks and update packed weights
+after graph capture at 2048 tokens per rank and above.
+
+| Model | Hidden | Intermediate | Activation | Decode tokens/rank | Prefill tokens/rank |
+|---|---:|---:|---|---|---|
+| MiMo V2.6 Pro | 6144 | 2048 | SwiGLU | 16, 32, 64, 96, 128 | 1024, 2048, 4096, 8192 |
+| MiMo V3 | 2048 | 5120 | SiTU | 16, 32, 64, 128 | 1024, 2048, 8192 |
+
 Small distributed cases cover separate replicas, both math modes, OAI/clamp,
 empty ranks, consecutive changing routes, statistics and graph replay.
 Distributed worklist and tile regressions use the common workspace's 64-rank
@@ -164,6 +176,7 @@ checks every token.
 python -m pytest -q -s --disable-warnings -x tests/test_mega_moe_precisions.py -k smoke
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s --disable-warnings -x \
   tests/test_mega_moe_precisions.py -k smoke
+torchrun --standalone --nproc-per-node=8 -m pytest -q -s -x tests/test_mega_moe_precisions.py -k w4a8_group128
 torchrun --standalone --nproc-per-node=8 tests/test_mega_moe_precisions.py \
   --case kimi_k3 --tokens 1024 2048 4096 --routing random --reference-tokens 8 \
   --benchmark --warmup 10 --iterations 100 --repeats 5

@@ -25,14 +25,24 @@ struct SingleTile {
 };
 
 template <int BlockM, int BlockN, int K, int WarpM, int WarpN, int Stages, GatedActivation Activation,
-          w4fa8::FragmentPolicy Fragment, w4fa8::ALoadPolicy ALoad>
+          w4fa8::FragmentPolicy Fragment, w4fa8::ALoadPolicy ALoad, bool GroupActivationScales, bool CacheGroupScales,
+          bool PredecodedWeights, bool FusedGroupQuant, bool PrefetchWeights, bool UnrollKStages>
 struct Gemm1 {
+    static constexpr int WeightRowBytes = PredecodedWeights ? K : K / 2;
     using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<
         BlockN, K, BlockM, BlockN, 128, WarpM, WarpN, 128,
-        1, Stages, GemmType::MGroupedNoPad, 1, false, Fragment, ALoad>;
+        1, Stages, GemmType::MGroupedNoPad, 1, false, Fragment, ALoad, GroupActivationScales, CacheGroupScales, PredecodedWeights>;
+    static constexpr int OutputStride = BlockN / 2 + 8;
+    static constexpr int QueueTicketOffset = FusedGroupQuant ? BlockM * OutputStride * sizeof(__ppu_bfloat16) : BlockM * sizeof(float);
+    static_assert(!FusedGroupQuant || (GroupActivationScales && BlockN % 256 == 0));
+    static_assert(!FusedGroupQuant || QueueTicketOffset + sizeof(uint32_t) <= sizeof(typename Kernel::SharedStorage),
+                  "fused quantization must fit the retired mainloop storage");
 
     struct Epilogue {
         __ppu_bfloat16* output;
+        uint8_t* quantized_output;
+        float* output_scales;
+        __ppu_bfloat16* scratch;
         const float* row_scales;
         int stride;
         float limit, alpha, inv_scale, situ_beta, situ_linear_beta;
@@ -47,6 +57,11 @@ struct Gemm1 {
             using namespace cute;
             // The last mainloop barrier retired operand reads. Claim the next
             // tile while the current activation epilogue stores its result.
+            if constexpr (FusedGroupQuant) {
+                // Retire every async operand write before reusing its storage.
+                cp_async_wait<0>();
+                __syncthreads();
+            }
             if (queue_counter && threadIdx.x == 0)
                 *next_ticket = atomicAdd(queue_counter, 1u);
             // The W4A8 MMA fragment pairs gate/up at v and v+4 (eight columns).
@@ -57,7 +72,8 @@ struct Gemm1 {
                 for (int r = 0; r < 2; ++r) {
                     const int row = get<0>(coords(2 * r, m, 0));
                     if (row >= valid) continue;
-                    const float sf = row_scales[row] * inv_scale;
+                    float sf = inv_scale;
+                    if constexpr (!GroupActivationScales) sf = row_scales[row] * inv_scale;
                     CUTE_UNROLL
                     for (int n = 0; n < size<2>(acc); ++n) {
                         const int col = get<1>(coords(2 * r, m, n));
@@ -68,18 +84,50 @@ struct Gemm1 {
                             float up = acc(2*r+v+4, m, n) * sf;
                             const float value = routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
                                 gate, up, limit, alpha, situ_beta, situ_linear_beta);
-                            output[int64_t(row) * stride + dst + v] = epilogue::quant::bf16(value);
+                            if constexpr (FusedGroupQuant)
+                                scratch[row * OutputStride + dst + v] = epilogue::quant::bf16(value);
+                            else
+                                output[int64_t(row) * stride + dst + v] = epilogue::quant::bf16(value);
                         }
+                    }
+                }
+            }
+            if constexpr (FusedGroupQuant) {
+                __syncthreads();
+                // Eight lanes own one complete K128 output group. Iterate the
+                // full tile so all lanes participate even for partial M tails.
+                constexpr int Groups = BlockN / 256;
+                constexpr int Threads = Kernel::MaxThreadsPerBlock;
+                const int lane = threadIdx.x % 8;
+                for (int item = threadIdx.x / 8; item < BlockM * Groups; item += Threads / 8) {
+                    const int row = item / Groups, group = item % Groups;
+                    float2 values[8];
+                    float amax = 0.0f;
+                    CUTE_UNROLL
+                    for (int i = 0; i < 8; ++i) {
+                        values[i] = row < valid ? __bfloat1622float2(
+                            *reinterpret_cast<const __ppu_bfloat162*>(scratch + row * OutputStride + group * 128 + lane * 16 + i * 2))
+                            : make_float2(0.0f, 0.0f);
+                        amax = fmaxf(amax, fmaxf(fabsf(values[i].x), fabsf(values[i].y)));
+                    }
+                    const auto sf = epilogue::quant::fp8_group128_scale(amax);
+                    if (row < valid) {
+                        if (lane == 0)
+                            output_scales[int64_t(row) * (stride / 128) + group] = sf.scale;
+                        *reinterpret_cast<uint4*>(quantized_output + int64_t(row) * stride + group * 128 + lane * 16) =
+                            epilogue::quant::pack_fp8x16(values, sf.inverse);
                     }
                 }
             }
         }
     };
 
-    CUTLASS_DEVICE static void run(const uint8_t* a, const float* a_scale,
+    template <class WaitForInput>
+    CUTLASS_DEVICE static uint32_t run(const uint8_t* a, const float* a_scale,
         const uint8_t* b, const uint8_t* b_scale, __ppu_bfloat16* out,
         int stride, int valid_m, char* smem, float limit, float alpha, float inv_scale,
-        float situ_beta, float situ_linear_beta, uint32_t* queue_counter, uint32_t* next_ticket) {
+        float situ_beta, float situ_linear_beta, uint32_t* queue_counter, uint32_t* next_ticket,
+        uint8_t* quantized_output, float* output_scales, WaitForInput wait_for_input) {
         typename Kernel::Params params{};
         params.ptr_a = reinterpret_cast<const cutlass::float_e4m3_t*>(a);
         params.ptr_b = b;
@@ -87,14 +135,30 @@ struct Gemm1 {
         params.ptr_d = reinterpret_cast<cutlass::bfloat16_t*>(out);
         params.ptr_a_scale = a_scale;
         SingleTile scheduler{valid_m};
-        Kernel{}.run(params, smem, scheduler,
-                     Epilogue{out, a_scale, stride, limit, alpha, inv_scale, situ_beta, situ_linear_beta,
-                              queue_counter, next_ticket});
-        __syncthreads();
+        const Epilogue epilogue{out, quantized_output, output_scales, reinterpret_cast<__ppu_bfloat16*>(smem),
+                                a_scale, stride, limit, alpha, inv_scale, situ_beta, situ_linear_beta,
+                                queue_counter, next_ticket};
+        if constexpr (PrefetchWeights) {
+            // The separate-quantization ticket lives in A storage until the input rendezvous.
+            static_assert(FusedGroupQuant || QueueTicketOffset + sizeof(uint32_t) <= BlockM * 128);
+            Kernel{}.template run<UnrollKStages>(params, smem, scheduler, epilogue, wait_for_input);
+        } else {
+            Kernel{}.run(params, smem, scheduler, epilogue);
+        }
+        if constexpr (FusedGroupQuant) {
+            // The epilogue's quantization barrier published the ticket. Retire
+            // it before the rendezvous allows reuse by the next mainloop.
+            const uint32_t ticket = *next_ticket;
+            __syncthreads();
+            return ticket;
+        } else {
+            __syncthreads();
+            return *next_ticket;
+        }
     }
 };
 
-template <int N, int K, int BlockM, int BlockN>
+template <int N, int K, int BlockM, int BlockN, bool GroupActivationScales>
 struct Scatter {
     // A bulk store covers 256 BF16 columns with all 32 lanes on one peer.
     static_assert(N % 256 == 0 && BlockN % 256 == 0);
@@ -134,8 +198,9 @@ struct Scatter {
                 const int row = get<0>(coords(2*r, m, 0));
                 if (row >= residual_m) continue;
                 const int64_t pool_row = scheduler.curr_offset_a()/K + m_block*BlockM + row;
-                const float sf = row_scales[pool_row] *
-                    (scheduler.curr_group_idx < masters ? inv_scale : replica_inv_scale);
+                const float weight_sf = scheduler.curr_group_idx < masters ? inv_scale : replica_inv_scale;
+                float sf = weight_sf;
+                if constexpr (!GroupActivationScales) sf = row_scales[pool_row] * weight_sf;
                 CUTE_UNROLL
                 for (int n = 0; n < size<2>(acc); ++n) {
                     CUTE_UNROLL
@@ -179,7 +244,9 @@ template <int BLOCK_M_, int GEMM1_BLOCK_N_, int TOKEN_BYTES_, int GEMM1_WARP_M_,
           int NUM_EXPERTS_PER_RANK_, int NUM_TOPK_, int GEMM1_N_, int PULL_CTAS_, int PULL_GROUP_SIZE_,
           int GEMM2_BLOCK_M_, bool GEMM2_VALID_ROWS_, uint64_t LAYOUT_OFF_ITI_, uint64_t LAYOUT_OFF_IT_,
           uint64_t LAYOUT_OFF_ISF_, uint64_t LAYOUT_OFF_PT_, uint64_t LAYOUT_OFF_PSF_,
-          uint64_t LAYOUT_OFF_GEMM2_META_, int NMTPR_, uint64_t RoutingBytes_>
+          uint64_t LAYOUT_OFF_GEMM2_META_, int NMTPR_, uint64_t RoutingBytes_, bool GroupActivationScales = false,
+          bool CacheGroupScales = false, bool PredecodedWeights = false, bool FusedGroupQuant = false,
+          bool PrefetchWeights_ = false, bool UnrollKStages = false>
 struct MegaMoEFp8Fp4Gemm1Kernel {
     static constexpr uint64_t routing_bytes = RoutingBytes_;
     static constexpr int BLOCK_M = BLOCK_M_, GEMM1_BLOCK_N = GEMM1_BLOCK_N_, TOKEN_BYTES = TOKEN_BYTES_;
@@ -196,10 +263,13 @@ struct MegaMoEFp8Fp4Gemm1Kernel {
     static constexpr uint64_t LAYOUT_OFF_ISF = LAYOUT_OFF_ISF_, LAYOUT_OFF_PT = LAYOUT_OFF_PT_;
     static constexpr uint64_t LAYOUT_OFF_PSF = LAYOUT_OFF_PSF_, LAYOUT_OFF_GEMM2_META = LAYOUT_OFF_GEMM2_META_;
     static constexpr int NMTPR = NMTPR_;
+    static constexpr int ScaleGroups = GroupActivationScales ? TOKEN_BYTES / 128 : 1;
+    static constexpr bool PrefetchWeights = PrefetchWeights_;
 
     using Backend =
         mega_moe::w4a8::Gemm1<BLOCK_M, GEMM1_BLOCK_N, TOKEN_BYTES, GEMM1_WARP_M, GEMM1_WARP_N,
-                              GEMM1_STAGES, ACTIVATION, FRAGMENT_POLICY, A_LOAD_POLICY>;
+                              GEMM1_STAGES, ACTIVATION, FRAGMENT_POLICY, A_LOAD_POLICY, GroupActivationScales,
+                              CacheGroupScales, PredecodedWeights, FusedGroupQuant, PrefetchWeights, UnrollKStages>;
     static constexpr uint32_t compute_bytes = sizeof(typename Backend::Kernel::SharedStorage);
     static constexpr uint32_t dispatch_bytes =
         ((NUM_EXPERTS * 4 + 15) & ~15u) + NUM_THREADS / 32 * TOKEN_BYTES;
@@ -214,7 +284,7 @@ template <typename Builder>
 __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm89_fp8_fp4_mega_moe_l1(
     layout::SymBuffer<> sb, int tokens, const uint8_t* w, const uint8_t* s, float inv, const uint8_t* rw,
     const uint8_t* rs, float rinv, int masters, __ppu_bfloat16* out, float limit, float alpha,
-    float situ_beta, float situ_linear_beta, uint4* gemm2_block_info) {
+    float situ_beta, float situ_linear_beta, uint4* gemm2_block_info, uint8_t* quantized_output, float* output_scales) {
     using Backend = typename Builder::Backend;
     auto p = [&](int64_t off) { return reinterpret_cast<uint8_t*>(sb.base + off); };
     mega_moe::fp8_channelwise::dispatch_gemm1_device<
@@ -223,18 +293,19 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         Builder::TOKEN_BYTES, Builder::GEMM1_N, Builder::GEMM1_BLOCK_N, 128, Builder::GEMM1_WARP_M, Builder::GEMM1_WARP_N,
             Builder::GEMM1_STAGES,
         Builder::PULL_CTAS, Builder::ACTIVATION, Backend, Builder::PULL_GROUP_SIZE, Builder::GEMM2_BLOCK_M,
-            Builder::GEMM2_VALID_ROWS>(
+            Builder::GEMM2_VALID_ROWS, Builder::ScaleGroups, Builder::PrefetchWeights>(
         p(0), sb, reinterpret_cast<int64_t*>(p(Builder::LAYOUT_OFF_ITI)), p(Builder::LAYOUT_OFF_IT),
         reinterpret_cast<float*>(p(Builder::LAYOUT_OFF_ISF)), p(Builder::LAYOUT_OFF_PT),
         reinterpret_cast<float*>(p(Builder::LAYOUT_OFF_PSF)), reinterpret_cast<int32_t*>(p(Builder::LAYOUT_OFF_GEMM2_META)),
         gemm2_block_info, reinterpret_cast<const cutlass::float_e4m3_t*>(w), reinterpret_cast<const float*>(s),
         reinterpret_cast<const cutlass::float_e4m3_t*>(rw), reinterpret_cast<const float*>(rs), masters, out, limit,
-        alpha, tokens, Builder::NMTPR, inv, rinv, situ_beta, situ_linear_beta, Builder::routing_bytes);
+        alpha, tokens, Builder::NMTPR, inv, rinv, situ_beta, situ_linear_beta, Builder::routing_bytes,
+        quantized_output, output_scales);
 }
 
 template <int N_, int K_, int BLOCK_M_, int BLOCK_N_, int WARP_M_, int WARP_N_, int NUM_GROUPS_, int NUM_STAGES_,
           w4fa8::FragmentPolicy FRAGMENT_POLICY_, w4fa8::ALoadPolicy A_LOAD_POLICY_, int NUM_THREADS_,
-          int NUM_RANKS_>
+          int NUM_RANKS_, bool GroupActivationScales = false, bool CacheGroupScales = false, bool PredecodedWeights = false>
 struct MegaMoEFp8Fp4Gemm2Kernel {
     static constexpr int N = N_, K = K_, BLOCK_M = BLOCK_M_, BLOCK_N = BLOCK_N_, WARP_M = WARP_M_;
     static constexpr int WARP_N = WARP_N_, NUM_GROUPS = NUM_GROUPS_, NUM_STAGES = NUM_STAGES_;
@@ -244,8 +315,8 @@ struct MegaMoEFp8Fp4Gemm2Kernel {
 
     using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<N, K, BLOCK_M, BLOCK_N, 128, WARP_M, WARP_N,
                                                        128, NUM_GROUPS, NUM_STAGES, GemmType::MGroupedNoPad, 1,
-                                                       false, FRAGMENT_POLICY, A_LOAD_POLICY>;
-    using Epilogue = mega_moe::w4a8::Scatter<N, K, BLOCK_M, BLOCK_N>;
+                                                       false, FRAGMENT_POLICY, A_LOAD_POLICY, GroupActivationScales, CacheGroupScales, PredecodedWeights>;
+    using Epilogue = mega_moe::w4a8::Scatter<N, K, BLOCK_M, BLOCK_N, GroupActivationScales>;
 
     // Keep the thread bound without a minimum-residency hint: HGGC's two-argument
     // launch bound can miscompile this shared-memory scatter epilogue.

@@ -4,6 +4,7 @@
 
 // Channelwise FP8 fused MegaMoE; shared routing is independent of GEMM dtype/layout.
 #include <deep_gemm/impls/mega_moe_transport.cuh>
+#include <deep_gemm/impls/fp8_blockwise_moe_utils.cuh>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_gemm1_mma.cuh>
@@ -81,9 +82,34 @@ CUTLASS_DEVICE void warp_quantize_bf16_row_common(
         mega_moe::detail::warp_quantize_bf16_row<kHidden, bool(DG_MOE_FAST_MATH)>(input, output, scales, row, lane);
 }
 
+// Eight lanes quantize one K128 group. Four adjacent groups share the
+// expert lookup, and each lane loads and stores a contiguous 16 values.
+CUTLASS_DEVICE void warp_quantize_four_bf16_groups(
+        const __ppu_bfloat16* input, cutlass::float_e4m3_t* output, float* scales,
+        uint32_t lane) {
+    constexpr int kValuesPerLane = 16;
+    const uint32_t elem = lane * kValuesPerLane;
+    const uint4 vectors[2] = {
+        *reinterpret_cast<const uint4*>(input + elem),
+        *reinterpret_cast<const uint4*>(input + elem + 8),
+    };
+    const auto* pairs = reinterpret_cast<const __ppu_bfloat162*>(vectors);
+    float2 values[kValuesPerLane / 2];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kValuesPerLane / 2; ++i) {
+        values[i] = __bfloat1622float2(pairs[i]);
+        amax = fmaxf(amax, fmaxf(fabsf(values[i].x), fabsf(values[i].y)));
+    }
+    const auto sf = epilogue::quant::fp8_group128_scale(amax);
+    if (lane % 8 == 0)
+        scales[lane / 8] = sf.scale;
+    *reinterpret_cast<uint4*>(output + elem) = epilogue::quant::pack_fp8x16(values, sf.inverse);
+}
+
 // Flatten valid expert rows for quantization, then map back to pool offsets.
 // Quantized rows use the pool offsets described by the GEMM2 metadata.
-template <uint32_t kEPR, uint32_t kWidth>
+template <uint32_t kEPR, uint32_t kWidth, bool GroupActivationScales = false>
 CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
         const int32_t* metadata, const __ppu_bfloat16* input,
         cutlass::float_e4m3_t* output, float* scales) {
@@ -124,9 +150,15 @@ CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
     const uint32_t warps = gridDim.x * (blockDim.x / 32);
     // Sparse decode rows favor binary lookup. Dense prefill keeps a cursor
     // that visits each expert at most once per warp.
-    const bool binary_search = total <= warps * kEPR / search_steps;
+    static_assert(!GroupActivationScales || kWidth % 128 == 0);
+    constexpr uint32_t groups_per_row = GroupActivationScales ? kWidth / 128 : 1;
+    constexpr uint32_t groups_per_item = GroupActivationScales && kWidth % 512 == 0 ? 4 : 1;
+    constexpr uint32_t items_per_row = groups_per_row / groups_per_item;
+    const uint64_t work_items = uint64_t(total) * items_per_row;
+    const bool binary_search = work_items <= warps * kEPR / search_steps;
     uint32_t expert = 0;
-    for (uint32_t row = warp; row < total; row += warps) {
+    for (uint64_t item = warp; item < work_items; item += warps) {
+        const uint32_t row = item / items_per_row;
         if (binary_search) {
             uint32_t lo = expert, hi = kEPR;
             while (lo < hi) {
@@ -140,7 +172,23 @@ CUTLASS_DEVICE void fp8_mega_moe_quantize_valid_pool_kernel_device(
         }
         if (expert >= kEPR) break;
         const uint32_t pool_row = at(source, expert) + row - at(begin, expert);
-        warp_quantize_bf16_row_common<kWidth>(input, output, scales, pool_row, lane);
+        if constexpr (GroupActivationScales) {
+            const uint32_t group = (item % items_per_row) * groups_per_item;
+            const int64_t base = int64_t(pool_row) * kWidth + group * 128;
+            float* group_scales = scales + int64_t(pool_row) * groups_per_row + group;
+            if constexpr (groups_per_item == 4) {
+                warp_quantize_four_bf16_groups(input + base, output + base, group_scales, lane);
+            } else {
+                float values[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    values[i] = __bfloat162float(input[base + lane * 4 + i]);
+                fp8_blockwise::quantize_group(values, reinterpret_cast<__hg_fp8_e4m3*>(output) + base,
+                    group_scales, lane);
+            }
+        } else {
+            warp_quantize_bf16_row_common<kWidth>(input, output, scales, pool_row, lane);
+        }
     }
 }
 
@@ -151,7 +199,8 @@ template <
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
     GatedActivation Activation = GatedActivation::SwiGLU, class Gemm1Backend = void,
-    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true>
+    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true,
+    uint32_t kScaleGroups = 1, bool kPrefetchWeights = false>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
         const layout::SymBuffer<>& sym_buffer,
@@ -174,9 +223,10 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
         const uint32_t num_max_tokens_per_rank,
         const float weight_inv_scale = 1.0f, const float replica_inv_scale = 1.0f,
         const float situ_beta = 4.0f, const float situ_linear_beta = 25.0f,
-        uint64_t routing_bytes = 0) {
+        uint64_t routing_bytes = 0, uint8_t* quantized_output = nullptr, float* output_scales = nullptr) {
     using Cfg = mega_moe::fp8_channelwise::Gemm1MmaConfig<
         kBlockM, kBlockN, kBlockK, kWarpM, kWarpN, kStages>;
+    static_assert(kScaleGroups == 1 || !cute::is_same_v<Gemm1Backend, void>);
     static_assert(kNumExpertsPerRank > 0 && kNumExpertsPerRank <= 128,
                   "register-distributed scheduler supports up to 128 physical "
                   "experts per rank");
@@ -211,7 +261,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
 
     mega_moe::detail::dispatch_handshake<
         kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank,
-        kNumTopk, cute::is_same_v<Gemm1Backend, void>>(
+        kNumTopk, cute::is_same_v<Gemm1Backend, void> || (kScaleGroups > 1)>(
         workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
         cta_idx, thread_idx);
 
@@ -226,13 +276,17 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     constexpr uint32_t kNumNBlocks = kGemm1N / kBlockN;
 
     auto* queue_counter = workspace.get_gemm1_work_count_ptr();
-    // Mainloop returns after its final CTA barrier; its storage is free
-    // until the next tile. The register-only activation leaves this word intact.
-    // The scale copy occupies the first M*sizeof(float) bytes of one A stage.
-    // Keep the ticket outside that range. MMA can overwrite it only after all
-    // threads consumed its value and passed the epilogue rendezvous.
+    // Keep the ticket beyond the scale-copy range. Backends that stage their
+    // activated output also reserve it beyond that tile, and retire the ticket
+    // before the rendezvous allows the next mainloop to reuse the storage.
     static_assert(kBlockM * sizeof(float) + sizeof(uint32_t) <= kBlockM * kBlockK);
-    auto& queue_ticket = *reinterpret_cast<uint32_t*>(smem_buf + kBlockM * sizeof(float));
+    constexpr uint32_t kQueueTicketOffset = [] {
+        if constexpr (cute::is_same_v<Gemm1Backend, void>)
+            return kBlockM * sizeof(float);
+        else
+            return uint32_t(Gemm1Backend::QueueTicketOffset);
+    }();
+    auto& queue_ticket = *reinterpret_cast<uint32_t*>(smem_buf + kQueueTicketOffset);
     const mega_moe::WorkQueue queue{queue_counter, &queue_ticket};
 
     struct BlockInfo {
@@ -315,8 +369,15 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     auto* pool_token_row = token_pool + uint64_t(pool_row) * kTokenBytes;
                     mega_moe::detail::warp_async_copy_global_to_shared(
                         smem_token, src_token_ptr, kTokenBytes, lane_idx);
-                    if (lane_idx == 0) {
-                        token_scale = *sym_buffer.map(input_scale + src_token, src_rank);
+                    if constexpr (kScaleGroups == 1) {
+                        if (lane_idx == 0)
+                            token_scale = *sym_buffer.map(input_scale + src_token, src_rank);
+                    } else {
+                        const auto* src_scales = sym_buffer.map(
+                            input_scale + uint64_t(src_token) * kScaleGroups, src_rank);
+                        auto* dst_scales = scale_pool + uint64_t(pool_row) * kScaleGroups;
+                        for (uint32_t group = lane_idx; group < kScaleGroups; group += 32)
+                            dst_scales[group] = src_scales[group];
                     }
                     asm volatile("" ::: "memory");
                     cute::cp_async_wait<0>();
@@ -324,7 +385,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     mega_moe::detail::warp_copy_bytes(
                         pool_token_row, smem_token, kTokenBytes, lane_idx);
                     if (lane_idx == 0) {
-                        scale_pool[pool_row] = token_scale;
+                        if constexpr (kScaleGroups == 1) scale_pool[pool_row] = token_scale;
                         *workspace.get_token_src_metadata_ptr(pool_row) = {
                             src_rank, src_token, src_topk};
                         gemm2_meta.store_route(pool_row, src_rank, src_token, src_topk);
@@ -356,8 +417,11 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 kBlockM, scheduler.curr_group_m - m_block * kBlockM);
             const uint32_t global_m_block = scheduler.curr_global_block_m_idx;
 
-            ready.wait(workspace.get_l1_arrival_count_ptr(0), global_m_block, global_m_block,
-                       total_m_blocks, kPullGroupSize);
+            auto wait_for_input = [&]() {
+                ready.wait(workspace.get_l1_arrival_count_ptr(0), global_m_block, global_m_block,
+                           total_m_blocks, kPullGroupSize);
+            };
+            if constexpr (!kPrefetchWeights) wait_for_input();
 
             const bool use_replica =
                 current_expert >= num_master_experts;
@@ -369,18 +433,20 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             const auto* weight_scale_base = use_replica
                 ? gemm1_weight_scale_replicas : gemm1_weight_scale;
             if constexpr (!cute::is_same_v<Gemm1Backend, void>) {
-                Gemm1Backend::run(
-                    token_pool + uint64_t(pool_base) * kTokenBytes, scale_pool + pool_base,
+                prefetched_work = Gemm1Backend::run(
+                    token_pool + uint64_t(pool_base) * kTokenBytes, scale_pool + uint64_t(pool_base) * kScaleGroups,
                     reinterpret_cast<const uint8_t*>(weight_base)
-                        + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * (kTokenBytes / 2),
+                        + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * Gemm1Backend::WeightRowBytes,
                     reinterpret_cast<const uint8_t*>(weight_scale_base)
                         + (uint64_t(weight_expert) * kGemm1N + n_block * kBlockN) * (kTokenBytes / 32),
                     swiglu_output + uint64_t(pool_base) * (kGemm1N / 2) + n_block * (kBlockN / 2),
                     kGemm1N / 2, valid_m, reinterpret_cast<char*>(smem_buf),
                     swiglu_limit, activation_alpha, use_replica ? replica_inv_scale : weight_inv_scale,
                     situ_beta, situ_linear_beta,
-                    queue_counter, &queue_ticket);
-                prefetched_work = queue.current();
+                    queue_counter, &queue_ticket,
+                    quantized_output ? quantized_output + uint64_t(pool_base) * (kGemm1N / 2) + n_block * (kBlockN / 2) : nullptr,
+                    output_scales ? output_scales + uint64_t(pool_base) * (kGemm1N / 256) + n_block * (kBlockN / 256) : nullptr,
+                    wait_for_input);
             } else {
                 mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, Activation>(
                     reinterpret_cast<const typename Cfg::ElementA*>(
@@ -416,13 +482,13 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
 
 namespace deep_gemm::mega_moe::fp8_channelwise {
 
-template <int Experts, int Width, int Threads, uint64_t MetadataOffset>
+template <int Experts, int Width, int Threads, uint64_t MetadataOffset, bool GroupActivationScales = false>
 __global__
 __launch_bounds__(Threads, 1) void sm89_fp8_mega_moe_quantize_local_pool(int64_t sb_base, const __ppu_bfloat16* input,
                                                                          cutlass::float_e4m3_t* output, float* scales) {
     const auto* metadata = reinterpret_cast<const int32_t*>(sb_base + MetadataOffset);
-    mega_moe::fp8_channelwise::fp8_mega_moe_quantize_valid_pool_kernel_device<Experts, (Width * 2) / 2>(metadata, input,
-                                                                                                        output, scales);
+    mega_moe::fp8_channelwise::fp8_mega_moe_quantize_valid_pool_kernel_device<Experts, Width, GroupActivationScales>(
+        metadata, input, output, scales);
 }
 
 } // namespace deep_gemm::mega_moe::fp8_channelwise

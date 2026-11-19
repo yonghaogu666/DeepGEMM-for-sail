@@ -290,13 +290,6 @@ static std::shared_ptr<StreamedAsyncContext> streamed_async_context(int device, 
     return context;
 }
 
-template <typename Runtime, typename Args>
-static void launch_streamed_on(const std::shared_ptr<KernelRuntime>& runtime, const Args& args, hggcStream_t stream) {
-    const auto& launch = args.launch_args;
-    auto config = construct_launch_config(runtime->kernel, stream, launch.smem_size, launch.grid_dim, launch.block_dim);
-    Runtime::launch_impl(runtime->kernel, config, args);
-}
-
 // Prepare every declared chunk/tail and numerical variant on the actual caller stream.
 static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                          const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows,
@@ -419,7 +412,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
                       int(a.size(0))};
             if (!chunk_gather) {
                 gather_args.params = gather;
-                launch_streamed_on<StreamedGatherRuntime>(gather_kernel, gather_args, caller);
+                StreamedGatherRuntime::launch(gather_kernel, gather_args, caller);
             }
         }
         auto output = reinterpret_cast<cutlass::bfloat16_t*>(d.data_ptr());
@@ -443,7 +436,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
                            rows.data_ptr<int32_t>(),
                            group_start};
             args.gather = gather;
-            launch_streamed_on<StreamedDecodeRuntime>(pair.decoder, args, context->decode);
+            StreamedDecodeRuntime::launch(pair.decoder, args, context->decode);
         };
         auto core = [&](int index) {
             const auto& work = plan[index];
@@ -462,7 +455,7 @@ static bool run_streamed(const torch::Tensor& a, const torch::Tensor& a_scale, c
                            {uint32_t(m), rows.data_ptr<int32_t>() + group_start, range},
                            nullptr,
                            nullptr};
-            launch_streamed_on<StreamedCoreRuntime>(pair.gemm, args, context->compute);
+            StreamedCoreRuntime::launch(pair.gemm, args, context->compute);
         };
 
         try {

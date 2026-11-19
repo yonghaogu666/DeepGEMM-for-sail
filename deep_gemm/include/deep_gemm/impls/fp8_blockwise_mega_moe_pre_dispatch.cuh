@@ -6,7 +6,7 @@
 
 namespace deep_gemm::mega_moe::fp8_blockwise {
 
-template <int kHidden, int kTopk, typename Index = int64_t>
+template <int kHidden, int kTopk, typename Index = int64_t, int kRowCTAs = 1>
 CUTLASS_DEVICE void pre_dispatch_kernel_device(
         const __ppu_bfloat16* input, const Index* ids, const float* weights,
         __hg_fp8_e4m3* output, float* scales,
@@ -18,7 +18,9 @@ CUTLASS_DEVICE void pre_dispatch_kernel_device(
         return;
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
-    for (int group = warp; group < kScales; group += kThreads / 32) {
+    constexpr int kWarps = kThreads / 32;
+    const int start = kRowCTAs == 1 ? warp : int(blockIdx.y) * kWarps + warp;
+    for (int group = start; group < kScales; group += kRowCTAs * kWarps) {
         float values[4];
         const int64_t base = int64_t(row) * kHidden + group * kGroupK;
         #pragma unroll
@@ -27,6 +29,8 @@ CUTLASS_DEVICE void pre_dispatch_kernel_device(
         quantize_group(values, output + base,
                        scales + int64_t(row) * kScales + group, lane);
     }
+    if (kRowCTAs > 1 && blockIdx.y != 0)
+        return;
     for (int slot = threadIdx.x; slot < kTopk; slot += kThreads) {
         const int64_t index = int64_t(row) * kTopk + slot;
         output_ids[index] = ids[index];
@@ -46,17 +50,17 @@ __global__ __launch_bounds__(kThreads) void pre_dispatch_kernel(
 
 namespace deep_gemm::mega_moe::fp8_blockwise {
 
-template <int Hidden, int TopK, typename TopkIndex>
+template <int Hidden, int TopK, typename TopkIndex, int RowCTAs = 1>
 __global__ __launch_bounds__(256, 1) void sm89_fp8_blockwise_mega_moe_pre_dispatch(
     __ppu_bfloat16* hidden_states, const TopkIndex* topk_ids, float* topk_weights, __hg_fp8_e4m3* input_token,
     float* input_scale, int64_t* input_topk_idx, float* input_topk_weights, int num_tokens, int capacity) {
     if (blockIdx.x >= num_tokens) {
-        detail::invalidate_unused_routes<TopK>(input_topk_idx, input_topk_weights, num_tokens, capacity, num_tokens);
+        if (RowCTAs == 1 || blockIdx.y == 0)
+            detail::invalidate_unused_routes<TopK>(input_topk_idx, input_topk_weights, num_tokens, capacity, num_tokens);
         return;
     }
-    mega_moe::fp8_blockwise::pre_dispatch_kernel_device<Hidden, TopK>(hidden_states, topk_ids, topk_weights,
-                                                                      input_token, input_scale, input_topk_idx,
-                                                                      input_topk_weights, (uint32_t)num_tokens);
+    pre_dispatch_kernel_device<Hidden, TopK, TopkIndex, RowCTAs>(
+        hidden_states, topk_ids, topk_weights, input_token, input_scale, input_topk_idx, input_topk_weights, num_tokens);
 }
 
 } // namespace deep_gemm::mega_moe::fp8_blockwise

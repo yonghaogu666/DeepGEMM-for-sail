@@ -594,21 +594,23 @@ supplied once through `topk_weights` and applied once in the final BF16 combine.
 Shared experts remain outside the routed pipeline; `num_shared_experts` must be 0.
 
 All precisions use `SymmBuffer` or `get_symm_buffer_for_mega_moe` for workspace
-allocation. Select the mode below; FP8 additionally distinguishes scale granularity
-with `quantization` (channelwise by default). These backends require PPU1.5.
+allocation. FP8 and W4A8 select activation scale granularity with `quantization`,
+which defaults to `"channelwise"`. These backends require PPU1.5.
 
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
-| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| E4M3 x MXFP4, per token | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| E4M3 x MXFP4, per K128 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 
 All MegaMoE backends pass FP32 GEMM1 accumulators to FP32 gated activation.
 Sigmoid and tanh always use the native PPU instructions, including when
 `fast_math=False`. W4A8 and channelwise FP8 round the activation result to BF16
-scratch before a separate FP32 row quantizer emits E4M3 values and one FP32
-scale per row. FP4 and blockwise FP8 keep FP32 values through fused activation
+before FP32 quantization emits E4M3 values. Per-token W4A8 and channelwise FP8
+produce one FP32 scale per row. Group128 W4A8 produces one per 128 consecutive
+features in each row, including when GEMM1 fuses the quantization. FP4 and blockwise FP8 keep FP32 values through fused activation
 quantization, producing group32 E8M0 and group128 FP32 scales respectively.
 W4A16 converts only the final activation result to BF16 for GEMM2. Existing clamp
 boundary conventions and quantization granularities are preserved.
@@ -675,7 +677,7 @@ l1, l2 = dg.transform_weights_for_w4a8_mega_moe(raw_l1_w4, raw_l2_w4)
 workspace = dg.SymmBuffer(
     group, num_experts=896, num_max_tokens_per_rank=4096,
     num_topk=16, hidden=3584, intermediate_hidden=3072,
-    mma_type="fp8xfp4", activation="situ")
+    mma_type="fp8xfp4", quantization="blockwise", activation="situ")
 y = torch.empty_like(x)
 dg.mega_moe_pre_dispatch(
     x, topk_ids, topk_weights,
@@ -683,6 +685,20 @@ dg.mega_moe_pre_dispatch(
     num_tokens=x.shape[0], mma_type=workspace.mma_type)
 dg.fp8_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
 ```
+
+In this W4A8 example, pre-dispatch writes E4M3 tokens and FP32 scales
+`x_sf[capacity,H/128]` into the symmetric workspace. After the gated
+activation, GEMM2 consumes one FP32 scale per 128 intermediate features.
+Omitting `quantization` selects per-token W4A8 with `x_sf[capacity,1]`.
+
+For MiMo V2.6 Pro at EP8 (H=6144, I=2048, 384 experts, top-k 8, SwiGLU),
+the group128 prefill profile decodes MXFP4 weights inside the GEMM tiles at
+1024 tokens/rank. At 2048, 4096 and 8192 tokens/rank it predecodes W1 and W2
+to E5M2, using about 1.69 GiB of decoded-weight scratch per rank. W1 is ready
+before GEMM1 starts. An auxiliary stream decodes W2 during GEMM1 and GEMM2
+waits for both. Each call and Graph replay decodes the current packed weights.
+Layer aliases of the same symmetric workspace reuse matching scratch buffers.
+Retire its Graphs and synchronize outstanding calls before releasing the last workspace owner.
 
 FP8 weights are contiguous E4M3 `[E,N,K]`. Channelwise FP32 scales are
 `[E,N,1]`; blockwise scales are `[E,N/128,K/128]`. The transform interleaves
@@ -706,8 +722,6 @@ FP8, W4A8 and W4A16 `base` aliases support different shapes within the allocatio
 and routing capacities, with the same mode, quantization, group and device.
 Create aliases before use or capture. Treat all aliases as one workspace for
 stream and cross-rank ordering, including Graph replay.
-W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
-channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.
 
 FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise

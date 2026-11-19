@@ -281,7 +281,8 @@ struct RoutedMoEBuffer : RoutedMoEInputLayout {
 
     CUTLASS_HOST_DEVICE
     RoutedMoEBuffer(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
-                    uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise, uint64_t routing_bytes = 0):
+                    uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise, uint64_t routing_bytes = 0,
+                    bool needs_bf16_scratch = false):
         RoutedMoEInputLayout(ranks, experts, capacity, topk, uint64_t(hidden) * (fp8 ? 1 : 2),
                             fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0, routing_bytes) {
         const uint64_t pool = dispatch.num_max_pool_tokens, groups = experts / ranks;
@@ -290,7 +291,7 @@ struct RoutedMoEBuffer : RoutedMoEInputLayout {
         l2_acts = align128(packed_routes + pool * sizeof(int64_t));
         l2_scales = align128(l2_acts + pool * intermediate * (fp8 ? 1 : 2));
         bf16_scratch = align128(l2_scales + (fp8 ? pool * (blockwise ? intermediate / 128 : 1) * sizeof(float) : 0));
-        block_info = align128(bf16_scratch + (fp8 && !blockwise ? pool * intermediate * 2 : 0));
+        block_info = align128(bf16_scratch + (fp8 && (!blockwise || needs_bf16_scratch) ? pool * intermediate * 2 : 0));
         block_info_elements = groups >= 128 ? 4 * (1 + groups + pool / kMinCandidateBlockM) : 0;
         combine = align128(block_info + block_info_elements * sizeof(int32_t));
         num_bytes = align128(combine + uint64_t(topk) * capacity * hidden * 2);

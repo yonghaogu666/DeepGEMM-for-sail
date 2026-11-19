@@ -93,10 +93,10 @@ public:
         return fmt::format(R"DGMEGA(#include <deep_gemm/impls/fp8_blockwise_mega_moe_pre_dispatch.cuh>
 using TopkIndex = {};
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::fp8_blockwise::sm89_fp8_blockwise_mega_moe_pre_dispatch<{}, {}, TopkIndex>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::fp8_blockwise::sm89_fp8_blockwise_mega_moe_pre_dispatch<{}, {}, TopkIndex, {}>);
 }}
 )DGMEGA",
-            c.int32_indices ? "int32_t" : "int64_t", c.hidden, c.num_topk);
+            c.int32_indices ? "int32_t" : "int64_t", c.hidden, c.num_topk, args.launch_args.grid_dim.y);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, const Args& args) {
@@ -119,8 +119,12 @@ inline void fp8_blockwise_mega_moe_pre_dispatch_impl(
     constexpr int block_threads = 256;
     const int capacity = input_topk_idx.size(0);
     const int tail_blocks = pre_dispatch_tail_blocks(num_tokens, capacity, num_topk, block_threads);
+    // Distribute independent K128 groups while there are too few token CTAs to fill the device.
+    const int max_row_ctas = ceil_div(hidden / 128, block_threads / 32);
+    const int target_ctas = get_num_sms() * (device_runtime->get_prop()->maxThreadsPerMultiProcessor / block_threads);
+    const int row_ctas = num_tokens ? std::clamp(ceil_div(target_ctas, num_tokens), 1, max_row_ctas) : 1;
     const FP8BlockwiseMegaMoEPreDispatchRuntime::Args args{
-        entry.c_str(), config, {dim3(num_tokens + tail_blocks), dim3(block_threads), 0},
+        entry.c_str(), config, {dim3(num_tokens + tail_blocks, row_ctas), dim3(block_threads), 0},
         {device_pointer(hidden_states), device_pointer(topk_ids), device_pointer(topk_weights), device_pointer(input_token),
          device_pointer(input_scale), device_pointer(input_topk_idx), device_pointer(input_topk_weights), num_tokens, capacity}};
     launch_mega_moe_kernel<FP8BlockwiseMegaMoEPreDispatchRuntime>(args);
@@ -131,7 +135,7 @@ public:
     struct LaunchInfo {
         int groups, n, num_threads;
         uint64_t metadata_offset;
-        bool fast_math;
+        bool fast_math, group_activation_scales;
     };
     struct Params {
         int64_t sym_buffer_base;
@@ -150,10 +154,10 @@ public:
         return fmt::format(R"DGMEGA(#define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/fp8_channelwise_mega_moe_dispatch_gemm1.cuh>
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::fp8_channelwise::sm89_fp8_mega_moe_quantize_local_pool<{}, {} / 2, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::fp8_channelwise::sm89_fp8_mega_moe_quantize_local_pool<{}, {} / 2, {}, {}, {}>);
 }}
 )DGMEGA",
-            int(c.fast_math), c.groups, c.n, c.num_threads, c.metadata_offset);
+            int(c.fast_math), c.groups, c.n, c.num_threads, c.metadata_offset, c.group_activation_scales);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, const Args& args) {
         const auto& p = args.kernel_params;
@@ -167,8 +171,10 @@ inline void fp8_channelwise_mega_moe_quantize_local_pool_kernel(
     uint8_t* base, const layout::RoutedMoEBuffer& buffer) {
     // Keep the existing four-CTA/SM, four-warp row-quantization budget.
     const FP8ChannelwiseMegaMoEQuantizeRuntime::Args args{
-        "fp8_channelwise_mega_moe_quantize_local_pool",
-        {config.dispatch.num_experts_per_rank, config.n, 128, buffer.gemm2_metadata, config.fast_math},
+        config.group_activation_scales ? "fp8_group128_mega_moe_quantize_local_pool" :
+                                         "fp8_channelwise_mega_moe_quantize_local_pool",
+        {config.dispatch.num_experts_per_rank, config.n, 128, buffer.gemm2_metadata,
+         config.fast_math, config.group_activation_scales},
         {dim3(config.tile.num_sms * 4), dim3(128), 0},
         {sym_buffer.base, math::advance_ptr<at::BFloat16>(base, buffer.bf16_scratch),
          base + buffer.l2_acts, math::advance_ptr<float>(base, buffer.l2_scales)}};

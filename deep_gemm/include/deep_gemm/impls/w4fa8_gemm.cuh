@@ -32,13 +32,14 @@ template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM,
           int kNumStages, GemmType kGemmType, int N_EXPAND = 1, bool ApplyInvScale = false,
           deep_gemm::w4fa8::FragmentPolicy Fragment = deep_gemm::w4fa8::FragmentPolicy::FullK,
           deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk,
-          bool GroupActivationScales = false>
+          bool GroupActivationScales = false, bool CacheGroupScales = false, bool PredecodedWeights = false>
 class W4A8GEMM_MMA {
 public:
   static constexpr bool WideM = deep_gemm::w4fa8::uses_ring_a(WarpM);
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool Compact = Fragment == deep_gemm::w4fa8::FragmentPolicy::RollingK32;
   static_assert(!GroupActivationScales || BlockK == 128);
+  static_assert(!CacheGroupScales || (GroupActivationScales && !Fused && !WideM && N_EXPAND == 1));
   static constexpr int DecodeN = WideM ? 1 : WarpN / 16;
   // A narrow ring bounds live A operands for wide M tiles.
   static constexpr int ADistance = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2 ? 1 : -1;
@@ -66,9 +67,11 @@ public:
   static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;
   static constexpr int K = ShapeK;
-  static constexpr int K2 = K / 2;
+  // B's physical K dimension is packed FP4 bytes or dense E5M2 elements.
+  static constexpr int K2 = PredecodedWeights ? K : K / 2;
   static constexpr int L = kNumGroups;
-  static constexpr int BlockK2 = BlockK / 2;
+  static constexpr int BlockK2 = PredecodedWeights ? BlockK : BlockK / 2;
+  using ElementStorageB = cute::conditional_t<PredecodedWeights, cutlass::float_e5m2_t, uint8_t>;
   using TileShape = Shape<Int<BlockM>, Int<BlockN>, Int<BlockK>>;
   static constexpr int N_Blocks = deep_gemm::math::ceil_div(ShapeN, BlockN* N_EXPAND);
   static constexpr int scheduler_swizzle = (BlockM == 16) ? 1 : 2;
@@ -120,10 +123,10 @@ public:
   using SmemLayoutA =
       decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<AStorageM>{}, Int<BlockK>{}, Int<ASlots>{})));
 
-  // sW => fp4 weights
+  // Packed FP4 weights, or a dense FP8 workspace for predecoded MegaMoE.
   using TilerB = Shape<Int<BlockN>, Int<BlockK2>>;
-  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, uint8_t, false, Int<BlockN>,
-                                                                         Int<BlockK2>, false, 0, true>;
+  using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementStorageB, false, Int<BlockN>,
+                                                                         Int<BlockK2>, PredecodedWeights, 0, true>;
   using SmemLayoutAtomB = typename DefaultOperandB::SmemLayoutAtom;
   using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
   using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
@@ -148,14 +151,20 @@ public:
   using SmemValLayoutScale = Layout<Shape<_1, _4>>;
   using SmemTiledCopyScale = decltype(make_tiled_copy(SmemCopyAtomScale{}, SmemThrLayoutScale{}, SmemValLayoutScale{}));
 
-  static_assert(BlockM == WarpM, "W4FA8 native tiles require BlockM == WarpM");
-  struct MainloopStorage {
+  static_assert(PredecodedWeights || BlockM == WarpM, "W4FA8 native tiles require BlockM == WarpM");
+  static_assert(!PredecodedWeights || (!Compact && !WideM && N_EXPAND == 1));
+  struct OperandStorage {
     cute::array_aligned<ElementA, cute::cosize_v<SmemLayoutA>> smem_a;
-    cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutB>> smem_b;
+    cute::array_aligned<ElementStorageB, cute::cosize_v<SmemLayoutB>> smem_b;
+  };
+  struct PackedStorage : OperandStorage {
     cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScale>> smem_scale;
   };
 
-  using SharedStorage = deep_gemm::w4fa8::RowScaleStorage<MainloopStorage, WideM ? BlockM : 0>;
+  using MainloopStorage = cute::conditional_t<PredecodedWeights, OperandStorage, PackedStorage>;
+  using SharedStorage = cute::conditional_t<CacheGroupScales,
+      deep_gemm::w4fa8::GroupScaleStorage<MainloopStorage, kNumStages * BlockM>,
+      deep_gemm::w4fa8::RowScaleStorage<MainloopStorage, WideM ? BlockM : 0>>;
 
   struct NormalArguments {
     int* block_m_info;
@@ -223,6 +232,7 @@ public:
   }
 
   struct DefaultEpilogue {};
+  struct InputReady {};
 
   CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
     TileScheduler scheduler{params.scheduler};
@@ -230,9 +240,12 @@ public:
   }
 
   // MegaMoE shares the native mainloop and supplies activation or scatter.
-  template <class Scheduler, class Epilogue>
+  template <bool UnrollKStages = false, class Scheduler, class Epilogue, class WaitForInput = InputReady>
   CUTLASS_DEVICE void run(Params const& params, char* smem_buf,
-                         Scheduler& deep_scheduler, const Epilogue& epilogue) {
+                         Scheduler& deep_scheduler, const Epilogue& epilogue, WaitForInput wait_for_input = {}) {
+    constexpr bool PrefetchWeights = !cute::is_same_v<WaitForInput, InputReady>;
+    static_assert(!PrefetchWeights || (GroupActivationScales && !CacheGroupScales && !ResidentA &&
+                  !PredecodedWeights && !Fused && N_EXPAND == 1 && kNumStages >= 2 && kNumStages <= 3));
     int thread_idx = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int warpm_idx = warp_idx % WarpsOnM;
@@ -242,7 +255,10 @@ public:
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});             // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});             // (BLK_N,BLK_K2,PIPE)
-    Tensor sScale = make_tensor(make_smem_ptr(storage.smem_scale.data()), SmemLayoutScale{}); // (BLN/64,BLK*2,PIPE)
+    // Only the packed-weight specialization issues copies through this view.
+    ElementScale* scale_ptr = reinterpret_cast<ElementScale*>(storage.smem_b.data());
+    if constexpr (!PredecodedWeights) scale_ptr = storage.smem_scale.data();
+    Tensor sScale = make_tensor(make_smem_ptr(scale_ptr), SmemLayoutScale{});
     auto strideA = make_stride(Int<K>{}, _1{});
     auto strideB = make_stride(Int<K2>{}, _1{}, Int<N * K2>{});
     auto strideScale = make_stride(Int<K * 2>{}, _1{}, Int<K * N / 32>{});
@@ -250,7 +266,7 @@ public:
     GmemTiledCopyA gmem_tiled_copy_A;
     GmemTiledCopyB gmem_tiled_copy_B;
     GmemTiledCopyScale gmem_tiled_copy_scale;
-    gmem_tiled_copy_B.desc_.template init<uint8_t, false, BlockN, BlockK2>(nullptr, N, K2, strideB);
+    gmem_tiled_copy_B.desc_.template init<ElementStorageB, false, BlockN, BlockK2>(nullptr, N, K2, strideB);
     gmem_tiled_copy_scale.desc_.template init<ElementScale, false, BlockN / 64, BlockK * 2>(nullptr, N / 64, K * 2,
                                                                                             strideScale);
     uint32_t thread_idx_A = Fused ? CopyAConfig::logical_thread_idx(thread_idx) : thread_idx;
@@ -333,6 +349,16 @@ public:
     Tensor tCsB = smem_thr_copy_B.partition_S(mix_sB);
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(fp4_tCrB);
 
+    auto [pure_copy_B, pure_src_B, pure_dst_B] = [&]() {
+      if constexpr (PredecodedWeights) {
+        auto copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+        auto thr_B = copy_B.get_thread_slice(warp_idx * 32);
+        auto view_B = reshape_k32(mix_sB);
+        return cute::make_tuple(copy_B, thr_B.partition_S(view_B), thr_B.retile_D(tCrB));
+      } else
+        return cute::make_tuple(NoTensor{}, NoTensor{}, NoTensor{});
+    }();
+
     // Native scale packing is organized in N64 units. Adjacent narrow
     // N warps load the same scale word and select their N16 sub-fragment.
     const int scale_group = WarpN == 48 ? warpn_idx * 3 / 4 : warpn_idx / (64 / WarpN);
@@ -368,7 +394,7 @@ public:
         ptr_b_l = params.ptr_b + int64_t(coord_l) * N * K2;
       else
         ptr_b_l = epilogue.weight(params.ptr_b, coord_l, int64_t(N) * K2);
-      Tensor mB_nk = make_tensor(make_gmem_ptr(ptr_b_l), make_shape(Int<N>{}, Int<K2>{}), make_stride(Int<K2>{}, _1{}));
+      Tensor mB_nk = make_tensor(make_gmem_ptr(reinterpret_cast<const ElementStorageB*>(ptr_b_l)), make_shape(Int<N>{}, Int<K2>{}), make_stride(Int<K2>{}, _1{}));
       Tensor mB_nk_mix = make_mix_tensor_like(mB_nk);
       Tensor gB = local_tile(mB_nk_mix, TilerB{}, make_coord(n_block_idx, _));
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
@@ -514,10 +540,20 @@ public:
         constexpr int scale_warp = WideM && MaxThreadsPerBlock >= 96 ? 2 : copy_warp;
         if (warp_idx == copy_warp)
           copy(gmem_tiled_copy_B, tBgB(_, _, _, k_tile_iter), tBsB(_, _, _, k_pipe));
-        if (warp_idx == scale_warp)
+        if constexpr (!PredecodedWeights)
+          if (warp_idx == scale_warp)
           copy(gmem_tiled_copy_scale, tSgS(_, _, _, k_tile_iter), tSsS(_, _, _, k_pipe));
       };
 
+      if constexpr (PrefetchWeights) {
+        // Weights and MXFP4 scales are immutable while the token rows are arriving.
+        CUTLASS_PRAGMA_UNROLL
+        for (int stage = 0; stage < kNumStages - 1; ++stage) {
+          if (stage < size<2>(gB)) g2s_copy_B_and_scale(stage, stage);
+          cp_async_fence();
+        }
+        wait_for_input();
+      }
       // Retain the complete short-K A tile in dedicated shared slots across N.
       int a_tiles_loaded = 0;
       auto g2s = [&](int k_tile_iter, int k_pipe) {
@@ -529,6 +565,18 @@ public:
         } else
           g2s_copy_A(k_tile_iter, k_pipe);
         g2s_copy_B_and_scale(k_tile_iter, k_pipe);
+        // Share each row scale across the N warps. The operand pipeline's
+        // commit, wait and CTA barriers also protect this stage.
+        if constexpr (CacheGroupScales) {
+          if (thread_idx < BlockM) {
+            const bool valid = thread_idx < residual_m;
+            const int64_t row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM +
+                                (valid ? thread_idx : 0);
+            cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(
+                params.ptr_a_scale[row * (K / 128) + k_tile_iter],
+                storage.group_scales[k_pipe * BlockM + thread_idx], valid);
+          }
+        }
       };
 
       auto s2r_copy_A = [&](int stage_idx, int k_block) {
@@ -701,7 +749,10 @@ public:
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 0; k_pipe < kNumStages - 1; k_pipe++) {
         if (k_pipe < k_tile_count) {
-          g2s(k_pipe, k_pipe);
+          if constexpr (PrefetchWeights)
+            g2s_copy_A(k_pipe, k_pipe);
+          else
+            g2s(k_pipe, k_pipe);
         }
         current_stage++;
         cp_async_fence();
@@ -717,8 +768,8 @@ public:
         auto process_active_rows = [&](auto active_m) {
           constexpr int UsedM = decltype(active_m)::value;
           clear(accum);
-          auto process_k_tile_iteration = [&](int k_tile_idx) {
-            int stage_idx = (k_tile_idx + n_iter * k_tile_count) % kNumStages;
+          auto process_k_tile_iteration = [&](int k_tile_idx, int phase = 0) {
+            const int stage_idx = UnrollKStages ? phase : (k_tile_idx + n_iter * k_tile_count) % kNumStages;
             int next_k_tile_idx = k_tile_idx + kNumStages - 1;
             if constexpr (N_EXPAND > 1) {
               if (next_k_tile_idx == k_tile_count) {
@@ -730,7 +781,7 @@ public:
               }
             } else {
               if (next_k_tile_idx < k_tile_count) {
-                g2s(next_k_tile_idx, current_stage);
+                g2s(next_k_tile_idx, UnrollKStages ? (phase + kNumStages - 1) % kNumStages : current_stage);
               }
             }
             cp_async_fence();
@@ -744,8 +795,12 @@ public:
                 CUTE_UNROLL
                 for (int row = 0; row < 2; ++row) {
                   const int local_row = get<0>(row_coords(2 * row, mb, 0));
-                  const int64_t scale_row = activation_scale_row(local_row < residual_m ? local_row : 0);
-                  group_scales(mb, row) = __ldg(params.ptr_a_scale + scale_row * (K / 128) + k_tile_idx);
+                  if constexpr (CacheGroupScales) {
+                    group_scales(mb, row) = storage.group_scales[stage_idx * BlockM + local_row];
+                  } else {
+                    const int64_t scale_row = activation_scale_row(local_row < residual_m ? local_row : 0);
+                    group_scales(mb, row) = __ldg(params.ptr_a_scale + scale_row * (K / 128) + k_tile_idx);
+                  }
                 }
               }
             }
@@ -833,21 +888,25 @@ public:
               } else {
                 for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block_ic) {
                   constexpr int k_block = decltype(k_block_ic)::value;
-                  if constexpr (k_block % 2 == 0)
+                  if constexpr (PredecodedWeights)
+                    copy(pure_copy_B, pure_src_B(_, _, k_block, stage_idx), pure_dst_B(_, _, k_block));
+                  else if constexpr (k_block % 2 == 0)
                     s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
                   // Wide-M A fragments must not overlap the FP4 dequantization
                   // scratch registers; load A after the B fragment is converted.
                   if constexpr (WarpM <= 64)
                     s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
 
+                  if constexpr (!PredecodedWeights) {
 #pragma unroll
-                  for (int n_block = 0; n_block < WarpN / 16; n_block++) {
-                    CUTE_UNROLL
-                    for (int half = 0; half < 2; ++half) {
-                      auto dequant_accum = decode_fragment(n_block, half);
-                      clear(dequant_accum);
-                      fp4_mma_dequant(n_block, 2 * k_block + half);
-                      quant_fp32C_to_e5m2B(n_block, k_block, half);
+                    for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                      CUTE_UNROLL
+                      for (int half = 0; half < 2; ++half) {
+                        auto dequant_accum = decode_fragment(n_block, half);
+                        clear(dequant_accum);
+                        fp4_mma_dequant(n_block, 2 * k_block + half);
+                        quant_fp32C_to_e5m2B(n_block, k_block, half);
+                      }
                     }
                   }
                   if constexpr (WarpM > 64)
@@ -889,7 +948,16 @@ public:
             __syncthreads();
           };
 
-          if constexpr (k_tile_count <= 4) {
+          if constexpr (UnrollKStages) {
+            static_assert(N_EXPAND == 1 && k_tile_count % kNumStages == 0);
+            // One full pipeline rotation makes each shared-memory stage address constant.
+#pragma unroll 1
+            for (int k = 0; k < k_tile_count; k += kNumStages) {
+              for_each(make_int_sequence<kNumStages>{}, [&](auto phase) {
+                process_k_tile_iteration(k + phase, phase);
+              });
+            }
+          } else if constexpr (k_tile_count <= 4) {
 #pragma unroll
             for (int k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx++) {
               process_k_tile_iteration(k_tile_idx);
@@ -911,9 +979,13 @@ public:
           }
           epilogue_no_tsm(active_m);
         };
+        // MegaMoE's custom nopad epilogues expose the true expert row count,
+        // even when its transport allocation was rounded up to BlockM.
         if constexpr (WideM || (Compact && WarpM >= 64) ||
-                      (GroupActivationScales && kGemmType == GemmType::MGroupedMasked &&
-                       WarpM == 32 && N_EXPAND == 1 && ShapeK > 512)) {
+                      (GroupActivationScales && WarpM == 32 && N_EXPAND == 1 && ShapeK > 512 &&
+                       (kGemmType == GemmType::MGroupedMasked ||
+                        (kGemmType == GemmType::MGroupedNoPad &&
+                         !cute::is_same_v<Epilogue, DefaultEpilogue>)))) {
           // Mutually exclusive branches keep each tail's accumulators local.
           // Independent predicates can merge their live ranges and spill.
           dispatch_tail((residual_m + WarpsOnM - 1) / WarpsOnM, process_active_rows);

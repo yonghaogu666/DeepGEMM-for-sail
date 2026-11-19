@@ -22,7 +22,7 @@ from deep_gemm.testing import calc_diff
 from quantization import quant_w4
 from test_mega_moe import (
     MegaMoECase, MODEL_TOKENS, mega_moe_group,
-    _process_group, _all_gather, _relative_l2, _make_routes,
+    _process_group, _all_gather, _relative_l2, _make_routes, _compile_kernels,
 )
 
 DISTRIBUTED_WORLDS = tuple(range(1, 65))
@@ -114,6 +114,15 @@ CASES = (
 
 SMOKE_CASES = tuple(c for c in CASES if c.name.startswith("smoke_"))
 
+W4A8_GROUP128_MIMO = (
+    MegaMoECase("mimo_v26_pro", 6144, 2048, 384, 8, 8192,
+                tokens=(16, 32, 64, 96, 128, 1024, 2048, 4096, 8192),
+                precision="w4a8", activation_group_size=128, routing="random", worlds=(8,)),
+    MegaMoECase("mimo_v3", 2048, 5120, 384, 8, 8192,
+                tokens=(16, 32, 64, 128, 1024, 2048, 4096, 8192), activation="situ",
+                precision="w4a8", activation_group_size=128, routing="random", worlds=(8,)),
+)
+
 
 def check_output(actual, expected, max_diff=0.001):
     """Make every rank report the same numerical pass/fail decision."""
@@ -171,7 +180,7 @@ def make_weights(e, n, k, precision, rng):
 
 
 def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, situ_linear_beta=25.0):
-    blockwise = c.precision == "fp8_blockwise"
+    blockwise = c.precision == "fp8_blockwise" or c.activation_group_size == 128
     if c.precision != "w4a16":
         q, s = quantize_rows(source, blockwise)
         source = dequantize(q, s, blockwise)
@@ -225,7 +234,8 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
     if c.precision == "w4a8":
         w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
-        mma_type, quantization = "fp8xfp4", None
+        mma_type = "fp8xfp4"
+        quantization = "blockwise" if c.activation_group_size == 128 else None
         entry = dg.fp8_fp4_mega_moe
     elif c.precision == "w4a16":
         w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
@@ -264,19 +274,20 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
             w2 = tuple(t[:-1].contiguous() for t in w2)
         options.update(l1_weights_replicas=replica1, l2_weights_replicas=replica2)
 
-    def forward(source, ids, weights, y, stats=None):
+    def forward(source, ids, weights, y, stats=None, workspace=buffer):
         dg.mega_moe_pre_dispatch(
             source, ids, weights,
-            buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-            num_tokens=source.shape[0], mma_type=buffer.mma_type)
-        entry(y, w1, w2, buffer, stats, **options)
+            workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+            num_tokens=source.shape[0], mma_type=workspace.mma_type)
+        entry(y, w1, w2, workspace, stats, **options)
         return y
 
     return SimpleNamespace(buffer=buffer, raw1=raw1, raw2=raw2, ref1=ref1, ref2=ref2,
                            l1_weights=w1, l2_weights=w2, options=options, entry=entry, forward=forward)
 
 
-def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None):
+def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None, check_zero_input=False,
+             check_weight_updates=False):
     rank, world = group.rank(), group.size()
     max_diff = 0.0015 if c.precision == "w4a8" else 0.001
     rng = torch.Generator(device="cuda").manual_seed(20261030 + rank)
@@ -284,6 +295,10 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
     buffer, refs1, refs2 = pipeline.buffer, pipeline.ref1, pipeline.ref2
     e = c.experts // world
     source = torch.randn((c.capacity, c.hidden), device="cuda", dtype=torch.bfloat16, generator=rng) * 0.1
+    if c.activation_group_size == 128:
+        # Make adjacent K128 groups require materially different scales.
+        exponents = torch.arange(c.hidden // 128, device="cuda").remainder(4) - 2
+        source.mul_(torch.exp2(exponents.float()).repeat_interleave(128))
     stats = torch.zeros(e, device="cuda", dtype=torch.int32)
     check_replica_omission = replicas and c.precision == "w4a8"
     replica_omission_checked = False
@@ -311,6 +326,16 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
                 return pipeline.forward(source[:tokens], ids[:tokens], weights[:tokens], y, stats)
 
             before = stats.clone()
+            if check_weight_updates and iteration == 0:
+                # W1 and W2 must both compile without submitting a decoder or
+                # allocating full-rank weight buffers, including on the auxiliary stream.
+                y.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated()
+                _compile_kernels(forward)
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                assert y.isnan().all()
+                torch.testing.assert_close(stats, before, rtol=0, atol=0)
             forward()
             torch.cuda.synchronize()
             all_ids = _all_gather(ids)
@@ -366,6 +391,32 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
             forward()
             torch.cuda.synchronize()
             torch.testing.assert_close(y, replayed, rtol=0, atol=0)
+            if check_zero_input and requested:
+                # Empty ranks must replay too: the graph contains EP barriers.
+                saved_source = source.clone()
+                source.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.isfinite(y).all()
+                assert torch.count_nonzero(y) == 0
+                source.copy_(saved_source)
+                del saved_source
+            if check_weight_updates and requested:
+                for layer in (1, 2):
+                    banks = [getattr(pipeline, f"l{layer}_weights")[0]]
+                    if replicas:
+                        banks.append(pipeline.options[f"l{layer}_weights_replicas"][0])
+                    saved = [bank.clone() for bank in banks]
+                    for bank in banks:
+                        bank.zero_()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.count_nonzero(y) == 0
+                    for bank, original in zip(banks, saved):
+                        bank.copy_(original)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(y, replayed, rtol=0, atol=0)
             weights.zero_()
             graph.replay()
             torch.cuda.synchronize()
@@ -401,6 +452,93 @@ def test_mega_moe_precision(case, mega_moe_group):
 def test_mega_moe_precision_replicas(case, mega_moe_group):
     run_case(replace(case, experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS,
                      tokens=(1, 33)), mega_moe_group, replicas=True, fast_math=False)
+
+
+@pytest.mark.parametrize("activation", ("swiglu", "situ", "swiglu_step", "swiglu_oai"))
+def test_w4a8_group128_smoke(activation, mega_moe_group):
+    case = MegaMoECase(
+        "w4a8_group128", 512, 256, 4 * mega_moe_group.size(), 2, 129,
+        tokens=(1, 0, 33, 129, 8), activation=activation, precision="w4a8",
+        clamp=.125 if activation in ("swiglu_step", "swiglu_oai") else None,
+        activation_alpha=.25 if activation == "swiglu_oai" else None,
+        routing="random", reference_tokens=129, worlds=DISTRIBUTED_WORLDS,
+        activation_group_size=128,
+    )
+    run_case(case, mega_moe_group, replicas=True, fast_math=False, check_zero_input=True)
+
+
+def test_w4a8_group128_shared_workspace(mega_moe_group):
+    # The smaller layer uses the owner's routing stride and its own K128 scale count.
+    rank, world = mega_moe_group.rank(), mega_moe_group.size()
+    rng = torch.Generator(device="cuda").manual_seed(20261119 + rank)
+    case = MegaMoECase("group128_owner", 1024, 512, 4 * world, 2, 65,
+                       precision="w4a8", routing="random", worlds=DISTRIBUTED_WORLDS,
+                       activation_group_size=128)
+    child = replace(case, hidden=512, intermediate=256, experts=2 * world, capacity=33)
+    owner = make_pipeline(case, mega_moe_group, rng)
+    smaller = make_pipeline(child, mega_moe_group, rng)
+    alias = dg.SymmBuffer(mega_moe_group, child.experts, child.capacity, child.topk,
+                          child.hidden, child.intermediate, mma_type="fp8xfp4",
+                          quantization="blockwise", base=owner.buffer)
+    try:
+        assert alias.buffer.data_ptr() == owner.buffer.buffer.data_ptr()
+        graphs = []
+        for shape, pipe, workspace in ((case, owner, owner.buffer), (child, smaller, alias)):
+            x = torch.randn((8, shape.hidden), device="cuda", dtype=torch.bfloat16, generator=rng) * .1
+            ids = _make_routes(shape, len(x), rng)
+            weights = torch.rand((len(x), shape.topk), device="cuda", generator=rng)
+            y = torch.empty_like(x)
+            expected = pipe.forward(x, ids, weights, y).clone()
+            pipe.forward(x, ids, weights, y, workspace=workspace)
+            q, scales = quantize_rows(x, blockwise=True)
+            torch.testing.assert_close(workspace.x_sf[:len(x)], scales, rtol=0, atol=0)
+            torch.testing.assert_close(workspace.x[:len(x)].view(torch.uint8), q.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                pipe.forward(x, ids, weights, y, workspace=workspace)
+            graphs.append((graph, y, expected, x, ids, weights))
+        for graph, y, expected, *_ in (graphs[0], graphs[1], graphs[0]):
+            y.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    finally:
+        alias.destroy()
+        smaller.buffer.destroy()
+        owner.buffer.destroy()
+
+
+@pytest.mark.parametrize("case", W4A8_GROUP128_MIMO, ids=lambda c: c.name)
+def test_w4a8_group128_decode(mega_moe_group, case):
+    # Reuse one allocation across sparse tails and the larger decode tile.
+    decode = tuple(n for n in case.tokens if n <= 128)
+    run_case(replace(case, capacity=max(decode), tokens=(*decode, 0), worlds=(8, 16, 32)), mega_moe_group,
+             replicas=True, fast_math=False, check_zero_input=True)
+
+
+@pytest.mark.parametrize("hidden", (768, 4096))
+def test_w4a8_group128_small_experts(hidden, mega_moe_group):
+    # Cross sparse-row and long-K boundaries with K>512 in both projections.
+    # run_case also changes routes during Graph replay and leaves a rank empty.
+    case = MegaMoECase(
+        "w4a8_group128_small_experts", hidden, 768, 4 * mega_moe_group.size(), 2, 65,
+        tokens=(1, 8, 16, 33, 65, 0), precision="w4a8", routing="random",
+        worlds=DISTRIBUTED_WORLDS, activation_group_size=128,
+    )
+    run_case(case, mega_moe_group, replicas=True, fast_math=False)
+
+
+@pytest.mark.parametrize("case,tokens", [
+    pytest.param(case, n, id=f"{case.name}-{n}")
+    for case in W4A8_GROUP128_MIMO for n in case.tokens if n > 128
+])
+def test_w4a8_group128_prefill(mega_moe_group, case, tokens):
+    # Exercise fused group quantization with native and predecoded weights,
+    # different inverse scales, Graph route updates, and a subsequent empty
+    # call on the same transport allocation.
+    run_case(replace(case, capacity=tokens, tokens=(tokens, tokens, 0)), mega_moe_group,
+             replicas=True, fast_math=False, check_zero_input=True, check_weight_updates=tokens >= 2048)
 
 
 def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):

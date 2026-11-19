@@ -39,6 +39,22 @@ CUTLASS_DEVICE uint16_t fp8_pair(float lo, float hi) {
     return __hg_cvt_float2_to_fp8x2(make_float2(lo, hi), __HG_SATFINITE, __HG_E4M3);
 }
 
+// Eight lanes each supply 16 BF16-derived values for one K128 group.
+// Normalize using the rounded scale also written for the next GEMM.
+CUTLASS_DEVICE FP8Scale fp8_group128_scale(float lane_amax) {
+    const float scale = fmaxf(warp_amax<8>(lane_amax), 1e-10f) * (1.0f / 448.0f);
+    return {scale, 1.0f / scale};
+}
+
+CUTLASS_DEVICE uint4 pack_fp8x16(const float2 (&values)[8], float inverse) {
+    uint4 packed{};
+    auto* pairs = reinterpret_cast<uint16_t*>(&packed);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+        pairs[i] = fp8_pair(values[i].x * inverse, values[i].y * inverse);
+    return packed;
+}
+
 // Preserve the existing fused FP4 epilogue's bit-based E8M0 rounding.
 CUTLASS_DEVICE uint32_t mxfp4_scale_bits(uint32_t amax_bits) {
     return (((amax_bits > 0x2EDBE6FFu ? amax_bits : 0x2EDBE6FFu) - 0x1400000u)

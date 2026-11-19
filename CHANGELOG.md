@@ -21,6 +21,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   shapes through `SymmBuffer(base=...)`, including eager execution and
   CUDA Graph replay.
 
+- **M890 W4A8 group128 MegaMoE** accepts `quantization="blockwise"` with
+  `mma_type="fp8xfp4"`. Both projections use FP32 K128 activation scales and
+  retain the existing MXFP4 K32 weight format. Includes MiMo V2.6 Pro EP8
+  decode and prefill profiles.
+
 - **M890 W4A8 group128 activations**: accepts contiguous FP32 activation
   scales with trailing dimension `K/128` alongside existing per-row scales
   in native and streamed GEMMs. Adds scale-mode specialization for JIT and

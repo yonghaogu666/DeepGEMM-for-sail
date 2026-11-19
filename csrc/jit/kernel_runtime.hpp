@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <sstream>
 #include <vector>
 
@@ -172,14 +173,15 @@ public:
     }
 
     template <typename Args>
-    static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
+    static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args,
+                       std::optional<hggcStream_t> requested_stream = std::nullopt) {
         // Compile-only / warm-up mode: Compiler::build already compiled + cached the kernel above, so
         // skip the actual launch.
         if (is_compile_only())
             return;
 
         const auto& kernel = kernel_runtime->kernel;
-        const auto& stream = current_stream();
+        const auto stream = requested_stream ? *requested_stream : current_stream();
         const LaunchArgs& launch_args = args.launch_args;
         auto config =
             construct_launch_config(kernel, stream, launch_args.smem_size, launch_args.grid_dim, launch_args.block_dim);

@@ -66,6 +66,7 @@ class MegaMoECase:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     activation_alpha: float | None = None
+    activation_group_size: int = 0
 
     @property
     def mma_type(self):

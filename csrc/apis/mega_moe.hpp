@@ -97,6 +97,13 @@ static std::string fp8_mega_moe_precision(const std::string& quantization) {
     return "fp8_" + quantization;
 }
 
+static std::string w4a8_mega_moe_precision(const std::optional<std::string>& quantization) {
+    const auto mode = quantization.value_or("channelwise");
+    TORCH_CHECK(mode == "channelwise" || mode == "blockwise",
+                "W4A8 activation quantization must be 'channelwise' or 'blockwise'");
+    return mode == "blockwise" ? "w4a8_group128" : "w4a8";
+}
+
 template <class BufferLayout = layout::MegaMoEBuffer>
 static BufferLayout get_mega_moe_layout(
     int num_ranks, int num_experts, int capacity, int topk,
@@ -198,8 +205,8 @@ get_symm_buffer_size_for_mega_moe(
     const std::optional<std::string>& quantization = std::nullopt) {
     const auto activation_kind = parse_gated_activation(activation);
     TORCH_CHECK(num_shared_experts == 0, "MegaMoE shared experts are not supported yet");
-    TORCH_CHECK(mma_type == "fp8xfp8" || !quantization,
-                "quantization applies only to fp8xfp8 workspaces");
+    TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || !quantization,
+                "quantization applies only to FP8-activation workspaces");
     if (is_fp4_mma_type(mma_type))
         return get_mega_moe_buffer_slices<layout::MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
@@ -211,7 +218,7 @@ get_symm_buffer_size_for_mega_moe(
         if (mma_type == "fp8xfp8")
             precision = fp8_mega_moe_precision(quantization.value_or("channelwise"));
         else if (mma_type == "fp8xfp4")
-            precision = "w4a8";
+            precision = w4a8_mega_moe_precision(quantization);
         else
             precision = "w4a16";
         return get_mega_moe_buffer_slices_for_precision(
@@ -441,6 +448,8 @@ static Precision routed_precision(const std::string& precision) {
         return P::W4A16;
     if (precision == "w4a8")
         return P::W4A8;
+    if (precision == "w4a8_group128")
+        return P::W4A8Group128;
     if (precision == "fp8_channelwise")
         return P::FP8Channelwise;
     TORCH_CHECK(precision == "fp8_blockwise", "Unsupported MegaMoE precision: ", precision);
@@ -475,7 +484,8 @@ static layout::RoutedMoEBuffer checked_routed_layout(
         routing_bytes = owner_bytes;
     }
     return {uint32_t(num_ranks), uint32_t(num_experts), uint32_t(num_max_tokens_per_rank), uint32_t(num_topk),
-            uint32_t(hidden), uint32_t(intermediate_hidden), p != P::W4A16, p == P::FP8Blockwise, routing_bytes};
+            uint32_t(hidden), uint32_t(intermediate_hidden), p != P::W4A16,
+            p == P::FP8Blockwise || p == P::W4A8Group128, routing_bytes, p == P::W4A8Group128};
 }
 
 static void check_routed_buffer(const Tensor& buffer, const layout::RoutedMoEBuffer& layout) {
@@ -496,7 +506,8 @@ static std::tuple<int64_t, pybind11::function> get_mega_moe_buffer_slices_for_pr
             const auto transport = make_sym_buffer(pointers, rank_idx, num_ranks);
             TORCH_CHECK(transport.base == reinterpret_cast<int64_t>(buffer.data_ptr()),
                         "Invalid local symmetric pointer");
-            const bool fp8 = precision != "w4a16", blockwise = precision == "fp8_blockwise";
+            const bool fp8 = precision != "w4a16";
+            const bool blockwise = precision == "fp8_blockwise" || precision == "w4a8_group128";
             auto x = mega_moe_slice(buffer, layout.input_tokens, {num_max_tokens_per_rank, hidden},
                                     fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
             auto sf = mega_moe_slice(buffer, layout.input_scales,
@@ -700,7 +711,7 @@ void fp8_fp4_mega_moe(
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<float>& activation_alpha_opt,
     const std::optional<W4A8Weights>& l1_weights_replicas, const std::optional<W4A8Weights>& l2_weights_replicas,
-    const std::array<int, 3>& staging_config) {
+    const std::array<int, 3>& staging_config, const std::optional<std::string>& quantization) {
     check_device();
     const auto activation_kind = parse_gated_activation(activation);
     const auto activation_params = check_mega_moe_activation(
@@ -709,8 +720,9 @@ void fp8_fp4_mega_moe(
     TORCH_CHECK(y.dim() == 2 && std::get<0>(l1_weights_tuple).dim() == 3, "Invalid output or GEMM1 weight rank");
     const int hidden = y.size(1), intermediate = std::get<0>(l1_weights_tuple).size(1) / 2;
     const int tokens = y.size(0), ranks = sym_buffer_ptrs.size();
+    const auto precision = w4a8_mega_moe_precision(quantization);
     const auto l = checked_routed_layout(ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate, "w4a8", staging_config);
+                                         hidden, intermediate, precision, staging_config);
     TORCH_CHECK(tokens <= num_max_tokens_per_rank, "output token count exceeds workspace capacity");
     TORCH_CHECK(y.device() == sym_buffer.device(), "output and workspace must share a device");
     const auto transport = make_sym_buffer(sym_buffer_ptrs, rank_idx, ranks);
@@ -743,15 +755,25 @@ void fp8_fp4_mega_moe(
     }
     check_routed_buffer(sym_buffer, l);
     const auto& configs = get_mega_moe_precision_configs(
-        Precision::W4A8, ranks, num_experts, num_topk, hidden, intermediate,
+        routed_precision(precision), ranks, num_experts, num_topk, hidden, intermediate,
         num_max_tokens_per_rank, tokens, masters, activation, y.device().index());
+    PredecodedWorkspace* workspace = nullptr;
+    if (configs.l1.predecode_weights && !is_compile_only()) {
+        const auto owner = py::cast(sym_buffer);
+        constexpr auto attr = "_mega_moe_w4a8_workspaces";
+        if (!py::hasattr(owner, attr))
+            owner.attr(attr) = py::capsule(new PredecodedWorkspaces,
+                [](void* p) { delete static_cast<PredecodedWorkspaces*>(p); });
+        auto* workspaces = owner.attr(attr).cast<py::capsule>().get_pointer<PredecodedWorkspaces>();
+        workspace = &predecoded_workspace(*workspaces, sym_buffer, configs);
+    }
     fp8_fp4_mega_moe_impl(y, l1_weights_tuple, l2_weights_tuple,
         l1_weights_replicas ? *l1_weights_replicas : l1_weights_tuple,
         l2_weights_replicas ? *l2_weights_replicas : l2_weights_tuple,
         sym_buffer.data_ptr<uint8_t>(), l, transport, rank_idx, tokens, activation_kind,
         activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.0f,
         fast_math, activation_params.alpha, activation_params.beta, activation_params.linear_beta,
-        configs, cumulative_local_expert_recv_stats);
+        configs, workspace, cumulative_local_expert_recv_stats);
 }
 
 static void int8_int8_mega_moe(

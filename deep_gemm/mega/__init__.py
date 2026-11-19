@@ -37,8 +37,9 @@ class SymmBuffer:
 
     mma_type='fp4xfp4' (also 'mxfp4xmxfp4') selects W4A4; 'fp8xfp4' selects W4A8.
     'int8xint8' selects SM80 INT8 with one FP32 scale per token.
-    'bf16xfp4' selects W4A16; 'fp8xfp8' selects W8A8, with
-    quantization='channelwise' (default) or 'blockwise'. intermediate_hidden is I.
+    'bf16xfp4' selects W4A16 and 'fp8xfp8' selects W8A8. W4A8 and W8A8 support
+    quantization='channelwise' (default) or 'blockwise'. W4A8 blockwise keeps MXFP4
+    weights and uses one activation scale per 128 elements in both GEMMs. intermediate_hidden is I.
 
     Select the HGGC device before construction. base shares storage and
     staging capacities; every view must fit the allocation.
@@ -51,9 +52,9 @@ class SymmBuffer:
     x is the FP4 dispatch view in [token, hidden/2] order. x_sf is the pushed-SFA
     staging view in [parity, source_rank, source_token, scale_block]
     order. It is an internal output of pre-dispatch, not a source-scale input
-    that callers may fill directly. W4A8 instead exposes E4M3 x [token, hidden]
-    and FP32 x_sf [token, 1], as does FP8 channelwise. FP8 blockwise has one
-    input scale per 128 elements. W4A16 exposes BF16 x and an empty x_sf view.
+    that callers may fill directly. W4A8 and W8A8 expose E4M3 x [token, hidden]
+    and FP32 x_sf [token, 1] for channelwise or [token, hidden/128] for blockwise.
+    W4A16 exposes BF16 x and an empty x_sf view.
     INT8 exposes x [token, hidden] and per-source-token FP32 scales in the
     x_sf staging view, populated by mega_moe_pre_dispatch.
     INT8 copy streams/events are created with the allocation, shared by aliases,
@@ -74,13 +75,16 @@ class SymmBuffer:
             quantization = 'channelwise' if quantization is None else quantization
             if quantization not in ('channelwise', 'blockwise'):
                 raise ValueError("FP8 quantization must be 'channelwise' or 'blockwise'")
+        elif mma_type == 'fp8xfp4':
+            if quantization not in (None, 'channelwise', 'blockwise'):
+                raise ValueError("W4A8 activation quantization must be 'channelwise' or 'blockwise'")
         elif quantization is not None:
-            raise ValueError('quantization applies only to fp8xfp8 workspaces')
+            raise ValueError('quantization applies only to FP8-activation workspaces')
         # Keep the original positional constructor and W4A4 staging contract.
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
         if base is not None:
             if (not isinstance(base, SymmBuffer) or base.mma_type != mma_type
-                    or base.quantization != quantization):
+                    or (base.quantization or 'channelwise') != (quantization or 'channelwise')):
                 raise ValueError('base must use the same MegaMoE mma_type and quantization')
             base._check_live()
             if base.group is not group or base.buffer.device.index != torch.cuda.current_device():
@@ -178,8 +182,8 @@ def get_symm_buffer_for_mega_moe(
 
     The workspace is filled by mega_moe_pre_dispatch and consumed by
     the corresponding complete compute entry. MMA modes are 'fp4xfp4' (alias 'mxfp4xmxfp4'),
-    'int8xint8', 'fp8xfp4', 'bf16xfp4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
-    selecting channelwise (default) or blockwise scales.
+    'int8xint8', 'fp8xfp4', 'bf16xfp4' and 'fp8xfp8'. The FP8-activation modes
+    accept quantization='channelwise' (default) or 'blockwise'.
     """
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -644,6 +648,7 @@ def fp8_fp4_mega_moe(
 ) -> None:
     """Complete E4M3 x MXFP4 MoE, applying routing weights once in combine.
 
+    Both GEMMs use the activation scale layout selected by sym_buffer.quantization.
     SiTU and OAI parameters follow fp4_fp4_mega_moe. situ_linear_beta=None
     disables the up softcap; activation_alpha applies only to OAI.
     """
@@ -659,4 +664,4 @@ def fp8_fp4_mega_moe(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
-        l1_weights_replicas, l2_weights_replicas, sym_buffer.staging_config)
+        l1_weights_replicas, l2_weights_replicas, sym_buffer.staging_config, sym_buffer.quantization)

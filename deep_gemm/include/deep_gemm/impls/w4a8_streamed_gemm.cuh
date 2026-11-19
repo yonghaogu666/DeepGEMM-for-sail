@@ -58,7 +58,7 @@ __device__ __forceinline__ void decode_tile_body(const uint8_t* __restrict__ pac
   const int expert_blocks = (int(gridDim.x) + expert_step - 1 - first_expert) / expert_step;
   for (int expert = first_expert; expert < Groups; expert += expert_step) {
     // Prune the complete expert before its K/N vector loop, including replay.
-    if (__ldg(all_rows + group_start + expert) == 0)
+    if (all_rows && __ldg(all_rows + group_start + expert) == 0)
       continue;
     for (int64_t vector = int64_t(local_block) * 256 + threadIdx.x; vector < int64_t(TileN) * VectorsPerRow;
          vector += int64_t(expert_blocks) * 256) {
@@ -73,7 +73,7 @@ __device__ __forceinline__ void decode_tile_body(const uint8_t* __restrict__ pac
       *reinterpret_cast<uint4*>(output + (int64_t(expert) * TileN * VectorsPerRow + vector) * 16) = decoded;
     }
   }
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+  if (all_rows && blockIdx.x == 0 && threadIdx.x == 0) {
     int prefix = 0, count = 0;
     for (int i = 0; i < group_start; ++i)
       prefix += all_rows[i];
@@ -130,7 +130,7 @@ __device__ __forceinline__ void decode_fulln_rows32_body(const uint8_t* __restri
     }
   }
 
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+  if (all_rows && blockIdx.x == 0 && threadIdx.x == 0) {
     int prefix = 0, count = 0;
     for (int i = 0; i < group_start; ++i)
       prefix += all_rows[i];
@@ -301,7 +301,7 @@ struct W4A8SingleRegisterMainloop : deep_gemm::w4fa8_streamed::UnitBScaleMainloo
   using TileShape = typename Base::TileShape;
   static constexpr int CachedScaleElements = deep_gemm::w4fa8_streamed::group_scale_pipeline_elements(
       cute::size<0>(TileShape{}), DispatchPolicy::Stages, sizeof(typename Base::SharedStorage), GroupActivationScales);
-  using SharedStorage = deep_gemm::w4fa8_streamed::GroupScaleStorage<
+  using SharedStorage = deep_gemm::w4fa8::GroupScaleStorage<
       typename Base::SharedStorage, CachedScaleElements>;
   using ElementScale = typename Base::ElementScale;
   using SmemLayoutA = typename Base::SmemLayoutA;
