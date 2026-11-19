@@ -21,6 +21,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   shapes through `SymmBuffer(base=...)`, including eager execution and
   CUDA Graph replay.
 
+- **M890 W4A8 group128 activations**: accepts contiguous FP32 activation
+  scales with trailing dimension `K/128` alongside existing per-row scales
+  in native and streamed GEMMs. Adds scale-mode specialization for JIT and
+  graph readiness, group-scale gathering for fused routing, and
+  `activation_group_size` in UT dump/replay. Weight preprocessing and
+  public GEMM signatures are unchanged.
+
 - **MegaMoE activation parity**: all MMA types support `swiglu`, `swiglu_step`,
   `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
   sigmoid/tanh are unconditional; `fast_math` selects only the division path.
@@ -80,6 +87,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   Supports `scoring_func="sqrtsoftplus"` (default) and `scoring_func="sigmoid"`.
 
 ### Changed
+
+- **M890 streamed W4A8 group128 GEMM**: caches each CTA's activation
+  scales in a bounded shared-memory ring alongside operand prefetches.
+  Uses AIU zero-fill for partial rows without redundant per-element masks.
+  Includes the ring in launch-memory sizing and retains uncached reads
+  when it would exceed the shared-memory budget.
+  E5M2 expanded weights, accumulation order, and per-row scaling are unchanged.
 
 - **MegaMoE activation precision**: all backends consume FP32 GEMM1
   accumulators and use FP32 activation with native PPU sigmoid/tanh.

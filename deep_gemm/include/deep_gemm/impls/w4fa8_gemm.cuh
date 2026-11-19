@@ -31,18 +31,20 @@ using deep_gemm::GemmType;
 template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM, int WarpN, int WarpK, int kNumGroups,
           int kNumStages, GemmType kGemmType, int N_EXPAND = 1, bool ApplyInvScale = false,
           deep_gemm::w4fa8::FragmentPolicy Fragment = deep_gemm::w4fa8::FragmentPolicy::FullK,
-          deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk>
+          deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk,
+          bool GroupActivationScales = false>
 class W4A8GEMM_MMA {
 public:
   static constexpr bool WideM = deep_gemm::w4fa8::uses_ring_a(WarpM);
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool Compact = Fragment == deep_gemm::w4fa8::FragmentPolicy::RollingK32;
+  static_assert(!GroupActivationScales || BlockK == 128);
   static constexpr int DecodeN = WideM ? 1 : WarpN / 16;
   // A narrow ring bounds live A operands for wide M tiles.
   static constexpr int ADistance = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2 ? 1 : -1;
   static constexpr bool EarlyA = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2;
-  static_assert(!WideM || (Compact && EarlyA && BlockN == 256 && WarpN == 32),
-                "W4FA8 wide tiles require RollingK32/Ring2 with BlockN256/WarpN32");
+  static_assert(!WideM || (Compact && EarlyA && BlockN == 256 && WarpN == (GroupActivationScales ? 16 : 32)),
+                "W4FA8 wide tiles require RollingK32/Ring2 and a scale-mode-specific warp width");
   static_assert(BlockK == WarpK, "W4FA8 native tiles require BlockK == WarpK");
   static_assert(!Compact || N_EXPAND == 1);
   static_assert(WarpN == 16 || WarpN == 32 || WarpN == 48 || WarpN == 64);
@@ -58,7 +60,7 @@ public:
   // A fourth slot reduces CTA residency for the default N256 tile.
   static constexpr bool ResidentA = N_EXPAND > 1 && WarpM == 64 && ShapeK <= 384;
   static constexpr int ASlots = ResidentA && ShapeK / BlockK > kNumStages ? ShapeK / BlockK : kNumStages;
-  static constexpr bool CacheRowScale = N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
+  static constexpr bool CacheRowScale = !GroupActivationScales && N_EXPAND > 1 && WarpM >= 32 && ShapeK <= 512;
   // basic
   static constexpr bool E8M0_scale = true;
   static constexpr bool scale_use_ld_matrix = true;
@@ -451,7 +453,7 @@ public:
       // The prologue commit/wait covers these 4-byte asynchronous copies too.
       // A buffer is reused only after every warp has crossed the intervening
       // work item's prologue CTA barrier, completing its old epilogue reads.
-      if constexpr (WideM)
+      if constexpr (WideM && !GroupActivationScales)
         if (thread_idx < BlockM) {
           const bool valid = thread_idx < residual_m;
           int64_t scale_row = 0;
@@ -600,6 +602,12 @@ public:
         }
       };
 
+      auto activation_scale_row = [&](int local_row) -> int64_t {
+        if constexpr (Fused)
+          return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
+        else
+          return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+      };
       auto apply_inv_scale = [&](float scale) {
         if constexpr (ApplyInvScale)
           return scale * params.inv_scale;
@@ -615,7 +623,7 @@ public:
           static_assert(BlockK >= sizeof(float));
           for (int row = thread_idx; row < BlockM; row += MaxThreadsPerBlock) {
             const bool valid = row < residual_m;
-            const int64_t scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + (valid ? row : 0);
+            const int64_t scale_row = activation_scale_row(valid ? row : 0);
             cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(params.ptr_a_scale[scale_row], smem_row_scale[row],
                                                               valid);
           }
@@ -657,13 +665,11 @@ public:
             const int local_row = get<0>(tDcD(2 * row, m, 0));
             if (local_row >= residual_m)
               continue;
-            int64_t scale_row;
-            if constexpr (Fused) {
-              scale_row = params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
-            } else
-              scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+            const int64_t scale_row = activation_scale_row(local_row);
             const float a_scale = [&]() {
-              if constexpr (WideM)
+              if constexpr (GroupActivationScales)
+                return apply_inv_scale(1.f);
+              else if constexpr (WideM)
                 return apply_inv_scale(storage.row_scales[scale_buffer][local_row]);
               else
                 return CacheRowScale ? cached_row_scale(m, row) : apply_inv_scale(params.ptr_a_scale[scale_row]);
@@ -730,108 +736,155 @@ public:
             cp_async_fence();
             current_stage = (current_stage + 1) % kNumStages;
 
-            if constexpr (Compact) {
-              for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto ki) {
-                constexpr int kb = decltype(ki)::value;
-                if constexpr (kb % 2 == 0)
-                  s2r_copy_B_and_scale_slice(stage_idx, kb / 2);
-                if constexpr (ADistance > 0 && EarlyA) {
-#pragma unroll
-                  for (int mb = 0; mb < ADistance && mb < UsedM; ++mb)
-                    copy(smem_tiled_copy_A, tCsA(_, mb, kb, stage_idx), tCrA_copy_view(_, mb, Int<0>{}));
+            auto group_scales = make_tensor<float>(make_shape(size<1>(accum), Int<2>{}));
+            if constexpr (GroupActivationScales) {
+              Tensor row_coords = thr_mma.partition_C(cD);
+              CUTE_UNROLL
+              for (int mb = 0; mb < UsedM; ++mb) {
+                CUTE_UNROLL
+                for (int row = 0; row < 2; ++row) {
+                  const int local_row = get<0>(row_coords(2 * row, mb, 0));
+                  const int64_t scale_row = activation_scale_row(local_row < residual_m ? local_row : 0);
+                  group_scales(mb, row) = __ldg(params.ptr_a_scale + scale_row * (K / 128) + k_tile_idx);
                 }
-                if constexpr (WideM) {
+              }
+            }
+            // Very wide group-scale tiles keep the final accumulator live but
+            // bound each K128 partial to four M16 fragments. Reusing the same
+            // copy/decode loop avoids register spills at the largest tile sizes.
+            constexpr int PartialM = GroupActivationScales && WideM && WarpM >= 160 ? 4 : UsedM;
+            for_each(make_int_sequence<(UsedM + PartialM - 1) / PartialM>{}, [&](auto slice) {
+              constexpr int MStart = decltype(slice)::value * PartialM;
+              constexpr int SliceM = UsedM - MStart < PartialM ? UsedM - MStart : PartialM;
+              auto accum_k = make_tensor<float>(make_shape(size<0>(accum), Int<SliceM>{}, size<2>(accum)));
+              if constexpr (GroupActivationScales) clear(accum_k);
+              auto& mma_accum = [&]() -> auto& {
+                if constexpr (GroupActivationScales) return accum_k;
+                else return accum;
+              }();
+
+              if constexpr (Compact) {
+                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto ki) {
+                  constexpr int kb = decltype(ki)::value;
+                  if constexpr (kb % 2 == 0)
+                    s2r_copy_B_and_scale_slice(stage_idx, kb / 2);
+                  if constexpr (ADistance > 0 && EarlyA) {
 #pragma unroll
-                  for (int nb = 0; nb < WarpN / 16; ++nb) {
-#pragma unroll
-                    for (int half = 0; half < 2; ++half) {
-                      clear(fp4_accum);
-                      fp4_mma_dequant(nb, 2 * kb + half);
-                      quant_fp32C_to_e5m2B(nb, kb, half);
-                    }
+                    for (int mb = 0; mb < ADistance && mb < SliceM; ++mb)
+                      copy(smem_tiled_copy_A, tCsA(_, MStart + mb, kb, stage_idx), tCrA_copy_view(_, mb, Int<0>{}));
                   }
-                } else {
-                  for_each(make_int_sequence<WarpN / (16 * DecodeN)>{}, [&](auto ng) {
-                    constexpr int n0 = decltype(ng)::value * DecodeN;
+                  if constexpr (WideM) {
 #pragma unroll
-                    for (int half = 0; half < 2; ++half) {
+                    for (int nb = 0; nb < WarpN / 16; ++nb) {
 #pragma unroll
-                      for (int j = 0; j < DecodeN; ++j) {
-                        clear(decode_fragment(j, half));
-                        fp4_mma_dequant(n0 + j, 2 * kb + half);
+                      for (int half = 0; half < 2; ++half) {
+                        clear(fp4_accum);
+                        fp4_mma_dequant(nb, 2 * kb + half);
+                        quant_fp32C_to_e5m2B(nb, kb, half);
                       }
                     }
+                  } else {
+                    for_each(make_int_sequence<WarpN / (16 * DecodeN)>{}, [&](auto ng) {
+                      constexpr int n0 = decltype(ng)::value * DecodeN;
 #pragma unroll
-                    for (int j = 0; j < DecodeN; ++j) {
+                      for (int half = 0; half < 2; ++half) {
 #pragma unroll
-                      for (int half = 0; half < 2; ++half)
-                        quant_fp32C_to_e5m2B(n0 + j, kb, half);
+                        for (int j = 0; j < DecodeN; ++j) {
+                          clear(decode_fragment(j, half));
+                          fp4_mma_dequant(n0 + j, 2 * kb + half);
+                        }
+                      }
+#pragma unroll
+                      for (int j = 0; j < DecodeN; ++j) {
+#pragma unroll
+                        for (int half = 0; half < 2; ++half)
+                          quant_fp32C_to_e5m2B(n0 + j, kb, half);
+                      }
+                    });
+                  }
+                  if constexpr (ADistance < 0) {
+                    s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, kb);
+#pragma unroll
+                    for (int nb = 0; nb < WarpN / 16; ++nb) {
+#pragma unroll
+                      for (int mb = 0; mb < SliceM; ++mb)
+                        cute::gemm(tiled_mma, tCrA(_, mb, Int<0>{}), tCrB(_, nb, Int<0>{}), mma_accum(_, mb, nb));
                     }
-                  });
-                }
-                if constexpr (ADistance < 0) {
-                  s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, kb);
+                  } else {
+                    auto load_a = [&](int mb) {
+                      copy(smem_tiled_copy_A, tCsA(_, MStart + mb, kb, stage_idx),
+                           tCrA_copy_view(_, mb % (ADistance + 1), Int<0>{}));
+                    };
 #pragma unroll
-                  for (int nb = 0; nb < WarpN / 16; ++nb) {
+                    for (int mb = 0; mb < ADistance && mb < SliceM; ++mb)
+                      if constexpr (!EarlyA)
+                        load_a(mb);
 #pragma unroll
-                    for (int mb = 0; mb < UsedM; ++mb)
-                      cute::gemm(tiled_mma, tCrA(_, mb, Int<0>{}), tCrB(_, nb, Int<0>{}), accum(_, mb, nb));
+                    for (int mb = 0; mb < SliceM; ++mb) {
+                      if (mb + ADistance < SliceM)
+                        load_a(mb + ADistance);
+#pragma unroll
+                      for (int nb = 0; nb < WarpN / 16; ++nb)
+                        cute::gemm(tiled_mma, tCrA(_, mb % (ADistance + 1), Int<0>{}), tCrB(_, nb, Int<0>{}),
+                                   mma_accum(_, mb, nb));
+                    }
                   }
-                } else {
-                  auto load_a = [&](int mb) {
-                    copy(smem_tiled_copy_A, tCsA(_, mb, kb, stage_idx),
-                         tCrA_copy_view(_, mb % (ADistance + 1), Int<0>{}));
-                  };
-#pragma unroll
-                  for (int mb = 0; mb < ADistance && mb < UsedM; ++mb)
-                    if constexpr (!EarlyA)
-                      load_a(mb);
-#pragma unroll
-                  for (int mb = 0; mb < UsedM; ++mb) {
-                    if (mb + ADistance < UsedM)
-                      load_a(mb + ADistance);
-#pragma unroll
-                    for (int nb = 0; nb < WarpN / 16; ++nb)
-                      cute::gemm(tiled_mma, tCrA(_, mb % (ADistance + 1), Int<0>{}), tCrB(_, nb, Int<0>{}),
-                                 accum(_, mb, nb));
-                  }
-                }
-              });
-            } else {
-              for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block_ic) {
-                constexpr int k_block = decltype(k_block_ic)::value;
-                if constexpr (k_block % 2 == 0)
-                  s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
-                // Wide-M A fragments must not overlap the FP4 dequantization
-                // scratch registers; load A after the B fragment is converted.
-                if constexpr (WarpM <= 64)
-                  s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
+                });
+              } else {
+                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block_ic) {
+                  constexpr int k_block = decltype(k_block_ic)::value;
+                  if constexpr (k_block % 2 == 0)
+                    s2r_copy_B_and_scale_slice(stage_idx, k_block / 2);
+                  // Wide-M A fragments must not overlap the FP4 dequantization
+                  // scratch registers; load A after the B fragment is converted.
+                  if constexpr (WarpM <= 64)
+                    s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
 
 #pragma unroll
-                for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                  for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                    CUTE_UNROLL
+                    for (int half = 0; half < 2; ++half) {
+                      auto dequant_accum = decode_fragment(n_block, half);
+                      clear(dequant_accum);
+                      fp4_mma_dequant(n_block, 2 * k_block + half);
+                      quant_fp32C_to_e5m2B(n_block, k_block, half);
+                    }
+                  }
+                  if constexpr (WarpM > 64)
+                    s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
+                  // Convert the whole warp N tile before consuming it, giving the
+                  // compiler independent FP4 operations to hide conversion latency.
+#pragma unroll
+                  for (int n_block = 0; n_block < WarpN / 16; ++n_block) {
+#pragma unroll
+                    for (int m_block = 0; m_block < SliceM; ++m_block) {
+                      cute::gemm(tiled_mma, tCrA(_, m_block, k_block), tCrB(_, n_block, k_block),
+                                 mma_accum(_, m_block, n_block));
+                    }
+                  }
+                });
+              }
+
+              if constexpr (GroupActivationScales) {
+                CUTE_UNROLL
+                for (int mb = 0; mb < SliceM; ++mb) {
                   CUTE_UNROLL
-                  for (int half = 0; half < 2; ++half) {
-                    auto dequant_accum = decode_fragment(n_block, half);
-                    clear(dequant_accum);
-                    fp4_mma_dequant(n_block, 2 * k_block + half);
-                    quant_fp32C_to_e5m2B(n_block, k_block, half);
+                  for (int row = 0; row < 2; ++row) {
+                    const float scale = group_scales(MStart + mb, row);
+                    CUTE_UNROLL
+                    for (int nb = 0; nb < size<2>(accum); ++nb) {
+                      CUTE_UNROLL
+                      for (int half = 0; half < 2; ++half) {
+                        const int v = 2 * row + 4 * half;
+                        accum(v, MStart + mb, nb) += accum_k(v, mb, nb) * scale;
+                        accum(v + 1, MStart + mb, nb) += accum_k(v + 1, mb, nb) * scale;
+                      }
+                    }
                   }
                 }
-                if constexpr (WarpM > 64)
-                  s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
-                // Convert the whole warp N tile before consuming it, giving the
-                // compiler independent FP4 operations to hide conversion latency.
-#pragma unroll
-                for (int n_block = 0; n_block < WarpN / 16; ++n_block) {
-#pragma unroll
-                  for (int m_block = 0; m_block < UsedM; ++m_block) {
-                    cute::gemm(tiled_mma, tCrA(_, m_block, k_block), tCrB(_, n_block, k_block),
-                               accum(_, m_block, n_block));
-                  }
-                }
-              });
-            }
+              }
 
+            });
             cp_async_wait<kNumStages - 2>();
             __syncthreads();
           };
@@ -842,10 +895,12 @@ public:
               process_k_tile_iteration(k_tile_idx);
             }
           } else {
-            if constexpr (!WideM)
+            constexpr bool CompactLoop = WideM || (GroupActivationScales &&
+                kGemmType == GemmType::MGroupedNoPad && WarpM == 64 && WarpN == 32);
+            if constexpr (!CompactLoop)
               process_k_tile_iteration(0);
 #pragma unroll 1
-            for (int k_tile_idx = WideM ? 0 : 1; k_tile_idx < k_tile_count; k_tile_idx++) {
+            for (int k_tile_idx = CompactLoop ? 0 : 1; k_tile_idx < k_tile_count; k_tile_idx++) {
               process_k_tile_iteration(k_tile_idx);
             }
           }
@@ -856,7 +911,9 @@ public:
           }
           epilogue_no_tsm(active_m);
         };
-        if constexpr (WideM || (Compact && WarpM >= 64)) {
+        if constexpr (WideM || (Compact && WarpM >= 64) ||
+                      (GroupActivationScales && kGemmType == GemmType::MGroupedMasked &&
+                       WarpM == 32 && N_EXPAND == 1 && ShapeK > 512)) {
           // Mutually exclusive branches keep each tail's accumulators local.
           // Independent predicates can merge their live ranges and spill.
           dispatch_tail((residual_m + WarpsOnM - 1) / WarpsOnM, process_active_rows);

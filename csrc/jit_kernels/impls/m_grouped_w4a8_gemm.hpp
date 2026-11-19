@@ -65,7 +65,8 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         }
         std::pair<int, int> cache_variant() const {
             const auto c = kernel_spec();
-            return {int(c.fragment) + 2 * int(c.a_load()) + 16 * int(params.inv_scale != 1.f), int(kind)};
+            return {int(c.fragment) + 2 * int(c.a_load()) + 4 * int(c.group_activation_scales) +
+                        16 * int(params.inv_scale != 1.f), int(kind)};
         }
     };
     static const char* name() { return "m_grouped_gemm_w4fa8_mma"; }
@@ -75,7 +76,7 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         return fmt::format(
             R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -89,6 +90,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
             get_gemm_type_name(a.kind), c.n_expand, a.params.inv_scale != 1.0f ? "true" : "false",
             kernel.fragment == FragmentPolicy::FullK ? "FullK" : "RollingK32",
             kernel.a_load() == ALoadPolicy::Bulk ? "Bulk" : "Ring2",
+            kernel.group_activation_scales ? "true" : "false",
             a.launch_args.smem_size, get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -97,7 +99,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
 };
 
 static DgProfParam make_profile(GemmType kind, int groups, int m, int n, int k, int expected_m, int topk,
-                                int32_t* rows) {
+                                int32_t* rows, bool group_activation_scales = false) {
     DgProfParam prof;
     if (deep_gemm::profiling_enabled()) {
         if (kind == GemmType::MGroupedFused)
@@ -107,6 +109,7 @@ static DgProfParam make_profile(GemmType kind, int groups, int m, int n, int k, 
             prof.add_params(std::string("quant_type"), std::string("group"));
         }
         prof.add_params(std::string("group_size"), 32);
+        prof.add_params(std::string("activation_group_size"), group_activation_scales ? 128 : 0);
     }
     return prof;
 }
@@ -151,32 +154,35 @@ static std::optional<SpecializedKernel> lookup_native_kernel(const typename R::A
 }
 
 static void log_native_config(const W4A8Config& c, int m, int n, int k, int groups,
-                              const SpecializedKernel& prepared) {
+                              const SpecializedKernel& prepared, bool group_activation_scales = false) {
     if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
         int regs = 0, stack = 0;
         hgFuncGetAttribute(&regs, HG_FUNC_ATTRIBUTE_NUM_REGS, prepared.runtime->kernel);
         hgFuncGetAttribute(&stack, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, prepared.runtime->kernel);
         printf("[W4FA8] group:%d problem:[%d,%d,%d] block:[%d,%d,%d] warp:[%d,%d,%d] stages:%d smem:%d vreg:%d "
-               "stack:%d tb_per_sm:%d threads:%d n_expand:%d\n",
+               "stack:%d tb_per_sm:%d threads:%d n_expand:%d activation_group_size:%d\n",
                groups, m, n, k, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.warp_k, c.num_stages,
-               get_smem_size(c, k), regs, stack, prepared.active_blocks, get_num_threads(c), c.n_expand);
+               get_smem_size(c, k), regs, stack, prepared.active_blocks, get_num_threads(c), c.n_expand,
+               group_activation_scales ? 128 : 0);
     }
 }
 
 template <class Scheduler>
-static void launch(const W4A8Config& c, int m, int n, int k, int groups, GemmType kind, int expected_m, int topk,
+static void launch(const NativeKernelConfig& spec, int m, int n, int k, int groups, GemmType kind, int expected_m, int topk,
                    int32_t* m_rows, const Arguments<Scheduler>& params) {
     using R = Runtime<Scheduler>;
+    const auto& c = spec.tile;
     const int threads = get_num_threads(c), smem = get_smem_size(c, k);
     typename R::Args args{c, n, k, groups, kind, {dim3(c.num_sms), dim3(threads), smem}, params};
+    args.kernel_config = spec;
     DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&args.device));
     const auto prepared = lookup_native_kernel<R>(args, is_w4a8_capturing(), false);
     TORCH_CHECK(prepared.has_value(), "W4FA8 native plan must be warmed outside graph capture");
     const auto& runtime = prepared->runtime;
     const int blocks = prepared->active_blocks;
     args.launch_args.grid_dim = dim3(c.num_sms < 20 ? c.num_sms : c.num_sms * std::min(8, blocks));
-    auto prof = make_profile(kind, groups, m, n, k, expected_m, topk, m_rows);
-    log_native_config(c, m, n, k, groups, *prepared);
+    auto prof = make_profile(kind, groups, m, n, k, expected_m, topk, m_rows, spec.group_activation_scales);
+    log_native_config(c, m, n, k, groups, *prepared, spec.group_activation_scales);
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(prof);
         R::launch(runtime, args);
@@ -217,12 +223,12 @@ static torch::Tensor prepare_nopad_layout(const torch::Tensor& rows, int groups,
 
 static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
                 const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows, GemmType kind,
-                int expected_m, const W4A8Config& c, float inv_scale = 1.0f, const torch::Tensor& expert_ids = {},
+                int expected_m, const NativeKernelConfig& spec, float inv_scale = 1.0f, const torch::Tensor& expert_ids = {},
                 const torch::Tensor& token_ids = {}, const torch::Tensor& aligned_blocks = {}) {
     TORCH_CHECK(std::isfinite(inv_scale) && inv_scale > 0, "inv_scale must be finite and positive");
     const int groups = b.size(0), n = b.size(1), k = a.size(-1);
     const int m = kind == GemmType::MGroupedMasked ? a.size(1) : a.size(0);
-    check_config(c, n, k, kind);
+    const auto& c = spec.tile;
     if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{
             a.data_ptr(),
@@ -234,7 +240,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
             inv_scale,
             token_ids.data_ptr<int32_t>(),
             {aligned_blocks.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>()}};
-        launch(c, m, n, k, groups, kind, expected_m, d.size(0) / m, rows.data_ptr<int32_t>(), params);
+        launch(spec, m, n, k, groups, kind, expected_m, d.size(0) / m, rows.data_ptr<int32_t>(), params);
     } else {
         auto prepared = kind == GemmType::MGroupedNoPad ? prepare_nopad_layout(rows, groups, m, c) : rows;
         auto layout = prepared.data_ptr<int32_t>();
@@ -247,7 +253,7 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
                                                        inv_scale,
                                                        nullptr,
                                                        TileSchedulerArguments(static_cast<uint32_t>(m), layout)};
-        launch(c, m, n, k, groups, kind, expected_m, 0, rows.data_ptr<int32_t>(), params);
+        launch(spec, m, n, k, groups, kind, expected_m, 0, rows.data_ptr<int32_t>(), params);
     }
 }
 
@@ -275,8 +281,8 @@ static bool run_compact(const NativeKernelConfig& spec, int m, int n, int k, int
     args.launch_args.grid_dim =
         dim3(c.num_sms * (fused ? prepared->active_blocks : std::min(8, prepared->active_blocks)));
     auto prof = make_profile(kind, groups, fused ? params.num_token : m, n, k, ceil_div(m, groups),
-                             fused ? m / params.num_token : 0, rows.data_ptr<int32_t>());
-    log_native_config(c, fused ? params.num_token : m, n, k, groups, *prepared);
+                             fused ? m / params.num_token : 0, rows.data_ptr<int32_t>(), spec.group_activation_scales);
+    log_native_config(c, fused ? params.num_token : m, n, k, groups, *prepared, spec.group_activation_scales);
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(prof);
         R::launch(prepared->runtime, args);
@@ -299,10 +305,10 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
         return;
     }
     const auto& kernel = std::get<NativeKernelConfig>(plan);
-    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool>;
+    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool, bool>;
     static std::mutex ready_mutex;
     static std::set<ReadyKey> ready;
-    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind), pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f};
+    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind), pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f, kernel.group_activation_scales};
     const bool capturing = is_w4a8_capturing();
     if (capturing) {
         std::lock_guard<std::mutex> lock(ready_mutex);
@@ -310,7 +316,7 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
     }
 
     if (kernel.fragment == FragmentPolicy::FullK) {
-        run(a, a_scale, b, scale, d, rows, kind, expected_m, kernel.tile, inv_scale, experts, tokens, aligned);
+        run(a, a_scale, b, scale, d, rows, kind, expected_m, kernel, inv_scale, experts, tokens, aligned);
     } else if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{
             a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), int(a.size(0)),

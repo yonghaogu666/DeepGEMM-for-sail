@@ -95,12 +95,26 @@ def decode_weight(packed, scales):
     return values[codes] * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
 
 
-def quant_activation(x, weight_inv_scale=1.0):
-    """Quantize E4M3, then fold the weight inverse into the FP32 output row scale."""
+def quant_activation(x, weight_inv_scale=1.0, activation_group_size=0):
+    """Quantize E4M3 per row or K128, folding the weight inverse into scales."""
+    if activation_group_size not in (0, 128):
+        raise ValueError('W4A8 activation_group_size must be 0 or 128')
+    shape = x.shape
+    if activation_group_size:
+        if shape[-1] % activation_group_size:
+            raise ValueError('Activation K must be divisible by 128')
+        x = x.reshape(*shape[:-1], shape[-1] // activation_group_size, activation_group_size)
     amax = x.float().abs().amax(-1, keepdim=True).clamp_min(1e-10)
     scale = amax * (1.0 / 448.0)
     inverse = 448.0 / amax
     quantized = (x.float() * inverse).clamp(-448, 448).to(torch.float8_e4m3fn)
     if weight_inv_scale != 1.0:
         scale *= weight_inv_scale
-    return quantized, scale
+    columns = shape[-1] // activation_group_size if activation_group_size else 1
+    return quantized.reshape(shape), scale.reshape(*shape[:-1], columns)
+
+
+def decode_activation(quantized, scales, weight_inv_scale=1.0):
+    """Recover quantized test operands, excluding the folded weight inverse."""
+    repeat = quantized.shape[-1] // scales.shape[-1]
+    return quantized.float() * scales.repeat_interleave(repeat, -1) / weight_inv_scale

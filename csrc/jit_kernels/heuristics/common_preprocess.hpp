@@ -31,7 +31,7 @@ enum class PreprocessMode {
 struct PreprocessedWeights {
     torch::Tensor weight;
     torch::Tensor scale;
-    // Only used in W4A8_MXFP4_MMA: Fold into the activation row scale
+    // W4A8_MXFP4_MMA: fold into all activation scales or pass as inv_scale.
     float inv_scale = 1.0f;
 };
 
