@@ -12,6 +12,8 @@ public:
     struct LaunchInfo {
         int num_topk;
         bool fp8, scaled;
+        int push_ranks = 0;
+        bool preload_routes = false;
     };
 
     struct KernelParams {
@@ -38,9 +40,10 @@ public:
         return fmt::format(R"(
 #include <deep_gemm/impls/mega_moe_combine.cuh>
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::detail::sm89_mega_moe_barrier_reduce<{}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe::detail::sm89_mega_moe_barrier_reduce<{}, {}, {}, {}, {}, {}>);
 }}
-)", info.num_topk, info.fp8, info.scaled, args.launch_args.block_dim.x);
+)", info.num_topk, info.fp8, info.scaled, args.launch_args.block_dim.x,
+            info.push_ranks, info.preload_routes);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -59,10 +62,15 @@ inline void reset_done(int32_t* barrier_done) {
 
 inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const DispatchConfig& config,
-    const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens) {
-    const int hidden = y.size(1), threads = combine_num_threads(num_tokens, hidden);
+    const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens,
+    CombineTuning policy = {}) {
+    const int hidden = y.size(1);
+    const int push_ranks = policy.push ? config.num_ranks : 0;
+    TORCH_CHECK(push_ranks <= layout::RoutedMoESignals::kMaxPushRanks);
+    const int threads = policy.push ? 256 : combine_num_threads(num_tokens, hidden);
+    const bool preload_routes = policy.preload_routes && config.num_topk <= 32;
     return {
-        {config.num_topk, false, false}, {dim3(std::max(num_tokens, 1), 1), dim3(threads), 0},
+        {config.num_topk, false, false, push_ranks, preload_routes}, {dim3(std::max(num_tokens, 1), 1), dim3(threads), 0},
         {base + buffer.combine, nullptr, math::advance_ptr<float>(base, buffer.topk_weights),
          math::advance_ptr<int64_t>(base, buffer.topk_idx), y.data_ptr<at::BFloat16>(),
          num_tokens, hidden, config.nmtpr, config.num_experts, 0, 0, 0,
@@ -71,8 +79,9 @@ inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
 
 inline void combine_mega_moe(
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const DispatchConfig& config,
-    const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens) {
-    auto args = make_mega_moe_combine_args(base, buffer, config, sym_buffer, y, rank_idx, num_tokens);
+    const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens,
+    CombineTuning policy = {}) {
+    auto args = make_mega_moe_combine_args(base, buffer, config, sym_buffer, y, rank_idx, num_tokens, policy);
     const auto runtime = compiler->build("ppu_mega_moe_barrier_reduce", MegaMoECombineRuntime::generate(args));
     reset_done(&args.kernel_params.signals->combine_done);
     MegaMoECombineRuntime::launch(runtime, args);

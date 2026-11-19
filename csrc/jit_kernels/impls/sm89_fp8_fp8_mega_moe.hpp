@@ -57,11 +57,6 @@ struct ChannelScatter {
     uint32_t num_groups = 0;
 };
 
-struct BlockScatter {
-    ChannelScatter base;
-    const int32_t* src_m_offsets = nullptr;
-};
-
 template <typename Epilogue, typename Scatter> struct ScatterEpilogue {
     Epilogue base;
     Scatter scatter;
@@ -88,7 +83,7 @@ struct FP8BlockwiseLinear2Params {
     Mode mode = Mode::kGemm;
     Problem problem_shape;
     FP8GemmRuntime::MainLoopArguments mainloop;
-    ScatterEpilogue<FP8GemmRuntime::EpilogueArgs, BlockScatter> epilogue;
+    ScatterEpilogue<FP8GemmRuntime::EpilogueArgs, ChannelScatter> epilogue;
     cutlass::KernelHardwareInfo hw_info;
     struct Scheduler {
         ScatterScheduler base;
@@ -137,10 +132,13 @@ public:
             const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
                                                      dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes, args.routing_bytes);
             if constexpr (kIsBlockwise) {
+                const auto& policy = c.blockwise;
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
-using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<
+    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {},
+    deep_gemm::mega::PullSchedule({}), deep_gemm::mega::Gemm1WorkSchedule({}), {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_blockwise_mega_moe_l1<Builder>);
@@ -151,7 +149,8 @@ static void __instantiate_kernel() {{
                     inputs.gemm2_metadata, dispatch.pull_ctas, int(args.kernel_params.activation_clamp >= 0),
                     c.master_experts, int(c.activation), c.metadata.block_m, dispatch.nmtpr, c.num_ctas, dispatch.num_experts,
                     dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes,
-                    args.routing_bytes, args.launch_args.smem_size);
+                    int(policy.pull), int(policy.work), tile.block_n, policy.quant_lanes, tile.num_stages,
+                    policy.work_batch, policy.write_padded_rows, args.routing_bytes, args.launch_args.smem_size);
             } else {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
@@ -173,7 +172,7 @@ static void __instantiate_kernel() {{
             if constexpr (kIsBlockwise) {
                 return fmt::format(R"(
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
-using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm2Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm2Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 using Kernel = typename Builder::Kernel;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static_assert(sizeof(Kernel::Params) == {}, "scatter Params ABI mismatch");
@@ -191,7 +190,8 @@ static void __instantiate_kernel() {{
 }}
 )",
                     c.n, c.k, c.num_groups, c.num_master_groups, c.num_stages, c.block_m, c.scratch_rows,
-                    c.num_ranks, c.num_threads, c.smem_size, c.smem_size, sizeof(Params), alignof(Params),
+                    c.num_ranks, c.num_threads, c.smem_size, c.block_n, c.warp_schedule, c.reuse_smem,
+                    c.smem_size, sizeof(Params), alignof(Params),
                     sizeof(Params{}.mainloop), sizeof(Params{}.epilogue), offsetof(Params, mainloop),
                     offsetof(Params, epilogue), offsetof(Params, hw_info), offsetof(Params, scheduler),
                     offsetof(Params, workspace), offsetof(Params, signal));
@@ -320,7 +320,7 @@ static auto make_fp8_fp8_linear2_args(
                       math::advance_ptr<float>(base, buffer.l2_scales), FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFA(problem),
                       device_pointer<float>(scale), FP8GemmRuntime::ScaleConfig::tile_atom_to_shape_SFB(problem)};
         p.epilogue.base = {{1, 0}, nullptr, sd, output, sd};
-        p.epilogue.scatter = {scatter, meta.offsets};
+        p.epilogue.scatter = scatter;
         p.epilogue.base_ptr_D = output;
         p.scheduler = {{uint32_t(m), grouped_layout}, meta.offsets};
     } else {
@@ -369,7 +369,7 @@ inline void fp8_fp8_mega_moe_impl(
         launch(std::integral_constant<Precision, Precision::FP8Blockwise>{});
     else
         launch(std::integral_constant<Precision, Precision::FP8Channelwise>{});
-    combine_mega_moe(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens);
+    combine_mega_moe(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens, configs.combine);
 }
 
 } // namespace deep_gemm::mega

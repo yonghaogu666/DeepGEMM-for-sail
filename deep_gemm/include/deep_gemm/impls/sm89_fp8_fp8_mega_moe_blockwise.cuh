@@ -10,7 +10,8 @@ template <int GEMM1_N_, int GEMM1_COMPUTE_M_, int NUM_THREADS_, uint64_t LAYOUT_
           uint64_t LAYOUT_OFF_ITI_, uint64_t LAYOUT_OFF_PT_, uint64_t LAYOUT_OFF_PSF_,
           uint64_t LAYOUT_OFF_GEMM2_META_, int PULL_CTAS_, int CLAMP_, int MASTER_EXPERTS_, GatedActivation ACTIVATION_,
           int GEMM2_BLOCK_M_, int NMTPR_, int NUM_CTAS_, int NUM_EXPERTS_, int NUM_RANKS_, int NUM_TOPK_,
-          int TOKEN_BYTES_, uint64_t RoutingBytes_>
+          int TOKEN_BYTES_, mega::PullSchedule PULL_, mega::Gemm1WorkSchedule WORK_,
+          int BLOCK_N_, int QUANT_LANES_, int STAGES_, int WORK_BATCH_, bool WRITE_PADDED_ROWS_, uint64_t RoutingBytes_>
 struct MegaMoEFp8BlockwiseGemm1Kernel {
     static constexpr uint64_t routing_bytes = RoutingBytes_;
     static constexpr int GEMM1_N = GEMM1_N_, GEMM1_COMPUTE_M = GEMM1_COMPUTE_M_, NUM_THREADS = NUM_THREADS_;
@@ -22,9 +23,13 @@ struct MegaMoEFp8BlockwiseGemm1Kernel {
     static constexpr int GEMM2_BLOCK_M = GEMM2_BLOCK_M_, NMTPR = NMTPR_, NUM_CTAS = NUM_CTAS_;
     static constexpr int NUM_EXPERTS = NUM_EXPERTS_, NUM_RANKS = NUM_RANKS_, NUM_TOPK = NUM_TOPK_;
     static constexpr int TOKEN_BYTES = TOKEN_BYTES_;
+    static constexpr mega::PullSchedule PULL = PULL_;
+    static constexpr mega::Gemm1WorkSchedule WORK = WORK_;
+    static constexpr int BLOCK_N = BLOCK_N_, QUANT_LANES = QUANT_LANES_, STAGES = STAGES_, WORK_BATCH = WORK_BATCH_;
+    static constexpr bool WRITE_PADDED_ROWS = WRITE_PADDED_ROWS_;
 
     static_assert(sizeof(layout::SymBuffer<>) == 528, "MegaMoE symmetric buffer ABI changed");
-    using G = mega_moe::fp8_blockwise::Gemm1<GEMM1_N, TOKEN_BYTES, GEMM1_COMPUTE_M>;
+    using G = mega_moe::fp8_blockwise::Gemm1<GEMM1_N, TOKEN_BYTES, GEMM1_COMPUTE_M, MegaMoEFp8BlockwiseGemm1Kernel>;
     static_assert(G::kNumThreads == NUM_THREADS, "blockwise GEMM1 launch must match its MMA tile");
     static constexpr uint32_t shared_memory_bytes() { return G::template shared_memory_bytes<NUM_EXPERTS>(); }
     static constexpr int kNumThreads = NUM_THREADS;
@@ -45,11 +50,10 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
     auto P = [&](uint64_t off) -> void* {
         return off >= off_pt ? local_pool + (off - off_pt) : (void*)(local_base + off);
     };
-    mega_moe::fp8_blockwise::dispatch_gemm1_kernel_device<Builder::NUM_RANKS, Builder::NUM_CTAS, Builder::NUM_EXPERTS,
-        Builder::NUM_TOPK, Builder::TOKEN_BYTES,
-                                                          Builder::GEMM1_N, Builder::PULL_CTAS, Builder::CLAMP,
-                                                              Builder::MASTER_EXPERTS,
-                                                          Builder::ACTIVATION, Builder::GEMM1_COMPUTE_M, Builder::GEMM2_BLOCK_M>(
+    mega_moe::fp8_blockwise::dispatch_gemm1_kernel_device<
+        Builder, Builder::NUM_RANKS, Builder::NUM_CTAS, Builder::NUM_EXPERTS, Builder::NUM_TOPK,
+        Builder::TOKEN_BYTES, Builder::GEMM1_N, Builder::PULL_CTAS, Builder::CLAMP, Builder::MASTER_EXPERTS,
+        Builder::ACTIVATION, Builder::GEMM1_COMPUTE_M, Builder::GEMM2_BLOCK_M>(
         P(off_ws), sb, (int64_t*)P(off_iti), (const uint8_t*)P(off_it), (const float*)P(off_isf),
         (uint8_t*)P(off_pt), (float*)P(off_psf), (int32_t*)P(off_meta), gemm2_block_info, (const uint8_t*)weight,
         weight_scales, output, output_scales, (uint32_t)num_tokens, Builder::NMTPR, activation_clamp, activation_alpha, situ_beta, situ_linear_beta,
@@ -57,11 +61,13 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
 }
 
 template <int N, int K, int GROUPS, int MASTER_GROUPS, int NUM_STAGES, int BLOCK_M, int SCRATCH_ROWS,
-          int NUM_RANKS, int NUM_THREADS, int SMEM_SIZE>
+          int NUM_RANKS, int NUM_THREADS, int SMEM_SIZE, int BLOCK_N,
+          bool WARP_SCHEDULE = false, bool REUSE_SCATTER_SMEM = false>
 struct MegaMoEFp8BlockwiseGemm2Kernel {
     using Family =
         deep_gemm::mega_moe::fp8_blockwise::Gemm2Scatter<N, K, GROUPS, MASTER_GROUPS, NUM_STAGES,
-                                                         BLOCK_M, SCRATCH_ROWS, NUM_RANKS>;
+                                                         BLOCK_M, SCRATCH_ROWS, NUM_RANKS, BLOCK_N, WARP_SCHEDULE,
+                                                         REUSE_SCATTER_SMEM>;
     using Kernel = typename Family::Kernel;
     static_assert(Family::kNumThreads == NUM_THREADS, "blockwise scatter launch must match its MMA tile");
     static_assert(Kernel::SharedStorageSize == SMEM_SIZE,

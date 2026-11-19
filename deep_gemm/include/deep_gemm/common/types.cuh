@@ -50,6 +50,11 @@ inline constexpr const char* GemmTypeS[] = {
 
 enum class MegaMoEPhaseKind { Linear1, Linear2 };
 
+namespace mega {
+enum class PullSchedule { Direct, Pipelined, Compact };
+enum class Gemm1WorkSchedule { Dynamic, DynamicSingleTile, Static };
+}  // namespace mega
+
 namespace scatter_pipeline {
 inline constexpr int kComputeThreads = 256;
 inline constexpr int kScatterThreads = 256;

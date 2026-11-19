@@ -213,7 +213,7 @@ struct Bf16MoeScatter {
     }
   }
 
-  template <int kBlockM, int kBlockN, uint32_t kThreadNum>
+  template <int kBlockM, int kBlockN, uint32_t kThreadNum, bool kFullWarp128 = false>
   CUTLASS_DEVICE
   static void scatter_staged_bf16(
       Params const& params, const __ppu_bfloat16* shared_tile,
@@ -226,7 +226,9 @@ struct Bf16MoeScatter {
                   "BF16 scatter requires eight-element vectors");
     if (params.packed_src_info == nullptr) return;
 
-    constexpr uint32_t kVec = 8;
+    // BN128 needs 32 active lanes, with four BF16 elements per lane.
+    static_assert(!kFullWarp128 || kBlockN == 128);
+    constexpr uint32_t kVec = kFullWarp128 ? 4 : 8;
     constexpr uint32_t kNVecs = kBlockN / kVec;
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     const uint32_t lane = tid % 32;
@@ -248,28 +250,32 @@ struct Bf16MoeScatter {
       }
       auto* destination = destination_row(
           params, topk_idx, token_idx);
-      auto* dst_base = reinterpret_cast<uint4*>(
+      using Vector = cute::conditional_t<kFullWarp128, uint2, uint4>;
+      auto* dst_base = reinterpret_cast<Vector*>(
           peer_offset(params, rank) +
           reinterpret_cast<int64_t>(destination + n_start));
-      const auto* src_base = reinterpret_cast<const uint4*>(
+      const auto* src_base = reinterpret_cast<const Vector*>(
           shared_tile + row * kBlockN);
 
       CUTLASS_PRAGMA_UNROLL
       for (uint32_t vector = lane;
            vector < kNVecs; vector += 32) {
-        const uint4 payload =
-            mega_moe::detail::scatter_load_bf16x8_shared(
-                src_base + vector);
 #if __HGGC_ARCH__ == 150
-        if (rank != params.rank_idx) {
-          __ppu_remote_store_bulk_ncp_b32x4(
-              static_cast<void*>(dst_base + vector), payload);
+        if constexpr (kFullWarp128) {
+          const uint2 payload = __ppu_shared_load_bulk_b32x2(src_base + vector);
+          if (rank != params.rank_idx)
+            __ppu_remote_store_bulk_ncp_b32x2(dst_base + vector, payload);
+          else
+            __ppu_global_store_bulk_b32x2(dst_base + vector, payload);
         } else {
-          __ppu_global_store_bulk_b32x4(
-              static_cast<void*>(dst_base + vector), payload);
+          const uint4 payload = mega_moe::detail::scatter_load_bf16x8_shared(src_base + vector);
+          if (rank != params.rank_idx)
+            __ppu_remote_store_bulk_ncp_b32x4(dst_base + vector, payload);
+          else
+            __ppu_global_store_bulk_b32x4(dst_base + vector, payload);
         }
 #else
-        dst_base[vector] = payload;
+        dst_base[vector] = src_base[vector];
 #endif
       }
     }

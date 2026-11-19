@@ -49,7 +49,8 @@ struct DistributedMegaMoEBlocks {
     uint32_t total_blocks = 0;
 
 #if defined(__HGGC__)
-    CUTLASS_DEVICE DistributedMegaMoEBlocks(const uint64_t* counts, uint32_t lane) {
+    template <typename Count>
+    CUTLASS_DEVICE DistributedMegaMoEBlocks(const Count* counts, uint32_t lane) {
         #pragma unroll
         for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
             const uint32_t expert = chunk * 32 + lane;

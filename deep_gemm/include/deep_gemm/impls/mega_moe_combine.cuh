@@ -17,10 +17,12 @@ constexpr uint64_t kBarrierTimeoutCycles = 600000000000ULL;
 // Only block (0, 0) publishes arrival and polls the peer counters. The local
 // done flag is cleared on the launch stream before each invocation, including
 // graph replay. Empty ranks must launch this kernel too.
+template <int kPushRanks>
 __device__ __forceinline__ void combine_barrier(const layout::SymBuffer<>& sym_buffer, int rank, int world,
                                                layout::RoutedMoESignals* signals, int num_experts) {
     auto* flag = &signals->combine_flag;
     auto* done = &signals->combine_done;
+    static_assert(kPushRanks <= layout::RoutedMoESignals::kMaxPushRanks);
     const int tid = threadIdx.x;
     if (blockIdx.x == 0 && blockIdx.y == 0) {
         // The preceding GEMM2/scatter has completed on this stream. Recycle
@@ -35,18 +37,29 @@ __device__ __forceinline__ void combine_barrier(const layout::SymBuffer<>& sym_b
         __syncthreads();
         if (tid < 32) {
             int32_t generation = 0;
+            auto* epoch = flag;
+            if constexpr (kPushRanks != 0)
+                epoch = &signals->push_generation;
             // Order completed scatter writes before publishing this rank.
             tix::fence_acq_rel_sys();
             if (tid == 0) {
-                generation = static_cast<int32_t>(static_cast<uint32_t>(tix::load_volatile(flag)) + 1u);
-                tix::store_volatile(flag, generation);
+                generation = static_cast<int32_t>(static_cast<uint32_t>(tix::load_volatile(epoch)) + 1u);
+                tix::store_volatile(epoch, generation);
             }
             generation = __shfl_sync(0xffffffffu, generation, 0);
+            if constexpr (kPushRanks != 0) {
+                // Each lane notifies its destination. Receivers poll only
+                // their local slots, after this rank's scatter has completed.
+                if (tid < kPushRanks)
+                    tix::store_volatile(sym_buffer.map(signals->ready_slot(rank), tid), generation);
+                tix::fence_acq_rel_sys();
+            }
             const auto start = clock64();
             while (true) {
                 bool arrived = true;
                 for (int peer_rank = tid; peer_rank < world; peer_rank += 32) {
-                    const int32_t peer = tix::load_volatile(sym_buffer.map(flag, peer_rank));
+                    const auto* ready = kPushRanks ? signals->ready_slot(peer_rank) : sym_buffer.map(flag, peer_rank);
+                    const int32_t peer = tix::load_volatile(ready);
                     // A peer may be one generation ahead. Unsigned subtraction
                     // handles the int32 wraparound without signed overflow.
                     arrived &= static_cast<int32_t>(static_cast<uint32_t>(peer) -
@@ -112,23 +125,39 @@ __device__ __forceinline__ void load_combine_vector(
     }
 }
 
-template <int kTopk, bool kFp8, bool kScaled, int kThreads>
+template <int kTopk, bool kFp8, bool kScaled, int kThreads, int kPushRanks, bool kPreloadRoutes>
 __device__ __forceinline__ void barrier_reduce_kernel(
     const void* buf, const uint64_t* scales, const float* weights, const int64_t* ids, __ppu_bfloat16* output,
     int tokens, int hidden, int capacity, int num_experts, int scale_tiles, int scale_block_n, int fp8_exp_shift,
     const layout::SymBuffer<>& sym_buffer, int rank, int world, layout::RoutedMoESignals* signals) {
-    combine_barrier(sym_buffer, rank, world, signals, num_experts);
+    static_assert(!kPreloadRoutes || (kTopk <= 32 && kThreads % 32 == 0));
     const int token = blockIdx.x;
+    auto load_route_weight = [&](int slot) {
+        const int64_t offset = static_cast<int64_t>(token) * kTopk + slot;
+        const int64_t expert = __ldg(ids + offset);
+        float weight = expert >= 0 && expert < num_experts ? __ldg(weights + offset) : 0.0f;
+        if constexpr (kFp8 && !kScaled)
+            weight *= ldexpf(1.0f, fp8_exp_shift);
+        return weight;
+    };
+    float prefetched_weight = 0.f;
+    if constexpr (kPreloadRoutes) {
+        // Route metadata is rank-local and finalized by G1 on this stream.
+        // Only payload reads depend on the final cross-rank barrier.
+        const int lane = threadIdx.x % 32;
+        if (token < tokens && lane < kTopk)
+            prefetched_weight = load_route_weight(lane);
+    }
+    combine_barrier<kPushRanks>(sym_buffer, rank, world, signals, num_experts);
     if (token >= tokens)
         return;
     float route_weights[kTopk];
     #pragma unroll
     for (int slot = 0; slot < kTopk; ++slot) {
-        const int64_t offset = static_cast<int64_t>(token) * kTopk + slot;
-        const int64_t expert = __ldg(ids + offset);
-        route_weights[slot] = expert >= 0 && expert < num_experts ? __ldg(weights + offset) : 0.0f;
-        if constexpr (kFp8 && !kScaled)
-            route_weights[slot] *= ldexpf(1.0f, fp8_exp_shift);
+        if constexpr (kPreloadRoutes)
+            route_weights[slot] = __shfl_sync(0xffffffffu, prefetched_weight, slot);
+        else
+            route_weights[slot] = load_route_weight(slot);
     }
     for (int vector = threadIdx.x; vector < hidden / 8; vector += kThreads) {
         float2 acc[4] = {};
@@ -162,13 +191,13 @@ __device__ __forceinline__ void barrier_reduce_kernel(
 
 namespace deep_gemm::mega_moe::detail {
 
-template <int TopK, bool Fp8, bool Scaled, int Threads>
+template <int TopK, bool Fp8, bool Scaled, int Threads, int PushRanks = 0, bool PreloadRoutes = false>
 __global__ __launch_bounds__(Threads)
 void sm89_mega_moe_barrier_reduce(
         const void* b, const uint64_t* s, const float* w, const int64_t* ids, __ppu_bfloat16* y,
         int t, int h, int c, int e, int st, int sn, int shift, layout::SymBuffer<> sym,
         int r, int ws, layout::RoutedMoESignals* signals) {
-    barrier_reduce_kernel<TopK, Fp8, Scaled, Threads>(
+    barrier_reduce_kernel<TopK, Fp8, Scaled, Threads, PushRanks, PreloadRoutes>(
         b, s, w, ids, y, t, h, c, e, st, sn, shift, sym, r, ws, signals);
 }
 

@@ -107,11 +107,22 @@ struct RoutedMoESignals {
     int rank_signals[2];
     alignas(16) int64_t peer_offsets[kNumMaxRanks];
     alignas(128) int32_t combine_flag;
+    // Push notifications reuse the two cache lines reserved for combine.
+    static constexpr int kMaxPushRanks = 32;
+    int32_t ready[kMaxPushRanks - 1];
     alignas(128) int32_t combine_done;
+    int32_t last_ready, push_generation;
+    CUTLASS_DEVICE int32_t* ready_slot(int rank) {
+        return rank == kMaxPushRanks - 1 ? &last_ready : ready + rank;
+    }
+
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
     alignas(128) uint64_t expert_recv_count[kNumMaxExperts];
     alignas(128) uint64_t expert_recv_count_sum[kNumMaxExpertsPerRank];
 };
+
+static_assert(offsetof(RoutedMoESignals, combine_done) == offsetof(RoutedMoESignals, combine_flag) + 128);
+static_assert(offsetof(RoutedMoESignals, expert_send_count) == offsetof(RoutedMoESignals, combine_flag) + 256);
 
 struct Workspace {
     void* base;

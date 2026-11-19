@@ -695,8 +695,10 @@ def test_mega_moe_precision_api(case, mega_moe_group):
             with pytest.raises(RuntimeError, match="activation_alpha"):
                 pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer,
                                **pipeline.options, activation_alpha=.25)
+        # A smaller view must reuse the owner's routing-bank stride and completion signals.
+        alias_capacity = case.capacity // 2 if case.precision == "fp8_blockwise" else case.capacity
         alias = dg.SymmBuffer(
-            mega_moe_group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
+            mega_moe_group, case.experts, alias_capacity, case.topk, case.hidden, case.intermediate,
             mma_type=pipeline.buffer.mma_type, quantization=pipeline.buffer.quantization,
             activation=case.activation, base=pipeline.buffer)
         try:
@@ -708,6 +710,11 @@ def test_mega_moe_precision_api(case, mega_moe_group):
             torch.testing.assert_close(y, expected, rtol=0, atol=0)
         finally:
             alias.destroy()
+        if case.precision == "fp8_blockwise":
+            # Replay the owner after computing through the smaller view.
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, expected, rtol=0, atol=0)
         for invalid in ((), (None, None), (pipeline.l1_weights[0].flatten(), pipeline.l1_weights[1])):
             with pytest.raises(ValueError, match="l1_weights must match"):
                 pipeline.entry(y, invalid, pipeline.l2_weights, pipeline.buffer, **pipeline.options)
