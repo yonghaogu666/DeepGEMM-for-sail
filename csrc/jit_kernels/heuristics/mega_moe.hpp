@@ -173,7 +173,8 @@ static int select_l1_copy_blocks(
 }
 
 static MegaMoEL1Config get_l1_config(
-    int shape_m, int n, int k, int num_experts_per_rank, int num_sms, int num_ranks, int expected_m) {
+    int shape_m, int n, int k, int num_experts_per_rank, int num_sms, int num_ranks, int expected_m,
+    int default_copy_blocks) {
     auto config = make_phase_config(deep_gemm_fp4_common::get_best_configs(
         shape_m, expected_m, n, k, num_experts_per_rank, num_sms, false, false,
         GemmType::MegaMoE, 256, 32));
@@ -193,14 +194,31 @@ static MegaMoEL1Config get_l1_config(
         }
     }
     const int k_tiles_per_flag = aligned_copy_ktpf(k, config.block_k);
-    return {config, select_l1_copy_blocks(expected_m, n, k, num_experts_per_rank, config, k_tiles_per_flag), k_tiles_per_flag};
+    // Zero keeps the shape default; positive overrides force a CTA count.
+    // Copy CTAs join GEMM1 after pulling rows, rather than reserving CUs.
+    const int copy_override = get_env<int>("DG_MEGAMOE_G1_COPY_CTAS", 0);
+    const int copy_blocks = copy_override != 0 ? copy_override : default_copy_blocks;
+    DG_HOST_ASSERT(copy_blocks >= 0 && copy_blocks < config.num_sms);
+    return {config, copy_blocks != 0 ? copy_blocks :
+        select_l1_copy_blocks(expected_m, n, k, num_experts_per_rank, config, k_tiles_per_flag), k_tiles_per_flag};
 }
 
 static MegaMoEL2Config get_l2_config(
-    int shape_m, int expected_m, int n, int k, int num_experts_per_rank, int num_sms) {
+    int shape_m, int expected_m, int n, int k, int num_experts_per_rank, int num_sms,
+    bool use_qwen38_decode_tile = false) {
     auto config = make_phase_config(deep_gemm_fp4_common::get_best_configs(
         shape_m, expected_m, n, k, num_experts_per_rank, num_sms, false, false,
         GemmType::MegaMoE, 256, 128));
+    // Keep explicit runtime tiles ahead of this shape-specific default.
+    if (use_qwen38_decode_tile && !deep_gemm_lut::get_runtime_config(
+            expected_m, n, k * 2, num_experts_per_rank,
+            GemmType::MegaMoE, deep_gemm_lut::RuntimeLutKind::FP4)) {
+        // BK counts packed FP4 bytes: 64 bytes hold 128 logical K elements.
+        constexpr CopyTile tile{16, 128, 64, 16, 64, 3};
+        config = {num_sms, tile.bm, tile.bn, tile.bk, tile.wm, tile.wn, tile.stages,
+            std::get<0>(deep_gemm_fp4_common::get_smem_config_fp4(
+                tile.stages, tile.bm, tile.bn, tile.wm, tile.wn, tile.bk, n, false, false))};
+    }
     // BN128 uses ordinary scatter; BN256 uses remote bulk scatter.
     // The owner protocol lets each reader match its writer's layout.
     const int old_wn = config.warp_n;
@@ -219,13 +237,20 @@ static MegaMoEL2Config get_l2_config(
 static MegaMoEConfig get_mega_moe_config(
     int num_ranks, int num_experts_per_rank, int num_max_tokens_per_rank,
     int hidden, int intermediate_hidden, int expected_m, int num_sms) {
+    // Qwen3.8-Flash W4A4 EP4 decode, measured on ZW-M890P with 36/39 CUs.
+    // expected_m is estimated rows/expert, not the rank's token count. With
+    // topk=10, this range covers up to 76 tokens/rank, including graph padding.
+    const bool qwen38_decode = num_ranks == 4 && num_experts_per_rank == 128 &&
+        hidden == 2560 && intermediate_hidden == 640 && expected_m >= 1 && expected_m <= 6 &&
+        num_sms >= 36 && num_sms <= 39 &&
+        std::string(device_runtime->get_prop()->name) == "ZW-M890P";
     return {
         get_l1_config(expected_m * num_experts_per_rank,
             intermediate_hidden * 2, hidden / 2, num_experts_per_rank,
-            num_sms, num_ranks, expected_m),
+            num_sms, num_ranks, expected_m, qwen38_decode ? 8 : 0),
         get_l2_config(num_ranks * num_max_tokens_per_rank, expected_m,
             hidden, intermediate_hidden / 2, num_experts_per_rank,
-            num_sms)
+            num_sms, qwen38_decode)
     };
 }
 
