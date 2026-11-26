@@ -32,7 +32,8 @@ template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM,
           int kNumStages, GemmType kGemmType, int N_EXPAND = 1, bool ApplyInvScale = false,
           deep_gemm::w4fa8::FragmentPolicy Fragment = deep_gemm::w4fa8::FragmentPolicy::FullK,
           deep_gemm::w4fa8::ALoadPolicy ALoad = deep_gemm::w4fa8::ALoadPolicy::Bulk,
-          bool GroupActivationScales = false, bool CacheGroupScales = false, bool PredecodedWeights = false>
+          bool GroupActivationScales = false, bool CacheGroupScales = false, bool PredecodedWeights = false,
+          bool ColumnMajorActivationScales = false>
 class W4A8GEMM_MMA {
 public:
   static constexpr bool WideM = deep_gemm::w4fa8::uses_ring_a(WarpM);
@@ -40,6 +41,7 @@ public:
   static constexpr bool Compact = Fragment == deep_gemm::w4fa8::FragmentPolicy::RollingK32;
   static_assert(!GroupActivationScales || BlockK == 128);
   static_assert(!CacheGroupScales || (GroupActivationScales && !Fused && !WideM && N_EXPAND == 1));
+  static_assert(!ColumnMajorActivationScales || kGemmType == GemmType::MGroupedMasked);
   static constexpr int DecodeN = WideM ? 1 : WarpN / 16;
   // A narrow ring bounds live A operands for wide M tiles.
   static constexpr int ADistance = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2 ? 1 : -1;
@@ -187,6 +189,7 @@ public:
     float inv_scale;
     const int* sorted_token_ids;
     typename TileScheduler::Params scheduler;
+    int64_t a_scale_group_stride = 0;
   };
 
   // for constexpr patial initialize
@@ -464,6 +467,23 @@ public:
         }
       }();
 
+      auto activation_scale_row = [&](int local_row) -> int64_t {
+        if constexpr (Fused)
+          return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
+        else if constexpr (ColumnMajorActivationScales)
+          return int64_t(coord_l) * params.a_scale_group_stride * (GroupActivationScales ? K / 128 : 1) +
+                 int64_t(m_block_idx) * BlockM + local_row;
+        else
+          return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
+      };
+      auto group_scale_offset = [&](int local_row, int k_group) -> int64_t {
+        const int64_t scale_row = activation_scale_row(local_row);
+        if constexpr (ColumnMajorActivationScales)
+          return scale_row + k_group * params.a_scale_group_stride;
+        else
+          return scale_row * (K / 128) + k_group;
+      };
+
       // Gather tokens are fixed for this work item. Form their row addresses
       // once, rather than repeating the wide multiply in each K-stage copy.
       const ElementA* token_rows[CopyAConfig::M_ITER];
@@ -482,13 +502,7 @@ public:
       if constexpr (WideM && !GroupActivationScales)
         if (thread_idx < BlockM) {
           const bool valid = thread_idx < residual_m;
-          int64_t scale_row = 0;
-          if (valid) {
-            if constexpr (Fused)
-              scale_row = params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + thread_idx];
-            else
-              scale_row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + thread_idx;
-          }
+          const int64_t scale_row = valid ? activation_scale_row(thread_idx) : 0;
           cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(params.ptr_a_scale[scale_row],
                                                             storage.row_scales[scale_buffer][thread_idx], valid);
         }
@@ -570,10 +584,8 @@ public:
         if constexpr (CacheGroupScales) {
           if (thread_idx < BlockM) {
             const bool valid = thread_idx < residual_m;
-            const int64_t row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM +
-                                (valid ? thread_idx : 0);
             cute::PPU_CP_ASYNC_CACHEALWAYS_ZFILL<float>::copy(
-                params.ptr_a_scale[row * (K / 128) + k_tile_iter],
+                params.ptr_a_scale[group_scale_offset(valid ? thread_idx : 0, k_tile_iter)],
                 storage.group_scales[k_pipe * BlockM + thread_idx], valid);
           }
         }
@@ -650,12 +662,6 @@ public:
         }
       };
 
-      auto activation_scale_row = [&](int local_row) -> int64_t {
-        if constexpr (Fused)
-          return params.sorted_token_ids[deep_scheduler.cumsum_m_block_idx * BlockM + local_row];
-        else
-          return deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
-      };
       auto apply_inv_scale = [&](float scale) {
         if constexpr (ApplyInvScale)
           return scale * params.inv_scale;
@@ -798,8 +804,8 @@ public:
                   if constexpr (CacheGroupScales) {
                     group_scales(mb, row) = storage.group_scales[stage_idx * BlockM + local_row];
                   } else {
-                    const int64_t scale_row = activation_scale_row(local_row < residual_m ? local_row : 0);
-                    group_scales(mb, row) = __ldg(params.ptr_a_scale + scale_row * (K / 128) + k_tile_idx);
+                    const auto offset = group_scale_offset(local_row < residual_m ? local_row : 0, k_tile_idx);
+                    group_scales(mb, row) = __ldg(params.ptr_a_scale + offset);
                   }
                 }
               }

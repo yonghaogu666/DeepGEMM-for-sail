@@ -48,6 +48,7 @@ template <class Scheduler> struct Arguments {
     float inv_scale;
     const int* sorted_token_ids;
     Scheduler scheduler;
+    int64_t a_scale_group_stride = 0;
 };
 
 template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Scheduler>> {
@@ -66,7 +67,7 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         std::pair<int, int> cache_variant() const {
             const auto c = kernel_spec();
             return {int(c.fragment) + 2 * int(c.a_load()) + 4 * int(c.group_activation_scales) +
-                        16 * int(params.inv_scale != 1.f), int(kind)};
+                        16 * int(params.inv_scale != 1.f) + 32 * int(params.a_scale_group_stride != 0), int(kind)};
         }
     };
     static const char* name() { return "m_grouped_gemm_w4fa8_mma"; }
@@ -76,7 +77,7 @@ template <class Scheduler> class Runtime final : public LaunchRuntime<Runtime<Sc
         return fmt::format(
             R"(
 #include <deep_gemm/impls/w4fa8_gemm.cuh>
-using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}>;
+using Kernel = cutlass::gemm::kernel::W4A8GEMM_MMA<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GemmType::{}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, false, false, {}>;
 static_assert(sizeof(Kernel::SharedStorage) == {}, "shared memory mismatch");
 static_assert(Kernel::MaxThreadsPerBlock == {}, "thread count mismatch");
 static_assert(sizeof(Kernel::Params) == {}, "kernel argument size mismatch");
@@ -91,6 +92,7 @@ void m_grouped_gemm_w4fa8_mma(Kernel::Params params) {{
             kernel.fragment == FragmentPolicy::FullK ? "FullK" : "RollingK32",
             kernel.a_load() == ALoadPolicy::Bulk ? "Bulk" : "Ring2",
             kernel.group_activation_scales ? "true" : "false",
+            a.params.a_scale_group_stride != 0 ? "true" : "false",
             a.launch_args.smem_size, get_num_threads(c), sizeof(Arguments<Scheduler>));
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -221,7 +223,7 @@ static torch::Tensor prepare_nopad_layout(const torch::Tensor& rows, int groups,
     return scratch;
 }
 
-static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torch::Tensor& b,
+static void run(const torch::Tensor& a, const torch::Tensor& a_scale, int64_t a_scale_group_stride, const torch::Tensor& b,
                 const torch::Tensor& scale, const torch::Tensor& d, const torch::Tensor& rows, GemmType kind,
                 int expected_m, const NativeKernelConfig& spec, float inv_scale = 1.0f, const torch::Tensor& expert_ids = {},
                 const torch::Tensor& token_ids = {}, const torch::Tensor& aligned_blocks = {}) {
@@ -252,7 +254,8 @@ static void run(const torch::Tensor& a, const torch::Tensor& a_scale, const torc
                                                        0,
                                                        inv_scale,
                                                        nullptr,
-                                                       TileSchedulerArguments(static_cast<uint32_t>(m), layout)};
+                                                       TileSchedulerArguments(static_cast<uint32_t>(m), layout),
+                                                       a_scale_group_stride};
         launch(spec, m, n, k, groups, kind, expected_m, 0, rows.data_ptr<int32_t>(), params);
     }
 }
@@ -305,10 +308,13 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
         return;
     }
     const auto& kernel = std::get<NativeKernelConfig>(plan);
-    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool, bool>;
+    const int64_t a_scale_group_stride = a_scale.is_contiguous() ? 0 : a_scale.stride(-1);
+    using ReadyKey = std::tuple<int, uintptr_t, int, int, int, int, int, W4A8ConfigTuple, FragmentPolicy, bool, bool, bool>;
     static std::mutex ready_mutex;
     static std::set<ReadyKey> ready;
-    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind), pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f, kernel.group_activation_scales};
+    const ReadyKey key{a.get_device(), reinterpret_cast<uintptr_t>(current_stream()), m, n, k, groups, int(kind),
+                       pack_config(kernel.tile), kernel.fragment, inv_scale != 1.f, kernel.group_activation_scales,
+                       a_scale_group_stride != 0};
     const bool capturing = is_w4a8_capturing();
     if (capturing) {
         std::lock_guard<std::mutex> lock(ready_mutex);
@@ -316,7 +322,7 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
     }
 
     if (kernel.fragment == FragmentPolicy::FullK) {
-        run(a, a_scale, b, scale, d, rows, kind, expected_m, kernel, inv_scale, experts, tokens, aligned);
+        run(a, a_scale, a_scale_group_stride, b, scale, d, rows, kind, expected_m, kernel, inv_scale, experts, tokens, aligned);
     } else if (kind == GemmType::MGroupedFused) {
         const Arguments<W4A8FusedSchedulerArguments> params{
             a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), int(a.size(0)),
@@ -326,7 +332,7 @@ static void execute_plan(const ExecutionPlan& plan, const torch::Tensor& a, cons
     } else {
         const Arguments<TileSchedulerArguments> params{
             a.data_ptr(), b.data_ptr(), scale.data_ptr(), d.data_ptr(), a_scale.data_ptr<float>(), 0,
-            inv_scale, nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>())};
+            inv_scale, nullptr, TileSchedulerArguments(uint32_t(m), rows.data_ptr<int32_t>()), a_scale_group_stride};
         TORCH_CHECK(run_compact(kernel, m, n, k, groups, kind, params, rows, a.get_device(), is_w4a8_capturing()),
                     "W4FA8 native plan must be warmed outside graph capture and fit compiled resources");
     }

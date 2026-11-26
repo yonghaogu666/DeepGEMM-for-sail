@@ -1793,10 +1793,17 @@ static void check_w4fa8_operands(const std::pair<torch::Tensor, torch::Tensor>& 
         TORCH_CHECK(m == 0 ? out.size(0) == 0 : out.size(0) % m == 0 && out.size(0) / m > 0 && out.size(0) / m <= e,
                     "fused output must contain token * top-k rows");
     }
-    for (const auto& t : {a, s, b, bs, out}) {
+    for (const auto& t : {a, b, bs, out}) {
         TORCH_CHECK(t.is_cuda() && t.device() == a.device() && t.is_contiguous(),
                     "W4FA8 tensors must be contiguous on one PPU device");
     }
+    // DeepEP LL and masked quantization can return scales with contiguous
+    // token rows and a padded leading dimension for each K128 group.
+    TORCH_CHECK(s.is_cuda() && s.device() == a.device() &&
+                    (s.is_contiguous() ||
+                     (masked && s.stride(1) == 1 && s.stride(2) >= m &&
+                      s.stride(0) == s.stride(2) * s.size(2))),
+                "W4FA8 activation scales must be contiguous or use packed columns for masked GEMM");
 }
 
 static void check_w4fa8_indices(const torch::Tensor& t, const torch::Tensor& a) {
